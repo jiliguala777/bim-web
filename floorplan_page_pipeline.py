@@ -143,7 +143,7 @@ def prepare_pdf_page(
     if page_data["is_vector_pdf"]:
         dimension_candidates = detect_dimension_candidates(page_data)
         scale_calibration = calibrate_from_overall_dimensions(page_data)
-        if page_data.get("has_vector_text") or ocr_evidence.get("accepted_count"):
+        if page_data.get("has_vector_text"):
             cleanup_candidates = dimension_candidates
         scale_calibration["text_source"] = (
             "pdf_text"

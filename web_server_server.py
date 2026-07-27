@@ -41,6 +41,7 @@ except ImportError as e:
 # --- AI 图纸识别模块 ---
 try:
     from floorplan_onnx import get_segmenter
+    from floorplan_page_pipeline import prepare_pdf_page
     from floorplan_rooms import apply_scale_to_room_topology
     _floorplan_segmenter = get_segmenter(ONNX_MODEL_PATH)
     HAS_FLOORPLAN_AI = True
@@ -1554,148 +1555,86 @@ def ai_recognize():
         }
 
         # PDF → PNG 转换，并优先从矢量文字和线段中自动标定比例尺。
+        prepared_page = None
         if ext == 'pdf':
             try:
-                from pdf2image import convert_from_path
-                pdf_dpi = 200
-                ocr_evidence = {
-                    'status': 'not_needed',
-                    'candidate_count': 0,
-                    'accepted_count': 0,
-                }
-                if HAS_VECTOR_PDF_SCALE:
-                    vector_pdf_dpi = 100
-                    dimension_page_data = extract_vector_page(
-                        raster_path,
-                        page_index=pdf_page_number - 1,
-                        dpi=vector_pdf_dpi,
-                    )
-                    if pdf_page_count is None:
-                        pdf_page_count = dimension_page_data.get('page_count')
-                    if dimension_page_data['is_vector_pdf']:
-                        pdf_dpi = vector_pdf_dpi
-                    else:
-                        scale_calibration['method'] = 'scanned_pdf_manual'
-                images = convert_from_path(
+                prepared_page = prepare_pdf_page(
                     raster_path,
-                    dpi=pdf_dpi,
-                    first_page=pdf_page_number,
-                    last_page=pdf_page_number,
+                    page_number=pdf_page_number,
                     poppler_path=_resolve_poppler_path(),
+                    segmenter=_floorplan_segmenter,
+                    output_dir=target_dir,
                 )
-                if images:
-                    if (
-                        dimension_page_data is not None
-                        and dimension_page_data.get('is_vector_pdf')
-                        and not dimension_page_data.get('has_vector_text')
-                    ):
-                        try:
-                            ocr_images = convert_from_path(
-                                raster_path,
-                                dpi=200,
-                                first_page=pdf_page_number,
-                                last_page=pdf_page_number,
-                                poppler_path=_resolve_poppler_path(),
-                            )
-                            if ocr_images:
-                                ocr_bgr = cv2.cvtColor(
-                                    np.asarray(ocr_images[0]),
-                                    cv2.COLOR_RGB2BGR,
-                                )
-                                ocr_spans, ocr_evidence = extract_numeric_text_spans(
-                                    ocr_bgr,
-                                    dimension_page_data['page_size_pt'],
-                                )
-                                dimension_page_data['text_spans'] = ocr_spans
-                        except Exception as ocr_error:
-                            ocr_evidence = {
-                                'status': 'failed',
-                                'candidate_count': 0,
-                                'accepted_count': 0,
-                                'reason': str(ocr_error),
-                            }
-                    if dimension_page_data is not None and dimension_page_data.get('is_vector_pdf'):
-                        dimension_candidates = detect_dimension_candidates(dimension_page_data)
-                        scale_calibration = calibrate_from_overall_dimensions(dimension_page_data)
-                        if dimension_page_data.get('has_vector_text'):
-                            dimension_cleanup_candidates = dimension_candidates
-                            scale_calibration['text_source'] = 'pdf_text'
-                        elif ocr_evidence.get('accepted_count'):
-                            scale_calibration['text_source'] = 'rapidocr'
-                        else:
-                            scale_calibration['text_source'] = 'none'
-                    png_path = os.path.join(target_dir, 'building_plan_ai.png')
-                    images[0].save(png_path, 'PNG')
-                    raster_path = png_path
+                pdf_page_count = prepared_page.page_count
+                scale_calibration = prepared_page.scale_calibration
+                vector_cleanup = prepared_page.vector_cleanup
+                png_path = os.path.join(target_dir, 'building_plan_ai.png')
+                cv2.imwrite(png_path, prepared_page.render_bgr)
+                raster_path = png_path
             except Exception as e:
                 return jsonify({'error': f'PDF conversion failed: {e}'}), 500
 
         # AI 推理
-        img_bgr = cv2.imread(raster_path)
+        img_bgr = (
+            prepared_page.cleaned_bgr.copy()
+            if prepared_page is not None
+            else cv2.imread(raster_path)
+        )
         if img_bgr is None:
             return jsonify({'error': 'Cannot decode image'}), 400
 
-        original_bgr = img_bgr.copy()
-        combined_cleanup_mask = np.zeros(img_bgr.shape[:2], dtype=np.uint8)
-        structural_support_mask = None
-        inference_roi = None
-        if dimension_page_data is not None:
-            dimension_page_data['render_size_px'] = [img_bgr.shape[1], img_bgr.shape[0]]
-        if dimension_page_data is not None and dimension_cleanup_candidates:
-            annotation_mask = build_dimension_annotation_mask(
-                dimension_page_data,
-                dimension_cleanup_candidates,
-            )
-            annotation_mask_path = os.path.join(target_dir, 'pdf_dimension_mask.png')
-            cv2.imwrite(annotation_mask_path, annotation_mask)
-            combined_cleanup_mask = cv2.bitwise_or(combined_cleanup_mask, annotation_mask)
+        original_bgr = (
+            prepared_page.render_bgr.copy()
+            if prepared_page is not None
+            else img_bgr.copy()
+        )
+        combined_cleanup_mask = (
+            prepared_page.cleanup_mask.copy()
+            if prepared_page is not None
+            else np.zeros(img_bgr.shape[:2], dtype=np.uint8)
+        )
+        structural_support_mask = (
+            prepared_page.structural_support_mask
+            if prepared_page is not None
+            else None
+        )
+        inference_roi = (
+            prepared_page.inference_roi
+            if prepared_page is not None
+            else None
+        )
+        has_vector_geometry = bool(
+            prepared_page is not None
+            and prepared_page.vector_cleanup.get('has_vector_geometry')
+        )
 
-        if dimension_page_data is not None and dimension_page_data.get('has_vector_geometry'):
-            nonstructural_mask, nonstructural_evidence = build_nonstructural_vector_mask(
-                dimension_page_data,
-            )
-            structural_support_mask, structural_evidence = build_structural_vector_mask(
-                dimension_page_data,
-            )
-            building_roi = detect_building_roi(dimension_page_data)
-            vector_cleanup = {
-                'enabled': bool(
-                    nonstructural_evidence.get('enabled')
-                    or structural_evidence.get('enabled')
-                    or building_roi.get('enabled')
-                ),
-                'has_vector_geometry': True,
-                'has_vector_text': bool(dimension_page_data.get('has_vector_text')),
-                'ocr': ocr_evidence,
-                'nonstructural_mask': nonstructural_evidence,
-                'structural_mask': structural_evidence,
-                'building_roi': building_roi,
-            }
-            if nonstructural_evidence.get('enabled'):
-                nonstructural_path = os.path.join(target_dir, 'pdf_nonstructural_mask.png')
-                cv2.imwrite(nonstructural_path, nonstructural_mask)
-                combined_cleanup_mask = cv2.bitwise_or(
+        if prepared_page is not None and has_vector_geometry:
+            if np.any(combined_cleanup_mask):
+                cv2.imwrite(
+                    os.path.join(target_dir, 'pdf_nonstructural_mask.png'),
                     combined_cleanup_mask,
-                    nonstructural_mask,
                 )
-            if structural_evidence.get('enabled'):
+            if (
+                structural_support_mask is not None
+                and vector_cleanup.get('structural_mask', {}).get('enabled')
+            ):
                 cv2.imwrite(
                     os.path.join(target_dir, 'pdf_structural_mask.png'),
                     structural_support_mask,
                 )
-            if building_roi.get('enabled'):
-                inference_roi = building_roi.get('bbox_px')
+            building_roi = vector_cleanup.get('building_roi') or {
+                'enabled': False,
+                'bbox_px': None,
+            }
             roi_path = os.path.join(target_dir, 'pdf_building_roi.json')
             with open(roi_path, 'w', encoding='utf-8') as roi_file:
                 json.dump(building_roi, roi_file, ensure_ascii=False, indent=2)
 
-        if np.any(combined_cleanup_mask):
-            img_bgr = remove_dimension_annotations(img_bgr, combined_cleanup_mask)
-        if dimension_page_data is not None and dimension_page_data.get('has_vector_geometry'):
+        if prepared_page is not None and has_vector_geometry:
             cv2.imwrite(os.path.join(target_dir, 'pdf_model_input.png'), img_bgr)
 
         predict_kwargs = {}
-        if dimension_page_data is not None and dimension_page_data.get('has_vector_geometry'):
+        if has_vector_geometry:
             topology_min_room_area_px = min(
                 5000.0,
                 max(500.0, img_bgr.shape[0] * img_bgr.shape[1] * 0.0002),

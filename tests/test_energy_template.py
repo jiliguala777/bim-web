@@ -8,6 +8,7 @@ import tempfile
 from contextlib import redirect_stderr, redirect_stdout
 from unittest.mock import MagicMock, patch
 
+import cv2
 import numpy as np
 
 
@@ -481,6 +482,19 @@ class EnergyRouteClientTests(unittest.TestCase):
         pdf_bytes.seek(0)
         return pdf_bytes
 
+    @staticmethod
+    def make_pdf_segmenter(result):
+        from floorplan_onnx import FloorplanSegmenterONNX
+
+        real_preprocessor = FloorplanSegmenterONNX.__new__(FloorplanSegmenterONNX)
+        real_preprocessor.img_size = 512
+        segmenter = MagicMock()
+        segmenter.remove_annotations.side_effect = real_preprocessor.remove_annotations
+        segmenter.preprocess_dark_cad.side_effect = real_preprocessor.preprocess_dark_cad
+        segmenter.prepare_model_input.side_effect = real_preprocessor.prepare_model_input
+        segmenter.predict.return_value = result
+        return segmenter
+
     def test_pdf_prepare_saves_upload_once_and_returns_page_count(self):
         with tempfile.TemporaryDirectory() as upload_root:
             previous_upload = self.server.app.config["UPLOAD_FOLDER"]
@@ -548,6 +562,12 @@ class EnergyRouteClientTests(unittest.TestCase):
                     content_type="multipart/form-data",
                 ).get_json()
                 segmenter = MagicMock()
+                from floorplan_onnx import FloorplanSegmenterONNX
+                real_preprocessor = FloorplanSegmenterONNX.__new__(FloorplanSegmenterONNX)
+                real_preprocessor.img_size = 512
+                segmenter.remove_annotations.side_effect = real_preprocessor.remove_annotations
+                segmenter.preprocess_dark_cad.side_effect = real_preprocessor.preprocess_dark_cad
+                segmenter.prepare_model_input.side_effect = real_preprocessor.prepare_model_input
                 segmenter.predict.return_value = {
                     "mask": np.zeros((2, 2), dtype=np.uint8),
                     "overlay": np.zeros((2, 2, 3), dtype=np.uint8),
@@ -565,8 +585,14 @@ class EnergyRouteClientTests(unittest.TestCase):
                     patch.object(self.server, "HAS_FLOORPLAN_AI", True),
                     patch.object(self.server, "HAS_VECTOR_PDF_SCALE", True),
                     patch.object(self.server, "_floorplan_segmenter", segmenter, create=True),
-                    patch.object(self.server, "extract_vector_page", return_value=page_data) as extract_page,
-                    patch("pdf2image.convert_from_path", return_value=[Image.new("RGB", (2, 2), "white")]) as render_page,
+                    patch(
+                        "floorplan_page_pipeline.extract_vector_page",
+                        return_value=page_data,
+                    ) as extract_page,
+                    patch(
+                        "floorplan_page_pipeline.convert_from_path",
+                        return_value=[Image.new("RGB", (2, 2), "white")],
+                    ) as render_page,
                 ):
                     response = self.client.post(
                         "/energy/ai_recognize",
@@ -582,7 +608,7 @@ class EnergyRouteClientTests(unittest.TestCase):
 
             self.assertEqual(response.status_code, 200, response.get_json())
             extract_page.assert_called_once_with(
-                str(next((Path(upload_root) / "energy" / "PAGE-TWO").glob("building_plan_prepared_*.pdf"))),
+                next((Path(upload_root) / "energy" / "PAGE-TWO").glob("building_plan_prepared_*.pdf")).resolve(),
                 page_index=1,
                 dpi=100,
             )
@@ -597,6 +623,105 @@ class EnergyRouteClientTests(unittest.TestCase):
             )
             self.assertEqual(saved["pdf_page_number"], 2)
             self.assertEqual(saved["pdf_page_count"], 2)
+
+    def test_ai_recognize_uses_shared_prepared_page_outputs(self):
+        from floorplan_page_pipeline import PreparedFloorplanPage
+
+        with tempfile.TemporaryDirectory() as upload_root:
+            previous_upload = self.server.app.config["UPLOAD_FOLDER"]
+            self.server.app.config["UPLOAD_FOLDER"] = upload_root
+            try:
+                prepared_upload = self.client.post(
+                    "/energy/pdf_prepare",
+                    data={
+                        "report_number": "SHARED-PAGE",
+                        "raster_file": (self.make_pdf_bytes(["ONE", "TWO"]), "floors.pdf"),
+                    },
+                    content_type="multipart/form-data",
+                ).get_json()
+                roi = {
+                    "enabled": True,
+                    "bbox_px": [0, 0, 2, 2],
+                    "confidence": 0.9,
+                    "reason": "test",
+                }
+                prepared_page = PreparedFloorplanPage(
+                    page_number=2,
+                    page_count=2,
+                    render_bgr=np.full((2, 2, 3), 255, dtype=np.uint8),
+                    cleaned_bgr=np.zeros((2, 2, 3), dtype=np.uint8),
+                    model_view_rgb=np.zeros((2, 2, 3), dtype=np.uint8),
+                    model_input_512=np.zeros((1, 3, 512, 512), dtype=np.float32),
+                    model_input_metadata={
+                        "original_size": [2, 2],
+                        "resized_size": [512, 512],
+                        "padding": [0, 0, 0, 0],
+                        "resize_scale": 256.0,
+                    },
+                    scale_calibration={"status": "manual_required", "method": "test"},
+                    vector_cleanup={
+                        "enabled": True,
+                        "has_vector_geometry": True,
+                        "has_vector_text": False,
+                        "ocr": {"status": "not_needed"},
+                        "nonstructural_mask": {"enabled": False},
+                        "structural_mask": {"enabled": True},
+                        "building_roi": roi,
+                    },
+                    inference_roi=[0, 0, 2, 2],
+                    cleanup_mask=np.zeros((2, 2), dtype=np.uint8),
+                    structural_support_mask=np.ones((2, 2), dtype=np.uint8) * 255,
+                    artifacts={},
+                )
+                segmenter = MagicMock()
+                from floorplan_onnx import FloorplanSegmenterONNX
+                real_preprocessor = FloorplanSegmenterONNX.__new__(FloorplanSegmenterONNX)
+                real_preprocessor.img_size = 512
+                segmenter.remove_annotations.side_effect = real_preprocessor.remove_annotations
+                segmenter.preprocess_dark_cad.side_effect = real_preprocessor.preprocess_dark_cad
+                segmenter.prepare_model_input.side_effect = real_preprocessor.prepare_model_input
+                segmenter.predict.return_value = {
+                    "mask": np.zeros((2, 2), dtype=np.uint8),
+                    "overlay": np.zeros((2, 2, 3), dtype=np.uint8),
+                    "stats": {},
+                    "geometry": {"walls": [], "windows": [], "doors": []},
+                    "room_topology": {
+                        "status": "no_closed_rooms", "room_count": 0, "rooms": [],
+                        "total_area_px2": 0.0, "total_area_m2": None,
+                        "scale_m_per_px": None, "load_geometry_ready": False,
+                    },
+                    "image_size": [2, 2],
+                }
+                with (
+                    patch.object(self.server, "HAS_FLOORPLAN_AI", True),
+                    patch.object(self.server, "_floorplan_segmenter", segmenter, create=True),
+                    patch.object(
+                        self.server,
+                        "prepare_pdf_page",
+                        return_value=prepared_page,
+                        create=True,
+                    ),
+                ):
+                    response = self.client.post(
+                        "/energy/ai_recognize",
+                        data={
+                            "report_number": "SHARED-PAGE",
+                            "pdf_upload_token": prepared_upload["upload_token"],
+                            "pdf_page_number": "2",
+                        },
+                    )
+            finally:
+                self.server.app.config["UPLOAD_FOLDER"] = previous_upload
+
+            self.assertEqual(response.status_code, 200, response.get_json())
+            body = response.get_json()
+            self.assertEqual(body["vector_cleanup"]["building_roi"], roi)
+            self.assertEqual(body["scale_calibration"]["method"], "test")
+            saved_model_input = cv2.imread(
+                str(Path(upload_root) / "energy" / "SHARED-PAGE" / "pdf_model_input.png")
+            )
+            self.assertIsNotNone(saved_model_input)
+            self.assertEqual(int(saved_model_input.max()), 0)
 
     def test_ai_recognize_rejects_invalid_prepared_pdf_reference_or_page(self):
         with tempfile.TemporaryDirectory() as upload_root:
@@ -648,6 +773,12 @@ class EnergyRouteClientTests(unittest.TestCase):
                     content_type="multipart/form-data",
                 ).get_json()
                 segmenter = MagicMock()
+                from floorplan_onnx import FloorplanSegmenterONNX
+                real_preprocessor = FloorplanSegmenterONNX.__new__(FloorplanSegmenterONNX)
+                real_preprocessor.img_size = 512
+                segmenter.remove_annotations.side_effect = real_preprocessor.remove_annotations
+                segmenter.preprocess_dark_cad.side_effect = real_preprocessor.preprocess_dark_cad
+                segmenter.prepare_model_input.side_effect = real_preprocessor.prepare_model_input
                 segmenter.predict.return_value = {
                     "mask": np.zeros((100, 120), dtype=np.uint8),
                     "raw_model_mask": np.ones((100, 120), dtype=np.uint8),
@@ -693,11 +824,11 @@ class EnergyRouteClientTests(unittest.TestCase):
                     patch.object(self.server, "HAS_FLOORPLAN_AI", True),
                     patch.object(self.server, "HAS_VECTOR_PDF_SCALE", True),
                     patch.object(self.server, "_floorplan_segmenter", segmenter, create=True),
-                    patch.object(self.server, "extract_vector_page", return_value=page_data) as extract_page,
-                    patch.object(self.server, "build_nonstructural_vector_mask", return_value=(vector_mask, cleanup_evidence), create=True),
-                    patch.object(self.server, "build_structural_vector_mask", return_value=(structural_mask, {"enabled": True, "dark_edge_count": 50, "masked_pixels": 8000}), create=True),
-                    patch.object(self.server, "detect_building_roi", return_value=roi, create=True),
-                    patch("pdf2image.convert_from_path", return_value=[Image.new("RGB", (120, 100), "white")]) as render_page,
+                    patch("floorplan_page_pipeline.extract_vector_page", return_value=page_data) as extract_page,
+                    patch("floorplan_page_pipeline.build_nonstructural_vector_mask", return_value=(vector_mask, cleanup_evidence)),
+                    patch("floorplan_page_pipeline.build_structural_vector_mask", return_value=(structural_mask, {"enabled": True, "dark_edge_count": 50, "masked_pixels": 8000})),
+                    patch("floorplan_page_pipeline.detect_building_roi", return_value=roi),
+                    patch("floorplan_page_pipeline.convert_from_path", return_value=[Image.new("RGB", (120, 100), "white")]) as render_page,
                 ):
                     response = self.client.post(
                         "/energy/ai_recognize",
@@ -714,7 +845,7 @@ class EnergyRouteClientTests(unittest.TestCase):
             self.assertEqual(extract_page.call_args.kwargs["dpi"], 100)
             self.assertEqual(
                 [call.kwargs["dpi"] for call in render_page.call_args_list],
-                [100, 200],
+                [100],
             )
             kwargs = segmenter.predict.call_args.kwargs
             self.assertEqual(kwargs["inference_roi"], [10, 10, 110, 90])
@@ -852,6 +983,7 @@ class EnergyRouteClientTests(unittest.TestCase):
 
     def test_vector_pdf_recognition_persists_confirmed_scale_and_masks_dimensions(self):
         from reportlab.pdfgen import canvas
+        from floorplan_onnx import FloorplanSegmenterONNX
 
         pdf_bytes = io.BytesIO()
         pdf = canvas.Canvas(pdf_bytes, pagesize=(400, 300))
@@ -876,6 +1008,11 @@ class EnergyRouteClientTests(unittest.TestCase):
         pdf_bytes.seek(0)
 
         segmenter = MagicMock()
+        real_preprocessor = FloorplanSegmenterONNX.__new__(FloorplanSegmenterONNX)
+        real_preprocessor.img_size = 512
+        segmenter.remove_annotations.side_effect = real_preprocessor.remove_annotations
+        segmenter.preprocess_dark_cad.side_effect = real_preprocessor.preprocess_dark_cad
+        segmenter.prepare_model_input.side_effect = real_preprocessor.prepare_model_input
         segmenter.predict.return_value = {
             "mask": np.zeros((2, 2), dtype=np.uint8),
             "overlay": np.zeros((2, 2, 3), dtype=np.uint8),
@@ -935,6 +1072,7 @@ class EnergyRouteClientTests(unittest.TestCase):
 
     def test_vector_pdf_without_text_uses_ocr_scale_fallback(self):
         from reportlab.pdfgen import canvas
+        from floorplan_onnx import FloorplanSegmenterONNX
 
         pdf_bytes = io.BytesIO()
         pdf = canvas.Canvas(pdf_bytes, pagesize=(400, 300))
@@ -973,6 +1111,11 @@ class EnergyRouteClientTests(unittest.TestCase):
             },
         ]
         segmenter = MagicMock()
+        real_preprocessor = FloorplanSegmenterONNX.__new__(FloorplanSegmenterONNX)
+        real_preprocessor.img_size = 512
+        segmenter.remove_annotations.side_effect = real_preprocessor.remove_annotations
+        segmenter.preprocess_dark_cad.side_effect = real_preprocessor.preprocess_dark_cad
+        segmenter.prepare_model_input.side_effect = real_preprocessor.prepare_model_input
         segmenter.predict.return_value = {
             "mask": np.zeros((2, 2), dtype=np.uint8),
             "overlay": np.zeros((2, 2, 3), dtype=np.uint8),
@@ -997,9 +1140,8 @@ class EnergyRouteClientTests(unittest.TestCase):
                 with (
                     patch.object(self.server, "HAS_FLOORPLAN_AI", True),
                     patch.object(self.server, "_floorplan_segmenter", segmenter, create=True),
-                    patch.object(
-                        self.server,
-                        "extract_numeric_text_spans",
+                    patch(
+                        "floorplan_page_pipeline.extract_numeric_text_spans",
                         return_value=(ocr_spans, {
                             "status": "completed",
                             "candidate_count": 2,
@@ -1008,9 +1150,8 @@ class EnergyRouteClientTests(unittest.TestCase):
                         }),
                         create=True,
                     ) as extract_ocr,
-                    patch.object(
-                        self.server,
-                        "build_dimension_annotation_mask",
+                    patch(
+                        "floorplan_page_pipeline.build_dimension_annotation_mask",
                         return_value=np.zeros((417, 556), dtype=np.uint8),
                     ) as dimension_mask,
                     patch.dict(os.environ, {

@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>BIM Web</title>
+    <link rel="stylesheet" href="/static/style.css">
+    <style>
+        body { min-height: 100vh; display: grid; place-items: center; padding: 32px; }
+        .landing { max-width: 760px; text-align: center; }
+        .landing h1 { margin-bottom: 16px; font-size: 40px; }
+        .landing p { margin-bottom: 28px; color: rgba(255,255,255,.72); line-height: 1.7; }
+        .actions { display: flex; gap: 12px; justify-content: center; flex-wrap: wrap; }
+        .actions a { padding: 12px 18px; border-radius: 8px; color: #fff; text-decoration: none; background: #3498db; }
+        .actions a.secondary { background: rgba(255,255,255,.12); }
+    </style>
+</head>
+<body>
+    <main class="landing">
+        <h1>BIM Web</h1>
+        <p>建筑平面图 AI 识别与能耗计算入口。上传平面图后可提取墙、窗、门等构件，并进入建筑负荷与能耗计算流程。</p>
+        <div class="actions">
+            <a href="/home">打开识别工具</a>
+            <a class="secondary" href="/energy">打开能耗计算</a>
+            <a class="secondary" href="/login">登录</a>
+        </div>
+    </main>
+</body>
+</html>

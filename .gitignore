@@ -1,0 +1,76 @@
+﻿# 坚果云同步状态文件
+*.nssyncsc
+.nssyncsc/
+
+# 常见依赖/产物
+node_modules/
+.venv/
+__pycache__/
+*.pyc
+dist/
+build/
+.DS_Store
+Thumbs.db
+
+# 本地运行产物
+uploads/
+jobs/
+*.log
+server.out.local.log
+server.err.local.log
+
+# 本地账号/会话数据库，不作为代码基线提交
+users.db
+
+# 敏感信息：密钥、凭据、服务器清单、运维脚本、含服务器IP的技术方案（请勿提交）
+API-Key汇总.md
+服务器清单.md
+New-API反代配置.md
+00_对话提炼与技术方案.md
+dmit_ssh/
+*.pem
+*.ppk
+id_rsa*
+
+# 环境变量与本机配置
+.env
+.env.*
+!.env.example
+
+# 本地工具状态
+.playwright-cli/
+.codex/
+.agents/
+.superpowers/
+
+# 临时输出与验证产物
+tmp/
+artifacts/
+output/
+.venv-*/
+
+# 模型权重单独交付，不进入 Git
+models/*.pt
+models/*.pth
+models/*.onnx
+models/*.ckpt
+
+# SQLite 临时文件和备份
+*.db-wal
+*.db-shm
+*_before_*.db
+
+# 数据目录默认排除，仅保留正式运行数据库
+data/*
+!data/building_library.db
+!data/envelope_databases/
+data/envelope_databases/*
+!data/envelope_databases/door.db
+!data/envelope_databases/exterior_wall.db
+!data/envelope_databases/floor.db
+!data/envelope_databases/floor_contact.db
+!data/envelope_databases/roof.db
+!data/envelope_databases/shading.db
+!data/envelope_databases/wall_insulation.db
+!data/envelope_databases/window_air_tightness.db
+!data/envelope_databases/windows.db

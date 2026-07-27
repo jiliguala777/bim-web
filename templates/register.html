@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Register - BIM Web</title>
+    <link rel="stylesheet" href="/static/style.css">
+    <style>
+        body { min-height: 100vh; display: grid; place-items: center; padding: 24px; }
+        form { width: min(360px, 100%); display: grid; gap: 14px; }
+        input, button { height: 44px; border-radius: 8px; border: 1px solid rgba(255,255,255,.16); padding: 0 12px; }
+        input { background: rgba(255,255,255,.08); color: #fff; }
+        button { background: #3498db; color: #fff; cursor: pointer; }
+        a { color: #8ecbff; }
+        .msg { min-height: 22px; color: #ffb4b4; }
+    </style>
+</head>
+<body>
+    <form id="registerForm">
+        <h1>注册</h1>
+        <input name="username" autocomplete="username" placeholder="用户名" required>
+        <input name="password" type="password" autocomplete="new-password" placeholder="密码" required>
+        <button type="submit">注册</button>
+        <div class="msg" id="msg"></div>
+        <a href="/login">返回登录</a>
+    </form>
+    <script>
+        document.getElementById('registerForm').addEventListener('submit', async (event) => {
+            event.preventDefault();
+            const form = new FormData(event.currentTarget);
+            const res = await fetch('/register', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(Object.fromEntries(form))
+            });
+            if (res.ok) location.href = '/login';
+            else document.getElementById('msg').textContent = (await res.json()).message || '注册失败';
+        });
+    </script>
+</body>
+</html>

@@ -1,0 +1,19 @@
+[Unit]
+Description=BIM Web Flask Service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=bimweb
+Group=bimweb
+WorkingDirectory=/opt/bim-web/app
+EnvironmentFile=/etc/bim-web/bim-web.env
+ExecStart=/opt/bim-web/venv/bin/gunicorn --workers 1 --threads 2 --worker-class gthread --timeout 300 --bind 127.0.0.1:8000 --access-logfile - --error-logfile - web_server_server:app
+Restart=on-failure
+RestartSec=5
+PrivateTmp=true
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,17 @@
+flask
+werkzeug
+numpy
+psutil
+opencv-python-headless
+onnxruntime
+ezdxf
+shapely
+pvlib
+pyarrow
+python-docx
+pywin32; sys_platform == "win32"
+gunicorn>=22,<24
+pdfplumber>=0.11,<1
+pdf2image>=1.17,<2
+reportlab>=4,<5
+rapidocr>=3.9.2,<4

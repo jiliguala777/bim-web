@@ -52,6 +52,7 @@ class AnnotationStorageTests(unittest.TestCase):
         )
         self.assertEqual(project_manifest["source_original_name"], "source.pdf")
         self.assertEqual(project_manifest["page_count"], 4)
+        self.assertEqual(project_manifest["pages"]["1"]["status"], "prepared")
         self.assertEqual(
             project_manifest["pages"]["1"]["preparation"]["artifacts"]["model_view"],
             "projects/example/page-1/model_view.png",

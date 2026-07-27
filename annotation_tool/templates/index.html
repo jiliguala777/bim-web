@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>BIM 图纸标注工作台</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+  <header class="topbar">
+    <div>
+      <p class="eyebrow">LOCAL · 127.0.0.1</p>
+      <h1>BIM 图纸标注工作台</h1>
+    </div>
+    <div class="status-cluster">
+      <span id="save-state" class="status-pill" data-state="idle">尚未编辑</span>
+      <span id="page-status" class="status-pill muted">未选择页面</span>
+    </div>
+  </header>
+
+  <main class="workspace">
+    <aside class="panel project-panel">
+      <section>
+        <h2>1. 导入 PDF</h2>
+        <form id="project-form">
+          <label for="project-name">项目名称</label>
+          <input id="project-name" name="name" placeholder="例如：四层办公楼">
+          <label for="pdf-file">建筑图纸 PDF</label>
+          <input id="pdf-file" name="pdf" type="file" accept="application/pdf,.pdf" required>
+          <button type="submit" class="primary">导入并建立项目</button>
+        </form>
+      </section>
+
+      <section>
+        <h2>2. 选择项目与楼层页</h2>
+        <label for="project-select">已有项目</label>
+        <select id="project-select"><option value="">请选择</option></select>
+        <label for="page-select">PDF 页面</label>
+        <select id="page-select" disabled><option value="">请选择</option></select>
+        <button id="prepare-page" type="button" disabled>准备所选页面</button>
+      </section>
+
+      <section class="page-list-section">
+        <h2>页面状态</h2>
+        <div id="page-list" class="page-list">
+          <p class="empty">导入 PDF 后显示</p>
+        </div>
+      </section>
+    </aside>
+
+    <section class="canvas-panel">
+      <div class="canvas-toolbar">
+        <div class="segmented" aria-label="底图视图">
+          <button id="view-original" type="button" data-view="render" class="active">原图</button>
+          <button id="view-cleaned" type="button" data-view="cleaned">清理图</button>
+          <button id="view-model" type="button" data-view="model_view">模型图</button>
+        </div>
+        <span id="zoom-label">100%</span>
+        <button id="fit-view" type="button">适合窗口</button>
+      </div>
+      <div id="viewport" class="viewport">
+        <div id="canvas-transform" class="canvas-transform">
+          <canvas id="image-canvas" aria-label="图纸底图"></canvas>
+          <canvas id="mask-canvas" aria-label="标注蒙版"></canvas>
+        </div>
+        <div id="canvas-empty" class="canvas-empty">
+          <strong>先选择并准备一个 PDF 页面</strong>
+          <span>滚轮缩放 · 空格拖动画布 · 鼠标绘制构件骨架</span>
+        </div>
+      </div>
+    </section>
+
+    <aside class="panel tool-panel">
+      <section>
+        <h2>3. 构件骨架粗线</h2>
+        <p class="hint">墙线在 512 模型空间中建议 4–8 像素。门窗沿其中心骨架绘制。</p>
+        <div class="tool-grid">
+          <button type="button" class="class-tool active wall" data-class-id="1">
+            <span></span>墙 Wall <kbd>1</kbd>
+          </button>
+          <button type="button" class="class-tool window" data-class-id="2">
+            <span></span>窗 Window <kbd>2</kbd>
+          </button>
+          <button type="button" class="class-tool door" data-class-id="3">
+            <span></span>门 Door <kbd>3</kbd>
+          </button>
+          <button type="button" class="class-tool eraser" data-class-id="0">
+            <span></span>橡皮擦 <kbd>0</kbd>
+          </button>
+        </div>
+        <label for="brush-size">模型空间线宽 <output id="brush-output">6 px</output></label>
+        <input id="brush-size" type="range" min="2" max="16" value="6">
+      </section>
+
+      <section>
+        <h2>编辑</h2>
+        <div class="button-row">
+          <button id="undo" type="button" disabled>撤销</button>
+          <button id="redo" type="button" disabled>重做</button>
+        </div>
+        <button id="preannotate" type="button" disabled>运行当前 ONNX 预标注</button>
+        <button id="save" type="button" disabled>保存草稿</button>
+        <button id="confirm" type="button" class="primary" disabled>确认本页标注</button>
+      </section>
+
+      <section>
+        <h2>4. 导出训练数据</h2>
+        <p class="hint">只有“已确认”的页面会进入训练集。单页导出会标记为 single_page_overfit。</p>
+        <button id="export" type="button" disabled>导出已确认页面</button>
+      </section>
+
+      <section>
+        <h2>检查信息</h2>
+        <div id="warnings" class="message-list"></div>
+        <pre id="event-log" class="event-log">等待操作…</pre>
+      </section>
+    </aside>
+  </main>
+
+  <script src="{{ url_for('static', filename='app.js') }}" defer></script>
+</body>
+</html>

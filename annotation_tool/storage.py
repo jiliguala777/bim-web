@@ -204,6 +204,8 @@ class AnnotationStore:
             },
         )
         page["preparation"] = manifest
+        if page.get("status") == "unprepared":
+            page["status"] = "prepared"
         page["updated_at"] = updated_at
         page_count = manifest.get("page_count")
         if page_count is not None:

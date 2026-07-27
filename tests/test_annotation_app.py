@@ -1,4 +1,5 @@
 import io
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -212,6 +213,49 @@ class AnnotationApiTests(unittest.TestCase):
             exported.get_json()["export"]["experiment_type"],
             "single_page_overfit",
         )
+
+
+class AnnotationTemplateTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        config = AnnotationConfig(data_root=Path(self.temporary.name) / "annotation-data")
+        self.app = create_app(config)
+        self.app.config["TESTING"] = True
+
+    def tearDown(self):
+        self.temporary.cleanup()
+
+    def test_workspace_contains_the_annotation_controls(self):
+        response = self.app.test_client().get("/")
+        markup = response.get_data(as_text=True)
+
+        self.assertEqual(response.status_code, 200)
+        for element_id in (
+            "pdf-file",
+            "page-select",
+            "view-original",
+            "view-cleaned",
+            "view-model",
+            "mask-canvas",
+            "undo",
+            "redo",
+            "save",
+            "confirm",
+            "preannotate",
+            "export",
+        ):
+            self.assertIn(f'id="{element_id}"', markup)
+        for class_id in (1, 2, 3):
+            self.assertIn(f'data-class-id="{class_id}"', markup)
+
+    def test_default_segmenter_uses_the_configured_onnx_model_path(self):
+        store = self.app.extensions["annotation_store"]
+        with patch.dict(os.environ, {"ONNX_MODEL_PATH": r"G:\models\custom.onnx"}):
+            with patch("annotation_tool.services.get_segmenter") as get_segmenter:
+                service = AnnotationService(store)
+                service._segmenter()
+
+        get_segmenter.assert_called_once_with(r"G:\models\custom.onnx")
 
 
 if __name__ == "__main__":

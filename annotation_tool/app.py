@@ -7,7 +7,8 @@ import io
 import os
 
 import cv2
-from flask import Flask, jsonify, request, send_file
+import numpy as np
+from flask import Flask, jsonify, render_template, request, send_file
 
 from .config import AnnotationConfig
 from .services import AnnotationService
@@ -38,6 +39,10 @@ def create_app(config: AnnotationConfig | None = None) -> Flask:
     )
     app.extensions["annotation_store"] = store
     app.extensions["annotation_service"] = service
+
+    @app.get("/")
+    def workspace():
+        return render_template("index.html")
 
     @app.errorhandler(ValueError)
     def invalid_request(error):
@@ -81,6 +86,13 @@ def create_app(config: AnnotationConfig | None = None) -> Flask:
         if current is None:
             raise FileNotFoundError("Page does not have an annotation mask")
         mask, version = current
+        if request.args.get("space") == "model512":
+            mask_path = version.mask_path.with_name(f"{version.version_id}.mask_512.npy")
+            if not mask_path.is_file():
+                raise FileNotFoundError("Model-space mask does not exist")
+            mask = np.load(mask_path, allow_pickle=False)
+        elif request.args.get("space") not in (None, "", "full"):
+            raise ValueError("mask space is invalid")
         encoded, buffer = cv2.imencode(".png", mask)
         if not encoded:
             raise ValueError("mask could not be encoded")

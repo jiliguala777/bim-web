@@ -66,11 +66,16 @@ class AnnotationService:
         store: AnnotationStore,
         *,
         poppler_path: str | None = None,
-        segmenter_factory=get_segmenter,
+        segmenter_factory=None,
     ):
         self.store = store
         self.poppler_path = poppler_path or os.environ.get("POPPLER_PATH")
         self.segmenter_factory = segmenter_factory
+
+    def _segmenter(self):
+        if self.segmenter_factory is not None:
+            return self.segmenter_factory()
+        return get_segmenter(os.environ.get("ONNX_MODEL_PATH") or None)
 
     def list_projects(self) -> list[dict]:
         return [_json_safe_project(project) for project in self.store.list_projects()]
@@ -151,7 +156,7 @@ class AnnotationService:
         project = self._project(project_id)
         self._validate_page(project, page_number)
         output_dir = self._page_dir(project_id, page_number)
-        segmenter = self.segmenter_factory()
+        segmenter = self._segmenter()
         prepared = prepare_pdf_page(
             self._source_path(project),
             page_number,
@@ -328,7 +333,7 @@ class AnnotationService:
         cleaned = cv2.imread(str(cleaned_path), cv2.IMREAD_COLOR)
         if cleaned is None:
             raise ValueError("prepared page image cannot be read")
-        segmenter = self.segmenter_factory()
+        segmenter = self._segmenter()
         try:
             prediction = segmenter.predict(
                 cleaned,

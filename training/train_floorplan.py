@@ -179,6 +179,8 @@ def train(
     if device.type == "cuda" and not torch.cuda.is_available():
         raise ValueError("CUDA was requested but is not available")
     output_dir = config.output_dir
+    if output_dir.exists() and any(output_dir.iterdir()):
+        raise ValueError("output_dir must be empty for a new experiment")
     output_dir.mkdir(parents=True, exist_ok=True)
     model = load_model_strict(
         config.checkpoint_path,

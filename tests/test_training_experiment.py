@@ -132,6 +132,25 @@ class TrainingExperimentTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "state_dict"):
             load_model_strict(incompatible, TinySegmentationModel, device="cpu")
 
+    def test_training_refuses_to_reuse_a_nonempty_output_directory(self):
+        output = self.root / "existing-output"
+        output.mkdir()
+        sentinel = output / "best.pt"
+        sentinel.write_bytes(b"do-not-overwrite")
+        config = TrainingConfig(
+            dataset_path=self.export,
+            checkpoint_path=self.initial,
+            output_dir=output,
+            epochs=1,
+            device="cpu",
+            augmentation_count=1,
+        )
+
+        with self.assertRaisesRegex(ValueError, "empty"):
+            train(config, model_factory=TinySegmentationModel)
+
+        self.assertEqual(sentinel.read_bytes(), b"do-not-overwrite")
+
     def test_real_factory_builds_the_four_class_resnet34_unet(self):
         model = build_floorplan_model()
 

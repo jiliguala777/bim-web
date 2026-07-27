@@ -155,6 +155,11 @@ class AnnotationService:
     def prepare_page(self, project_id: str, page_number: int) -> dict:
         project = self._project(project_id)
         self._validate_page(project, page_number)
+        existing_page = project.get("pages", {}).get(str(page_number), {})
+        if existing_page.get("current_version"):
+            raise ValueError(
+                "page has an annotation; create a new project before re-preparing it"
+            )
         output_dir = self._page_dir(project_id, page_number)
         segmenter = self._segmenter()
         prepared = prepare_pdf_page(
@@ -334,6 +339,7 @@ class AnnotationService:
         if cleaned is None:
             raise ValueError("prepared page image cannot be read")
         segmenter = self._segmenter()
+        inference_failure = None
         try:
             prediction = segmenter.predict(
                 cleaned,
@@ -342,9 +348,16 @@ class AnnotationService:
                 preserve_full_context=True,
             )
             mask = prediction["mask"]
-        except Exception:
+        except Exception as exc:
+            inference_failure = {
+                "type": type(exc).__name__,
+                "message": str(exc),
+            }
             if not allow_blank:
-                raise
+                raise ValueError(
+                    f"preannotation failed ({type(exc).__name__}); "
+                    "choose a blank mask explicitly if needed"
+                ) from exc
             mask = np.zeros(cleaned.shape[:2], dtype=np.uint8)
         version, warnings = self.save_mask(
             project_id,
@@ -353,6 +366,11 @@ class AnnotationService:
             status="preannotated",
             author=author,
         )
+        if inference_failure is not None:
+            warnings.insert(
+                0,
+                "ONNX preannotation failed; an explicit blank mask was created",
+            )
         model_path = Path(
             os.environ.get(
                 "ONNX_MODEL_PATH",
@@ -361,6 +379,8 @@ class AnnotationService:
         )
         evidence = {
             "version_id": version.version_id,
+            "inference_status": "failed" if inference_failure else "passed",
+            "failure": inference_failure,
             "model_path": model_path.name,
             "model_sha256": _sha256(model_path) if model_path.is_file() else None,
         }
@@ -375,6 +395,65 @@ class AnnotationService:
         confirmed = self.store.list_confirmed_pages(project_id)
         if not confirmed:
             raise ValueError("at least one confirmed page is required for export")
+
+        validated_samples = []
+        for page in confirmed:
+            current = self.store.load_current_mask(project_id, page.page_number)
+            if current is None:
+                raise ValueError("confirmed page mask is missing")
+            full_mask, version = current
+            if _sha256(version.mask_path) != version.mask_sha256:
+                raise ValueError("confirmed mask hash does not match its version record")
+            preparation = self._preparation(project_id, page.page_number)
+            if preparation.get("preprocessing_version") != PREPROCESSING_VERSION:
+                raise ValueError("confirmed page preprocessing version is incompatible")
+            width, height = (
+                int(value) for value in preparation["model_input"]["original_size"]
+            )
+            if full_mask.shape != (height, width):
+                raise ValueError("confirmed full-resolution mask dimensions are invalid")
+            if full_mask.size and (
+                int(full_mask.min()) < 0 or int(full_mask.max()) > 3
+            ):
+                raise ValueError("confirmed mask values must be within 0..3")
+            image_source = self.artifact_path(
+                project_id,
+                page.page_number,
+                "model_input_512",
+            )
+            artifact = preparation["artifacts"]["model_input_512"]
+            if _sha256(image_source) != artifact.get("sha256"):
+                raise ValueError("model input artifact hash does not match its manifest")
+            image = cv2.imread(str(image_source), cv2.IMREAD_COLOR)
+            if image is None or image.shape[:2] != (512, 512):
+                raise ValueError("model input artifact must be a readable 512x512 image")
+            model_mask_path = version.mask_path.with_name(
+                f"{version.version_id}.mask_512.npy"
+            )
+            if not model_mask_path.is_file():
+                raise ValueError("confirmed page is missing its 512 model-space mask")
+            model_mask = np.load(model_mask_path, allow_pickle=False)
+            if (
+                model_mask.shape != (512, 512)
+                or model_mask.dtype != np.uint8
+                or (
+                    model_mask.size
+                    and (int(model_mask.min()) < 0 or int(model_mask.max()) > 3)
+                )
+            ):
+                raise ValueError("confirmed 512 mask is invalid")
+            expected_model_mask = self._mask_512(
+                full_mask,
+                preparation["model_input"],
+            )
+            if not np.array_equal(model_mask, expected_model_mask):
+                raise ValueError(
+                    "confirmed 512 mask does not match the full-resolution version"
+                )
+            validated_samples.append(
+                (page, version, image_source, model_mask)
+            )
+
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         export_id = f"{project_id}-{timestamp}"
         export_dir = (self.store.root / "exports" / export_id).resolve()
@@ -386,22 +465,7 @@ class AnnotationService:
 
         samples = []
         class_pixels = {str(class_id): 0 for class_id in range(4)}
-        for page in confirmed:
-            current = self.store.load_current_mask(project_id, page.page_number)
-            if current is None:
-                raise ValueError("confirmed page mask is missing")
-            _, version = current
-            image_source = self.artifact_path(
-                project_id,
-                page.page_number,
-                "model_input_512",
-            )
-            model_mask_path = version.mask_path.with_name(
-                f"{version.version_id}.mask_512.npy"
-            )
-            if not model_mask_path.is_file():
-                raise ValueError("confirmed page is missing its 512 model-space mask")
-            mask = np.load(model_mask_path, allow_pickle=False)
+        for page, version, image_source, mask in validated_samples:
             stem = f"{project_id}-page-{page.page_number}"
             image_target = images_dir / f"{stem}.png"
             mask_target = masks_dir / f"{stem}.npy"

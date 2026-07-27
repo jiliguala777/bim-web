@@ -33,6 +33,9 @@
     autosaveTimer: null,
     saving: null,
     dirty: false,
+    editRevision: 0,
+    pageGeneration: 0,
+    preannotating: false,
   };
 
   const imageCanvas = $("#image-canvas");
@@ -88,6 +91,10 @@
   }
 
   async function selectProject(projectId) {
+    if (state.dirty) await saveMask(true);
+    else if (state.saving) await state.saving;
+    const generation = state.pageGeneration + 1;
+    state.pageGeneration = generation;
     state.project = state.projects.find((project) => project.project_id === projectId) || null;
     state.page = null;
     clearCanvas();
@@ -97,6 +104,10 @@
       return;
     }
     const body = await api(`/api/projects/${encodeURIComponent(projectId)}/pages`);
+    if (
+      generation !== state.pageGeneration
+      || state.project?.project_id !== projectId
+    ) return;
     state.pages = body.pages;
     $("#page-select").innerHTML = '<option value="">请选择</option>' + state.pages
       .map((page) => `<option value="${page.page_number}">第 ${page.page_number} 页 · ${statusText(page.status)}</option>`)
@@ -136,6 +147,10 @@
   }
 
   async function selectPage(pageNumber) {
+    if (state.dirty) await saveMask(true);
+    else if (state.saving) await state.saving;
+    const generation = state.pageGeneration + 1;
+    state.pageGeneration = generation;
     state.page = state.pages.find((page) => page.page_number === Number(pageNumber)) || null;
     if (!state.page) return clearCanvas();
     $("#page-status").textContent = `第 ${state.page.page_number} 页 · ${statusText(state.page.status)}`;
@@ -147,10 +162,20 @@
     state.width = state.page.preparation.model_input.original_size[0];
     state.height = state.page.preparation.model_input.original_size[1];
     setupCanvases();
-    await Promise.all([loadBackground(), loadMask()]);
+    const requestBase = currentBase();
+    const width = state.width;
+    const height = state.height;
+    await Promise.all([
+      loadBackground(requestBase, generation, width, height),
+      loadMask(requestBase, generation, width, height),
+    ]);
+    if (
+      generation !== state.pageGeneration
+      || state.page?.page_number !== Number(pageNumber)
+    ) return;
     resetHistory();
     fitView();
-    setControls(true);
+    setControls(!state.preannotating);
   }
 
   function setupCanvases() {
@@ -172,30 +197,60 @@
     return createImageBitmap(await response.blob());
   }
 
-  async function loadBackground() {
-    state.background = await loadImage(`${currentBase()}/artifact/${state.view}`);
+  async function loadBackground(
+    requestBase = currentBase(),
+    generation = state.pageGeneration,
+    width = state.width,
+    height = state.height,
+    view = state.view
+  ) {
+    const background = await loadImage(`${requestBase}/artifact/${view}`);
+    if (generation !== state.pageGeneration || view !== state.view) {
+      background.close();
+      return false;
+    }
+    state.background?.close?.();
+    state.background = background;
     imageContext.fillStyle = "#fff";
-    imageContext.fillRect(0, 0, state.width, state.height);
-    imageContext.drawImage(state.background, 0, 0, state.width, state.height);
+    imageContext.fillRect(0, 0, width, height);
+    imageContext.drawImage(state.background, 0, 0, width, height);
+    return true;
   }
 
-  async function loadMask() {
-    const response = await fetch(`${currentBase()}/mask`, { cache: "no-store" });
-    state.mask.fill(0);
+  async function loadMask(
+    requestBase = currentBase(),
+    generation = state.pageGeneration,
+    width = state.width,
+    height = state.height
+  ) {
+    const response = await fetch(`${requestBase}/mask`, { cache: "no-store" });
+    if (generation !== state.pageGeneration) return false;
+    const loadedMask = new Uint8Array(width * height);
     if (response.ok) {
       const bitmap = await createImageBitmap(await response.blob());
+      if (generation !== state.pageGeneration) {
+        bitmap.close();
+        return false;
+      }
       const temporary = document.createElement("canvas");
-      temporary.width = state.width;
-      temporary.height = state.height;
+      temporary.width = width;
+      temporary.height = height;
       const context = temporary.getContext("2d", { willReadFrequently: true });
       context.imageSmoothingEnabled = false;
-      context.drawImage(bitmap, 0, 0, state.width, state.height);
-      const pixels = context.getImageData(0, 0, state.width, state.height).data;
-      for (let index = 0; index < state.mask.length; index += 1) state.mask[index] = pixels[index * 4];
+      context.drawImage(bitmap, 0, 0, width, height);
+      bitmap.close();
+      const pixels = context.getImageData(0, 0, width, height).data;
+      for (let index = 0; index < loadedMask.length; index += 1) {
+        loadedMask[index] = pixels[index * 4];
+      }
     }
+    if (generation !== state.pageGeneration) return false;
+    state.mask = loadedMask;
     renderMask();
     state.dirty = false;
+    state.editRevision = 0;
     setSaveState("已载入", "idle");
+    return true;
   }
 
   function renderMask() {
@@ -347,19 +402,20 @@
 
   function markDirty() {
     state.dirty = true;
+    state.editRevision += 1;
     setSaveState("有未保存修改", "dirty");
     clearTimeout(state.autosaveTimer);
     state.autosaveTimer = setTimeout(() => saveMask(false).catch(handleError), 1500);
   }
 
-  async function maskBlob() {
+  async function maskBlob(maskValues, width, height) {
     const temporary = document.createElement("canvas");
-    temporary.width = state.width;
-    temporary.height = state.height;
+    temporary.width = width;
+    temporary.height = height;
     const context = temporary.getContext("2d");
-    const image = context.createImageData(state.width, state.height);
-    for (let index = 0; index < state.mask.length; index += 1) {
-      const value = state.mask[index];
+    const image = context.createImageData(width, height);
+    for (let index = 0; index < maskValues.length; index += 1) {
+      const value = maskValues[index];
       const offset = index * 4;
       image.data[offset] = value;
       image.data[offset + 1] = value;
@@ -375,18 +431,36 @@
   async function saveMask(force = false) {
     if (!state.page || (!state.dirty && !force)) return null;
     if (state.saving) await state.saving;
+    if (!state.page || (!state.dirty && !force)) return null;
     clearTimeout(state.autosaveTimer);
+    const requestBase = currentBase();
+    const projectId = state.project.project_id;
+    const pageNumber = state.page.page_number;
+    const revision = state.editRevision;
+    const maskSnapshot = state.mask.slice();
+    const width = state.width;
+    const height = state.height;
     state.saving = (async () => {
       setSaveState("保存中…", "saving");
       const form = new FormData();
-      form.append("mask", await maskBlob(), `page-${state.page.page_number}.png`);
+      form.append(
+        "mask",
+        await maskBlob(maskSnapshot, width, height),
+        `page-${pageNumber}.png`
+      );
       form.append("author", "local-user");
-      const result = await api(`${currentBase()}/mask`, { method: "POST", body: form });
-      state.dirty = false;
-      setSaveState("已保存", "idle");
-      showWarnings(result.warnings);
-      setCurrentPageStatus(result.status);
-      await inspectModelMask();
+      const result = await api(`${requestBase}/mask`, { method: "POST", body: form });
+      const stillCurrent = (
+        state.project?.project_id === projectId
+        && state.page?.page_number === pageNumber
+      );
+      if (stillCurrent) {
+        state.dirty = state.editRevision !== revision;
+        setSaveState(state.dirty ? "有未保存修改" : "已保存", state.dirty ? "dirty" : "idle");
+        showWarnings(result.warnings);
+        setCurrentPageStatus(result.status);
+        await inspectModelMask(requestBase, maskSnapshot);
+      }
       return result;
     })();
     try {
@@ -396,8 +470,8 @@
     }
   }
 
-  async function inspectModelMask() {
-    const response = await fetch(`${currentBase()}/mask?space=model512`, { cache: "no-store" });
+  async function inspectModelMask(requestBase = currentBase(), fullMask = state.mask) {
+    const response = await fetch(`${requestBase}/mask?space=model512`, { cache: "no-store" });
     if (!response.ok) return;
     const bitmap = await createImageBitmap(await response.blob());
     const canvas = document.createElement("canvas");
@@ -408,7 +482,7 @@
     const pixels = context.getImageData(0, 0, 512, 512).data;
     const modelClasses = new Set();
     for (let index = 0; index < pixels.length; index += 4) modelClasses.add(pixels[index]);
-    const fullClasses = new Set(state.mask);
+    const fullClasses = new Set(fullMask);
     const names = { 1: "墙", 2: "窗", 3: "门" };
     const vanished = [1, 2, 3].filter((classId) => fullClasses.has(classId) && !modelClasses.has(classId));
     if (vanished.length) showWarnings([`${vanished.map((id) => names[id]).join("、")}在 512 模型输入中消失，请加粗标注`]);
@@ -482,7 +556,7 @@
   });
 
   maskCanvas.addEventListener("pointerdown", (event) => {
-    if (!state.mask || state.spaceDown || event.button === 1) return;
+    if (!state.mask || state.preannotating || state.spaceDown || event.button === 1) return;
     state.drawing = true;
     state.lastPoint = canvasPoint(event);
     maskCanvas.setPointerCapture(event.pointerId);
@@ -554,20 +628,87 @@
   $("#save").addEventListener("click", () => saveMask(true).catch(handleError));
 
   $("#preannotate").addEventListener("click", async () => {
+    let generation = state.pageGeneration;
+    let requestBase = null;
+    let replacedDirty = false;
+    let appliedPreannotation = false;
     try {
       if (state.dirty && !confirm("当前未保存修改会被预标注替换，继续吗？")) return;
+      clearTimeout(state.autosaveTimer);
+      if (state.saving) await state.saving;
+      replacedDirty = state.dirty;
+      state.dirty = false;
+      state.editRevision += 1;
+      generation = state.pageGeneration;
+      requestBase = currentBase();
+      const width = state.width;
+      const height = state.height;
+      state.preannotating = true;
+      maskCanvas.style.pointerEvents = "none";
+      $("#project-select").disabled = true;
+      $("#page-select").disabled = true;
+      $("#prepare-page").disabled = true;
+      setControls(false);
+      $("#undo").disabled = true;
+      $("#redo").disabled = true;
       setSaveState("模型识别中…", "saving");
-      const result = await api(`${currentBase()}/preannotate`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ author: "onnx-preannotation", allow_blank: true }),
-      });
+      const requestPreannotation = (allowBlank) => api(`${requestBase}/preannotate`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            author: "onnx-preannotation",
+            allow_blank: allowBlank,
+          }),
+        });
+      let result;
+      try {
+        result = await requestPreannotation(false);
+      } catch (error) {
+        const useBlank = confirm(
+          `ONNX 预标注失败：${error.message}\n\n是否明确改用空白蒙版开始人工标注？`
+        );
+        if (!useBlank) throw error;
+        result = await requestPreannotation(true);
+      }
+      if (generation !== state.pageGeneration) return;
       showWarnings(result.warnings);
-      await loadMask();
+      await loadMask(requestBase, generation, width, height);
+      if (generation !== state.pageGeneration) return;
+      appliedPreannotation = true;
       resetHistory();
       setCurrentPageStatus("preannotated");
-      log("预标注完成，请人工修正后确认");
-    } catch (error) { handleError(error); }
+      const blankCreated = result.warnings.some((warning) => warning.includes("blank mask"));
+      log(
+        blankCreated
+          ? "ONNX 失败，已按你的确认创建空白蒙版"
+          : "预标注完成，请人工修正后确认"
+      );
+    } catch (error) {
+      if (generation === state.pageGeneration) handleError(error);
+    } finally {
+      if (
+        !appliedPreannotation
+        && replacedDirty
+        && generation === state.pageGeneration
+      ) {
+        state.dirty = true;
+        setSaveState("预标注失败，原修改仍未保存", "dirty");
+        clearTimeout(state.autosaveTimer);
+        state.autosaveTimer = setTimeout(
+          () => saveMask(false).catch(handleError),
+          1500
+        );
+      }
+      state.preannotating = false;
+      maskCanvas.style.pointerEvents = "";
+      $("#project-select").disabled = false;
+      $("#page-select").disabled = !state.project;
+      $("#prepare-page").disabled = !state.project;
+      if (state.page?.preparation) {
+        setControls(true);
+        updateHistoryButtons();
+      }
+    }
   });
 
   $("#confirm").addEventListener("click", async () => {

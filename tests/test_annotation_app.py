@@ -1,4 +1,5 @@
 import io
+import hashlib
 import json
 import os
 import tempfile
@@ -157,6 +158,35 @@ class AnnotationApiTests(unittest.TestCase):
         self.assertEqual(preannotation.status_code, 200, preannotation.get_json())
         self.assertEqual(preannotation.get_json()["status"], "preannotated")
 
+        class FailingSegmenter:
+            def predict(self, image, **kwargs):
+                raise RuntimeError("simulated inference failure")
+
+        service.segmenter_factory = FailingSegmenter
+        failed = self.client.post(
+            f"/api/projects/{project['project_id']}/pages/1/preannotate"
+        )
+        self.assertEqual(failed.status_code, 400)
+        self.assertIn("preannotation failed", failed.get_json()["error"])
+        blank = self.client.post(
+            f"/api/projects/{project['project_id']}/pages/1/preannotate",
+            json={"allow_blank": True},
+        )
+        self.assertEqual(blank.status_code, 200, blank.get_json())
+        self.assertTrue(
+            any("blank mask" in warning for warning in blank.get_json()["warnings"])
+        )
+        _, blank_version = self.app.extensions["annotation_store"].load_current_mask(
+            project["project_id"],
+            1,
+        )
+        evidence = json.loads(
+            blank_version.mask_path.with_name(
+                f"{blank_version.version_id}.preannotation.json"
+            ).read_text(encoding="utf-8")
+        )
+        self.assertEqual(evidence["inference_status"], "failed")
+
     def test_draft_confirmation_and_single_page_export_keep_preparation_data(self):
         project = self._create_project()
         store = self.app.extensions["annotation_store"]
@@ -172,6 +202,7 @@ class AnnotationApiTests(unittest.TestCase):
             project["project_id"],
             1,
             {
+                "preprocessing_version": 1,
                 "page_count": 2,
                 "model_input": {
                     "original_size": [4, 4],
@@ -185,7 +216,7 @@ class AnnotationApiTests(unittest.TestCase):
                     },
                     "model_input_512": {
                         "path": str(model_input.relative_to(store.root)),
-                        "sha256": "test-512",
+                        "sha256": hashlib.sha256(model_input.read_bytes()).hexdigest(),
                     }
                 },
             },
@@ -236,6 +267,20 @@ class AnnotationApiTests(unittest.TestCase):
         self.assertEqual(exported_image.shape[:2], (512, 512))
         self.assertEqual(exported_mask.shape, (512, 512))
         self.assertEqual(manifest["samples"][0]["status"], "confirmed")
+        model_input.write_bytes(b"corrupt")
+        corrupted_export = self.client.post(
+            f"/api/projects/{project['project_id']}/export"
+        )
+        self.assertEqual(corrupted_export.status_code, 400)
+        self.assertIn("hash", corrupted_export.get_json()["error"])
+        with patch("annotation_tool.services.prepare_pdf_page") as prepare:
+            repeated = self.client.post(
+                f"/api/projects/{project['project_id']}/pages/prepare",
+                json={"page_number": 1},
+            )
+        self.assertEqual(repeated.status_code, 400)
+        self.assertIn("annotation", repeated.get_json()["error"])
+        prepare.assert_not_called()
 
 
 class AnnotationTemplateTests(unittest.TestCase):
@@ -270,6 +315,16 @@ class AnnotationTemplateTests(unittest.TestCase):
             self.assertIn(f'id="{element_id}"', markup)
         for class_id in (1, 2, 3):
             self.assertIn(f'data-class-id="{class_id}"', markup)
+
+        script = (Path(__file__).resolve().parents[1] / "annotation_tool/static/app.js").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("const requestBase = currentBase();", script)
+        self.assertIn("state.mask.slice()", script)
+        self.assertIn("pageGeneration", script)
+        self.assertIn("clearTimeout(state.autosaveTimer)", script)
+        self.assertIn("replacedDirty", script)
+        self.assertIn("appliedPreannotation", script)
 
     def test_default_segmenter_uses_the_configured_onnx_model_path(self):
         store = self.app.extensions["annotation_store"]

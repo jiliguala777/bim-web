@@ -145,6 +145,11 @@ def export_onnx(
     allow_checker_failure: bool = False,
 ) -> dict[str, Any]:
     """Export, check, execute, and compare the real floorplan model."""
+    destination = Path(output_path).resolve()
+    if destination.exists():
+        raise FileExistsError(f"refusing to overwrite ONNX output: {destination}")
+    if Path(checkpoint_path).resolve() == destination:
+        raise ValueError("checkpoint and ONNX output paths must differ")
     try:
         import onnxruntime as ort
         import torch
@@ -154,7 +159,6 @@ def export_onnx(
         ) from exc
 
     model = load_checkpoint_model(checkpoint_path)
-    destination = Path(output_path)
     destination.parent.mkdir(parents=True, exist_ok=True)
 
     generator = torch.Generator(device="cpu").manual_seed(20260714)

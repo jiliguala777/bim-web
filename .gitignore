@@ -43,6 +43,8 @@ id_rsa*
 .agents/
 .superpowers/
 .worktrees/
+annotation_tool/data/
+annotation_tool/runtime/
 
 # 临时输出与验证产物
 tmp/

@@ -16,6 +16,7 @@ MODEL_INPUT_SHAPE = (1, 3, 512, 512)
 MODEL_OUTPUT_SHAPE = (1, 4, 512, 512)
 DEFAULT_MAX_ABS_ERROR = 1e-4
 DEFAULT_MIN_ARGMAX_AGREEMENT = 0.99999
+ONNX_EXPORT_OPTIONS = {"dynamo": False}
 
 
 def check_onnx_in_subprocess(
@@ -175,6 +176,7 @@ def export_onnx(
         input_names=["input"],
         output_names=["logits"],
         dynamic_axes=None,
+        **ONNX_EXPORT_OPTIONS,
     )
 
     checker = check_onnx_in_subprocess(destination)

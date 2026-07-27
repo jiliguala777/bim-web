@@ -4,6 +4,7 @@ from subprocess import CompletedProcess
 import numpy as np
 
 from tools.export_floorplan_onnx import (
+    ONNX_EXPORT_OPTIONS,
     check_onnx_in_subprocess,
     compare_outputs,
     extract_state_dict,
@@ -12,6 +13,9 @@ from tools.export_floorplan_onnx import (
 
 
 class ExportFloorplanOnnxTests(unittest.TestCase):
+    def test_export_uses_legacy_path_compatible_with_declared_dependencies(self):
+        self.assertIs(ONNX_EXPORT_OPTIONS["dynamo"], False)
+
     def test_checker_subprocess_reports_native_crash_without_killing_parent(self):
         def fake_run(*args, **kwargs):
             return CompletedProcess(args=args[0], returncode=-1073741819, stdout="", stderr="access violation")

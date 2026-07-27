@@ -42,6 +42,7 @@ id_rsa*
 .codex/
 .agents/
 .superpowers/
+.worktrees/
 
 # 临时输出与验证产物
 tmp/

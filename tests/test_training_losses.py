@@ -1,6 +1,9 @@
 import unittest
 
-import torch
+try:
+    import torch
+except ImportError as exc:
+    raise unittest.SkipTest("training tests require .venv-train") from exc
 
 from training.losses import CombinedSegmentationLoss, dice_per_class
 

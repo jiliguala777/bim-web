@@ -5,7 +5,10 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-import torch
+try:
+    import torch
+except ImportError as exc:
+    raise unittest.SkipTest("training tests require .venv-train") from exc
 from torch import nn
 
 from training.evaluate import evaluate_checkpoint

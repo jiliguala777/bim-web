@@ -6,6 +6,11 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+try:
+    import torch  # noqa: F401
+except ImportError as exc:
+    raise unittest.SkipTest("training tests require .venv-train") from exc
+
 from training.dataset import ExportedFloorplanDataset, validate_export
 
 

@@ -829,6 +829,29 @@ HTML、CSS、JavaScript 修改也需要确认服务器已经拉取新提交；�
 - [文化宫负荷与模型接入交接](docs/新对话交接_文化宫负荷与模型接入_2026-07-14.md)
 - [当前负荷与年度能耗计算审计报告](docs/文化宫四层_当前负荷与年度能耗计算审计报告_2026-07-15.md)
 
+## PDF 标注与单页模型微调
+
+新版标注工具复用网站的多页 PDF 预处理和 512 模型输入流程，标注数据与实验模型默认保存到 Git 仓库之外的 `G:\bim网页\标注数据`。
+
+```powershell
+.\annotation_tool\start_annotation_tool.ps1
+.\training\setup_training_env.ps1
+.\.venv-train\Scripts\python.exe -m training.run_experiment `
+  --dataset "G:\bim网页\标注数据\exports\你的导出目录" `
+  --checkpoint "G:\bim-web\models\M2_pub_plus_user.pt" `
+  --output "G:\bim网页\标注数据\models\一层单页实验" `
+  --device cpu
+```
+
+在本地网站中复测实验 ONNX：
+
+```powershell
+$env:ONNX_MODEL_PATH="G:\bim网页\标注数据\models\一层单页实验\best.onnx"
+.\start_local.ps1
+```
+
+同一 PDF 页训练后再识别同一页属于 `single_page_overfit`，只验证拟合能力和训练链路，不代表对其他图纸的泛化效果。实验模型不自动部署到生产服务器，生产切换需要独立验证和单独决定。完整步骤见 [标注与训练指南](annotation_tool/README.md)。
+
 ## 22. 当前生产基线
 
 ```text

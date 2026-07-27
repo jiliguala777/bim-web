@@ -390,8 +390,18 @@ class AnnotationService:
             current = self.store.load_current_mask(project_id, page.page_number)
             if current is None:
                 raise ValueError("confirmed page mask is missing")
-            mask, version = current
-            image_source = self.artifact_path(project_id, page.page_number, "model_view")
+            _, version = current
+            image_source = self.artifact_path(
+                project_id,
+                page.page_number,
+                "model_input_512",
+            )
+            model_mask_path = version.mask_path.with_name(
+                f"{version.version_id}.mask_512.npy"
+            )
+            if not model_mask_path.is_file():
+                raise ValueError("confirmed page is missing its 512 model-space mask")
+            mask = np.load(model_mask_path, allow_pickle=False)
             stem = f"{project_id}-page-{page.page_number}"
             image_target = images_dir / f"{stem}.png"
             mask_target = masks_dir / f"{stem}.npy"
@@ -404,7 +414,9 @@ class AnnotationService:
                 class_pixels[str(class_id)] += int(np.sum(mask == class_id))
             samples.append(
                 {
+                    "sample_id": stem,
                     "page_number": page.page_number,
+                    "status": "confirmed",
                     "version_id": version.version_id,
                     "image": str(image_target.relative_to(export_dir)),
                     "mask": str(mask_target.relative_to(export_dir)),

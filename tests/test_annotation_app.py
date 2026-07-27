@@ -1,4 +1,5 @@
 import io
+import json
 import os
 import tempfile
 import unittest
@@ -163,6 +164,10 @@ class AnnotationApiTests(unittest.TestCase):
         page_dir.mkdir(parents=True)
         model_view = page_dir / "model_view.png"
         self.assertTrue(cv2.imwrite(str(model_view), np.full((4, 4, 3), 255, np.uint8)))
+        model_input = page_dir / "model_input_512.png"
+        self.assertTrue(
+            cv2.imwrite(str(model_input), np.full((512, 512, 3), 255, np.uint8))
+        )
         store.save_page_manifest(
             project["project_id"],
             1,
@@ -177,6 +182,10 @@ class AnnotationApiTests(unittest.TestCase):
                     "model_view": {
                         "path": str(model_view.relative_to(store.root)),
                         "sha256": "test",
+                    },
+                    "model_input_512": {
+                        "path": str(model_input.relative_to(store.root)),
+                        "sha256": "test-512",
                     }
                 },
             },
@@ -213,6 +222,20 @@ class AnnotationApiTests(unittest.TestCase):
             exported.get_json()["export"]["experiment_type"],
             "single_page_overfit",
         )
+        export_id = exported.get_json()["export"]["export_id"]
+        export_root = store.root / "exports" / export_id
+        manifest = json.loads((export_root / "manifest.json").read_text(encoding="utf-8"))
+        exported_image = cv2.imread(
+            str(export_root / manifest["samples"][0]["image"]),
+            cv2.IMREAD_COLOR,
+        )
+        exported_mask = np.load(
+            export_root / manifest["samples"][0]["mask"],
+            allow_pickle=False,
+        )
+        self.assertEqual(exported_image.shape[:2], (512, 512))
+        self.assertEqual(exported_mask.shape, (512, 512))
+        self.assertEqual(manifest["samples"][0]["status"], "confirmed")
 
 
 class AnnotationTemplateTests(unittest.TestCase):

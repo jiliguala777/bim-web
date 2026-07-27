@@ -1,0 +1,433 @@
+"""Application services for PDF preparation, annotation, and dataset export."""
+
+from __future__ import annotations
+
+from datetime import datetime, timezone
+import hashlib
+import io
+import json
+import os
+from pathlib import Path
+import shutil
+import tempfile
+from typing import Any
+
+import cv2
+import numpy as np
+import pdfplumber
+from PIL import Image
+
+from floorplan_onnx import get_segmenter
+from floorplan_page_pipeline import prepare_pdf_page
+
+from .storage import AnnotationStore, MaskVersion, ProjectRecord
+
+
+PREPROCESSING_VERSION = 1
+ARTIFACT_NAMES = {
+    "render": "page_render.png",
+    "cleaned": "cleaned_page.png",
+    "model_view": "model_view.png",
+    "model_input_512": "model_input_512.png",
+    "metadata": "preprocessing.json",
+}
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _json_safe_project(project: dict) -> dict:
+    return {
+        key: value
+        for key, value in project.items()
+        if key
+        in {
+            "schema_version",
+            "project_id",
+            "name",
+            "source_sha256",
+            "source_original_name",
+            "page_count",
+            "pages",
+            "created_at",
+            "updated_at",
+        }
+    }
+
+
+class AnnotationService:
+    def __init__(
+        self,
+        store: AnnotationStore,
+        *,
+        poppler_path: str | None = None,
+        segmenter_factory=get_segmenter,
+    ):
+        self.store = store
+        self.poppler_path = poppler_path or os.environ.get("POPPLER_PATH")
+        self.segmenter_factory = segmenter_factory
+
+    def list_projects(self) -> list[dict]:
+        return [_json_safe_project(project) for project in self.store.list_projects()]
+
+    def create_project(self, uploaded_file, name: str) -> dict:
+        if uploaded_file is None or not getattr(uploaded_file, "filename", ""):
+            raise ValueError("pdf upload is required")
+        original_name = Path(uploaded_file.filename).name
+        if not original_name.lower().endswith(".pdf"):
+            raise ValueError("uploaded file must be a PDF")
+
+        runtime_dir = self.store.root / "runtime"
+        runtime_dir.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=runtime_dir) as temporary_dir:
+            safe_name = original_name.replace("\x00", "").strip() or "source.pdf"
+            temporary_pdf = Path(temporary_dir) / safe_name
+            uploaded_file.save(temporary_pdf)
+            try:
+                with pdfplumber.open(str(temporary_pdf)) as document:
+                    page_count = len(document.pages)
+            except Exception as exc:
+                raise ValueError("uploaded file is not a readable PDF") from exc
+            if page_count < 1:
+                raise ValueError("PDF must contain at least one page")
+            source = self.store.import_source(temporary_pdf)
+
+        project_record = self.store.create_project(name, source.sha256)
+        project = self.store.update_project(
+            project_record.project_id,
+            page_count=page_count,
+            source_original_name=original_name,
+        )
+        return _json_safe_project(project)
+
+    def _project(self, project_id: str) -> dict:
+        return self.store.load_project(project_id)
+
+    def _source_path(self, project: dict) -> Path:
+        path = self.store.root / "sources" / f"{project['source_sha256']}.pdf"
+        if not path.is_file():
+            raise FileNotFoundError("Source PDF does not exist")
+        return path
+
+    def _page_dir(self, project_id: str, page_number: int) -> Path:
+        if page_number < 1:
+            raise ValueError("page_number must be positive")
+        project_dir = self.store.project_directory(project_id)
+        page_dir = (project_dir / "pages" / str(page_number)).resolve()
+        page_dir.relative_to(project_dir)
+        return page_dir
+
+    @staticmethod
+    def _validate_page(project: dict, page_number: int) -> None:
+        page_count = project.get("page_count")
+        if page_number < 1 or (page_count is not None and page_number > page_count):
+            raise ValueError(f"page_number must be between 1 and {page_count}")
+
+    def list_pages(self, project_id: str) -> list[dict]:
+        project = self._project(project_id)
+        page_count = int(project.get("page_count") or 0)
+        stored_pages = project.get("pages", {})
+        result = []
+        for page_number in range(1, page_count + 1):
+            page = dict(
+                stored_pages.get(
+                    str(page_number),
+                    {
+                        "page_number": page_number,
+                        "status": "unprepared",
+                        "current_version": None,
+                    },
+                )
+            )
+            result.append(page)
+        return result
+
+    def prepare_page(self, project_id: str, page_number: int) -> dict:
+        project = self._project(project_id)
+        self._validate_page(project, page_number)
+        output_dir = self._page_dir(project_id, page_number)
+        segmenter = self.segmenter_factory()
+        prepared = prepare_pdf_page(
+            self._source_path(project),
+            page_number,
+            poppler_path=self.poppler_path,
+            segmenter=segmenter,
+            output_dir=output_dir,
+        )
+        artifacts = {}
+        for key, payload in prepared.artifacts.items():
+            artifact_path = output_dir / payload["path"]
+            artifacts[key] = {
+                "path": str(artifact_path.relative_to(self.store.root)),
+                "sha256": payload["sha256"],
+            }
+        preparation = {
+            "preprocessing_version": PREPROCESSING_VERSION,
+            "page_number": page_number,
+            "page_count": prepared.page_count,
+            "image_size": [prepared.render_bgr.shape[1], prepared.render_bgr.shape[0]],
+            "model_input": prepared.model_input_metadata,
+            "scale_calibration": prepared.scale_calibration,
+            "vector_cleanup": prepared.vector_cleanup,
+            "inference_roi": prepared.inference_roi,
+            "artifacts": artifacts,
+        }
+        project = self.store.save_page_manifest(project_id, page_number, preparation)
+        return project["pages"][str(page_number)]
+
+    def artifact_path(self, project_id: str, page_number: int, name: str) -> Path:
+        if name not in ARTIFACT_NAMES:
+            raise ValueError("artifact name is invalid")
+        project = self._project(project_id)
+        self._validate_page(project, page_number)
+        page = project.get("pages", {}).get(str(page_number), {})
+        artifact = page.get("preparation", {}).get("artifacts", {}).get(name)
+        if artifact is None:
+            raise FileNotFoundError("Artifact does not exist")
+        path = (self.store.root / artifact["path"]).resolve()
+        page_dir = self._page_dir(project_id, page_number)
+        try:
+            path.relative_to(page_dir)
+        except ValueError as exc:
+            raise ValueError("artifact path is invalid") from exc
+        if not path.is_file():
+            raise FileNotFoundError("Artifact does not exist")
+        return path
+
+    def _preparation(self, project_id: str, page_number: int) -> dict:
+        project = self._project(project_id)
+        self._validate_page(project, page_number)
+        preparation = (
+            project.get("pages", {}).get(str(page_number), {}).get("preparation")
+        )
+        if not preparation:
+            raise ValueError("page must be prepared before annotation")
+        return preparation
+
+    @staticmethod
+    def decode_mask(payload: Any) -> np.ndarray:
+        if isinstance(payload, np.ndarray):
+            array = payload
+        elif isinstance(payload, (bytes, bytearray)):
+            try:
+                with Image.open(io.BytesIO(payload)) as image:
+                    if image.format != "PNG":
+                        raise ValueError("mask file must be PNG")
+                    if image.mode in {"P", "L", "I", "I;16"}:
+                        array = np.asarray(image).copy()
+                    else:
+                        colour = np.asarray(image.convert("RGB"))
+                        if not (
+                            np.array_equal(colour[:, :, 0], colour[:, :, 1])
+                            and np.array_equal(colour[:, :, 1], colour[:, :, 2])
+                        ):
+                            raise ValueError("mask PNG must contain indexed class values")
+                        array = colour[:, :, 0]
+            except (OSError, SyntaxError) as exc:
+                raise ValueError("mask PNG could not be decoded") from exc
+        else:
+            array = np.asarray(payload)
+        if array.ndim != 2:
+            raise ValueError("mask must be two-dimensional")
+        if not np.issubdtype(array.dtype, np.integer):
+            raise ValueError("mask must contain integer class values")
+        if array.size and (int(array.min()) < 0 or int(array.max()) > 3):
+            raise ValueError("mask values must be within 0..3")
+        return array.astype(np.uint8, copy=False)
+
+    @staticmethod
+    def _mask_512(mask: np.ndarray, metadata: dict) -> np.ndarray:
+        resized_w, resized_h = (int(value) for value in metadata["resized_size"])
+        top, left, _, _ = (int(value) for value in metadata["padding"])
+        resized = cv2.resize(mask, (resized_w, resized_h), interpolation=cv2.INTER_NEAREST)
+        model_mask = np.zeros((512, 512), dtype=np.uint8)
+        model_mask[top:top + resized_h, left:left + resized_w] = resized
+        return model_mask
+
+    @staticmethod
+    def _mask_warnings(mask: np.ndarray, model_mask: np.ndarray) -> list[str]:
+        warnings = []
+        for class_id, class_name in ((1, "wall"), (2, "window"), (3, "door")):
+            ratio = float(np.mean(mask == class_id))
+            if ratio > 0.5:
+                warnings.append(f"{class_name} class covers an unusually large area")
+            if np.any(mask == class_id) and not np.any(model_mask == class_id):
+                warnings.append(f"{class_name} class disappears at 512 model resolution")
+        wall = (model_mask == 1).astype(np.uint8)
+        component_count = cv2.connectedComponents(wall)[0] - 1 if np.any(wall) else 0
+        if component_count > 100:
+            warnings.append("wall annotation has many disconnected fragments or gaps")
+        return warnings
+
+    def save_mask(
+        self,
+        project_id: str,
+        page_number: int,
+        payload: Any,
+        *,
+        status: str = "draft",
+        author: str = "local-user",
+    ) -> tuple[MaskVersion, list[str]]:
+        preparation = self._preparation(project_id, page_number)
+        mask = self.decode_mask(payload)
+        width, height = (int(value) for value in preparation["model_input"]["original_size"])
+        if mask.shape != (height, width):
+            raise ValueError(
+                f"mask dimensions must be {width}x{height}; received {mask.shape[1]}x{mask.shape[0]}"
+            )
+        model_mask = self._mask_512(mask, preparation["model_input"])
+        version = self.store.save_mask_version(
+            project_id,
+            page_number,
+            mask,
+            status=status,
+            author=author,
+        )
+        model_path = version.mask_path.with_name(f"{version.version_id}.mask_512.npy")
+        self.store._atomic_npy(model_path, model_mask)
+        return version, self._mask_warnings(mask, model_mask)
+
+    def current_mask(self, project_id: str, page_number: int):
+        return self.store.load_current_mask(project_id, page_number)
+
+    def confirm_page(
+        self,
+        project_id: str,
+        page_number: int,
+        *,
+        author: str,
+    ) -> MaskVersion:
+        current = self.store.load_current_mask(project_id, page_number)
+        if current is None:
+            raise ValueError("page has no mask to confirm")
+        mask, _ = current
+        version, _ = self.save_mask(
+            project_id,
+            page_number,
+            mask,
+            status="confirmed",
+            author=author,
+        )
+        return version
+
+    def preannotate_page(
+        self,
+        project_id: str,
+        page_number: int,
+        *,
+        author: str,
+        allow_blank: bool = False,
+    ) -> tuple[MaskVersion, list[str]]:
+        preparation = self._preparation(project_id, page_number)
+        cleaned_path = self.artifact_path(project_id, page_number, "cleaned")
+        cleaned = cv2.imread(str(cleaned_path), cv2.IMREAD_COLOR)
+        if cleaned is None:
+            raise ValueError("prepared page image cannot be read")
+        segmenter = self.segmenter_factory()
+        try:
+            prediction = segmenter.predict(
+                cleaned,
+                use_preprocessing=True,
+                inference_roi=preparation.get("inference_roi"),
+                preserve_full_context=True,
+            )
+            mask = prediction["mask"]
+        except Exception:
+            if not allow_blank:
+                raise
+            mask = np.zeros(cleaned.shape[:2], dtype=np.uint8)
+        version, warnings = self.save_mask(
+            project_id,
+            page_number,
+            mask,
+            status="preannotated",
+            author=author,
+        )
+        model_path = Path(
+            os.environ.get(
+                "ONNX_MODEL_PATH",
+                Path(__file__).resolve().parents[1] / "models" / "M2_pub_plus_user.onnx",
+            )
+        )
+        evidence = {
+            "version_id": version.version_id,
+            "model_path": model_path.name,
+            "model_sha256": _sha256(model_path) if model_path.is_file() else None,
+        }
+        self.store._atomic_json(
+            version.mask_path.with_name(f"{version.version_id}.preannotation.json"),
+            evidence,
+        )
+        return version, warnings
+
+    def export_confirmed(self, project_id: str) -> dict:
+        project = self._project(project_id)
+        confirmed = self.store.list_confirmed_pages(project_id)
+        if not confirmed:
+            raise ValueError("at least one confirmed page is required for export")
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        export_id = f"{project_id}-{timestamp}"
+        export_dir = (self.store.root / "exports" / export_id).resolve()
+        export_dir.relative_to(self.store.root / "exports")
+        images_dir = export_dir / "images"
+        masks_dir = export_dir / "masks"
+        images_dir.mkdir(parents=True, exist_ok=False)
+        masks_dir.mkdir(parents=True, exist_ok=True)
+
+        samples = []
+        class_pixels = {str(class_id): 0 for class_id in range(4)}
+        for page in confirmed:
+            current = self.store.load_current_mask(project_id, page.page_number)
+            if current is None:
+                raise ValueError("confirmed page mask is missing")
+            mask, version = current
+            image_source = self.artifact_path(project_id, page.page_number, "model_view")
+            stem = f"{project_id}-page-{page.page_number}"
+            image_target = images_dir / f"{stem}.png"
+            mask_target = masks_dir / f"{stem}.npy"
+            mask_png_target = masks_dir / f"{stem}.png"
+            shutil.copyfile(image_source, image_target)
+            self.store._atomic_npy(mask_target, mask)
+            if not cv2.imwrite(str(mask_png_target), mask):
+                raise OSError("could not write exported mask preview")
+            for class_id in range(4):
+                class_pixels[str(class_id)] += int(np.sum(mask == class_id))
+            samples.append(
+                {
+                    "page_number": page.page_number,
+                    "version_id": version.version_id,
+                    "image": str(image_target.relative_to(export_dir)),
+                    "mask": str(mask_target.relative_to(export_dir)),
+                    "mask_preview": str(mask_png_target.relative_to(export_dir)),
+                    "image_sha256": _sha256(image_target),
+                    "mask_sha256": _sha256(mask_target),
+                }
+            )
+        experiment_type = "single_page_overfit" if len(samples) == 1 else "fine_tune"
+        manifest = {
+            "schema_version": 1,
+            "export_id": export_id,
+            "project_id": project_id,
+            "source_sha256": project["source_sha256"],
+            "class_map": {"0": "background", "1": "wall", "2": "window", "3": "door"},
+            "experiment_type": experiment_type,
+            "samples": samples,
+        }
+        report = {
+            "sample_count": len(samples),
+            "confirmed_pages": [sample["page_number"] for sample in samples],
+            "class_pixels": class_pixels,
+            "experiment_type": experiment_type,
+        }
+        self.store._atomic_json(export_dir / "manifest.json", manifest)
+        self.store._atomic_json(export_dir / "dataset_report.json", report)
+        return {
+            "export_id": export_id,
+            "experiment_type": experiment_type,
+            "sample_count": len(samples),
+        }

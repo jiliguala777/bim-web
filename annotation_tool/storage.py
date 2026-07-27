@@ -221,6 +221,35 @@ class AnnotationStore:
             raise FileNotFoundError("Project does not exist")
         return manifest_path, json.loads(manifest_path.read_text(encoding="utf-8"))
 
+    def load_project(self, project_id: str) -> dict:
+        return self._load_project(project_id)[1]
+
+    def list_projects(self) -> list[dict]:
+        projects = []
+        projects_root = self.root / "projects"
+        for manifest_path in projects_root.glob("*/project.json"):
+            try:
+                project = json.loads(manifest_path.read_text(encoding="utf-8"))
+                self.project_directory(project["project_id"])
+            except (OSError, ValueError, KeyError, json.JSONDecodeError):
+                continue
+            projects.append(project)
+        return sorted(
+            projects,
+            key=lambda project: project.get("updated_at", ""),
+            reverse=True,
+        )
+
+    def update_project(self, project_id: str, **changes) -> dict:
+        manifest_path, project = self._load_project(project_id)
+        protected = {"project_id", "source_sha256", "created_at"}
+        if protected.intersection(changes):
+            raise ValueError("immutable project fields cannot be changed")
+        project.update(changes)
+        project["updated_at"] = _now()
+        self._atomic_json(manifest_path, project)
+        return project
+
     def save_mask_version(
         self,
         project_id: str,
@@ -270,12 +299,14 @@ class AnnotationStore:
         self._atomic_json(version_path, payload)
 
         pages = project.setdefault("pages", {})
-        pages[page_key] = {
-            "page_number": page_number,
-            "status": status,
-            "current_version": version_id,
-            "updated_at": created_at,
-        }
+        page = pages.setdefault(page_key, {"page_number": page_number})
+        page.update(
+            {
+                "status": status,
+                "current_version": version_id,
+                "updated_at": created_at,
+            }
+        )
         project["updated_at"] = created_at
         self._atomic_json(manifest_path, project)
         return version

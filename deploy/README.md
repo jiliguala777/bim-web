@@ -1,6 +1,9 @@
-# BIM Web：Ubuntu 22.04 部署指南
+# BIM Web：Ubuntu 24.04 部署指南
 
-本指南用于将私人 GitHub 中的 BIM Web 代码部署到腾讯云 Ubuntu 22.04 轻量应用服务器。第一阶段通过公网 IP 的 HTTP 端口访问；域名、HTTPS 和自动部署不在本指南范围内。
+本指南用于将私人 GitHub 中的 BIM Web 代码部署到腾讯云 Ubuntu 24.04
+轻量应用服务器。当前生产基线为 Ubuntu 24.04、Python 3.12、Nginx 1.24
+和 Poppler 24.02。第一阶段通过公网 IP 的 HTTP 端口访问；域名和 HTTPS
+需要后续单独配置。
 
 模型不进入 GitHub。`M2_pub_plus_user.onnx` 必须单独上传并存放在：
 
@@ -78,8 +81,12 @@ sudo apt install -y \
   nginx \
   poppler-utils \
   libgomp1 \
+  libgl1 \
   git
 ```
+
+`libgl1` 是 OpenCV 在 Ubuntu 上加载 `libGL.so.1` 所需的系统库。缺少它时，
+`import cv2` 会失败，即使 Python 包已经安装成功。
 
 确认 Poppler 可用：
 
@@ -119,7 +126,8 @@ sudo ls -ld /opt/bim-web /var/lib/bim-web /etc/bim-web
 将 `PRIVATE_REPOSITORY_URL` 替换为私人仓库地址：
 
 ```bash
-sudo -u bimweb git clone PRIVATE_REPOSITORY_URL /opt/bim-web/app
+runuser -u bimweb -- \
+  git clone PRIVATE_REPOSITORY_URL /opt/bim-web/app
 ```
 
 推荐给服务器配置只读 Deploy Key。不要将 GitHub 密码或访问令牌写入仓库、环境文件或部署文档。
@@ -127,9 +135,18 @@ sudo -u bimweb git clone PRIVATE_REPOSITORY_URL /opt/bim-web/app
 确认代码：
 
 ```bash
-cd /opt/bim-web/app
-sudo -u bimweb git status --short --branch
-sudo -u bimweb git log -1 --oneline
+runuser -u bimweb -- \
+  git -C /opt/bim-web/app status --short --branch
+
+runuser -u bimweb -- \
+  git -C /opt/bim-web/app log -1 --oneline
+```
+
+仓库属于 `bimweb`。不要用 root 直接运行仓库 Git 命令，也不要按错误提示给
+root 添加全局 `safe.directory`。后续所有仓库操作都使用：
+
+```bash
+runuser -u bimweb -- git -C /opt/bim-web/app <Git 子命令>
 ```
 
 ## 6. 创建 Python 环境
@@ -146,7 +163,7 @@ sudo -u bimweb /opt/bim-web/venv/bin/pip install \
 
 ```bash
 sudo -u bimweb /opt/bim-web/venv/bin/python -c \
-  "import flask, onnxruntime, cv2, pdfplumber; print('Python dependencies OK')"
+  "import flask, onnxruntime, cv2, pdfplumber, shapely; print('Python dependencies OK')"
 ```
 
 ## 7. 单独上传并校验 ONNX 模型
@@ -176,6 +193,11 @@ sha256sum /opt/bim-web/models/M2_pub_plus_user.onnx
 sudo -u bimweb /opt/bim-web/venv/bin/python -c \
   "import onnxruntime as ort; ort.InferenceSession('/opt/bim-web/models/M2_pub_plus_user.onnx'); print('ONNX model OK')"
 ```
+
+后续更新模型时，推荐上传为带日期或版本号的新文件，例如
+`M2_pub_plus_user_20260801.onnx`，校验并加载成功后再修改
+`/etc/bim-web/bim-web.env` 中的 `ONNX_MODEL_PATH`。旧模型保留用于快速
+回退，不要直接覆盖唯一的已验证模型。
 
 ## 8. 创建生产环境变量
 
@@ -283,7 +305,13 @@ http://服务器公网IP/login
 5. 选择页面后能完成 AI 识别；
 6. 识别结果写入 `/var/lib/bim-web/uploads`；
 7. 重启服务后用户数据库和识别结果仍存在；
-8. 第 13 页案例能得到预期房间闭合结果。
+8. 文化宫 PDF 第 13 页得到当前回归基线：
+   - 页面 `13 / 36`；
+   - 图像大小 `[2339, 3312]`；
+   - 修复原因 `dominant_span_rectangle`；
+   - 房间数量 `19`；
+   - 总面积约 `1318.78 m²`；
+   - 不要求人工外墙处理。
 
 检查服务状态和日志：
 
@@ -298,11 +326,20 @@ sudo tail -n 100 /var/log/nginx/error.log
 在本地完成修改、测试并推送私人 GitHub 后，在服务器执行：
 
 ```bash
-cd /opt/bim-web/app
-sudo -u bimweb git pull --ff-only
-sudo -u bimweb /opt/bim-web/venv/bin/pip install \
-  -r requirements.txt \
-  -c requirements-runtime-constraints.txt
+runuser -u bimweb -- \
+  git -C /opt/bim-web/app fetch origin main
+
+runuser -u bimweb -- \
+  git -C /opt/bim-web/app status --short --branch
+
+runuser -u bimweb -- \
+  git -C /opt/bim-web/app pull --ff-only origin main
+
+runuser -u bimweb -- \
+  /opt/bim-web/venv/bin/pip install \
+  -r /opt/bim-web/app/requirements.txt \
+  -c /opt/bim-web/app/requirements-runtime-constraints.txt
+
 sudo systemctl restart bim-web
 sudo systemctl status bim-web --no-pager
 ```
@@ -314,16 +351,31 @@ sudo systemctl status bim-web --no-pager
 代码回退前先记录当前版本：
 
 ```bash
-cd /opt/bim-web/app
-sudo -u bimweb git log --oneline -10
+runuser -u bimweb -- \
+  git -C /opt/bim-web/app log --oneline -10
 ```
 
 选择已经验证过的提交后再切换并重启：
 
 ```bash
-sudo -u bimweb git checkout <已确认的提交哈希>
+runuser -u bimweb -- \
+  git -C /opt/bim-web/app switch --detach <已确认的提交哈希>
+
 sudo systemctl restart bim-web
 sudo systemctl status bim-web --no-pager
 ```
 
-模型、上传文件、用户数据库和环境变量均在代码目录之外，不会因代码回退被覆盖。完成排障后应回到正式发布分支，不要长期停留在 detached HEAD。
+模型、上传文件、用户数据库和环境变量均在代码目录之外，不会因代码回退被
+覆盖。完成排障后回到正式发布分支：
+
+```bash
+runuser -u bimweb -- \
+  git -C /opt/bim-web/app switch main
+
+runuser -u bimweb -- \
+  git -C /opt/bim-web/app pull --ff-only origin main
+
+sudo systemctl restart bim-web
+```
+
+不要长期停留在 detached HEAD。

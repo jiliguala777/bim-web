@@ -102,18 +102,27 @@ class DeploymentAssetTests(unittest.TestCase):
     def test_deployment_guide_uses_current_model_and_safe_paths(self):
         guide = self.read("deploy/README.md")
         for expected in (
-            "Ubuntu 22.04",
+            "Ubuntu 24.04",
+            "libgl1",
             "/opt/bim-web/app",
             "/opt/bim-web/models/M2_pub_plus_user.onnx",
             "/var/lib/bim-web/uploads",
             "/etc/bim-web/bim-web.env",
             "sha256sum",
+            "runuser -u bimweb --",
+            "不要用 root 直接运行仓库 Git 命令",
+            "不要按错误提示给",
+            "safe.directory",
             "nginx -t",
             "systemctl status bim-web",
             "journalctl -u bim-web",
-            "git pull --ff-only",
+            "pull --ff-only origin main",
+            "dominant_span_rectangle",
+            "房间数量 `19`",
         ):
             self.assertIn(expected, guide)
+        self.assertNotIn("Ubuntu 22.04", guide)
+        self.assertNotIn("sudo -u bimweb git", guide)
         self.assertNotIn("M2_DA_best.onnx", guide)
         self.assertNotIn(".gemini/antigravity", guide)
 

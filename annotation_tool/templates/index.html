@@ -40,6 +40,26 @@
         <button id="prepare-page" type="button" disabled>准备所选页面</button>
       </section>
 
+      <section id="region-section">
+        <h2>标注范围</h2>
+        <div class="button-row">
+          <button id="target-full-page" type="button" disabled>整页标注</button>
+          <button id="start-crop" type="button" disabled>框选区域</button>
+        </div>
+        <div id="crop-controls" hidden>
+          <p class="hint">在图纸上拖出矩形，给区域命名后创建独立标注样本。</p>
+          <label for="crop-region-name">区域名称</label>
+          <input id="crop-region-name" maxlength="80" placeholder="例如：四层">
+          <div class="button-row">
+            <button id="cancel-crop" type="button">取消</button>
+            <button id="create-crop-region" type="button" class="primary" disabled>创建区域</button>
+          </div>
+        </div>
+        <div id="region-list" class="region-list">
+          <p class="empty">当前页暂无裁剪区域</p>
+        </div>
+      </section>
+
       <section class="page-list-section">
         <h2>页面状态</h2>
         <div id="page-list" class="page-list">
@@ -62,6 +82,7 @@
         <div id="canvas-transform" class="canvas-transform">
           <canvas id="image-canvas" aria-label="图纸底图"></canvas>
           <canvas id="mask-canvas" aria-label="标注蒙版"></canvas>
+          <div id="crop-selection" class="crop-selection" hidden></div>
         </div>
         <div id="canvas-empty" class="canvas-empty">
           <strong>先选择并准备一个 PDF 页面</strong>
@@ -119,6 +140,7 @@
 
   <script src="{{ url_for('static', filename='saved_mask_loader.js') }}" defer></script>
   <script src="{{ url_for('static', filename='export_result.js') }}" defer></script>
+  <script src="{{ url_for('static', filename='crop_region.js') }}" defer></script>
   <script src="{{ url_for('static', filename='app.js') }}" defer></script>
 </body>
 </html>

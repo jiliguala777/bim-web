@@ -14,6 +14,8 @@
     project: null,
     pages: [],
     page: null,
+    regions: [],
+    region: null,
     view: "render",
     background: null,
     mask: null,
@@ -38,6 +40,10 @@
     preannotating: false,
     preparing: false,
     editingReady: false,
+    cropMode: false,
+    cropping: false,
+    cropStart: null,
+    cropBox: null,
   };
 
   const imageCanvas = $("#image-canvas");
@@ -79,8 +85,8 @@
 
   function setEditingReady(ready) {
     state.editingReady = Boolean(ready);
-    const enabled = state.editingReady && !state.preannotating;
-    maskCanvas.style.pointerEvents = enabled ? "" : "none";
+    const enabled = state.editingReady && !state.preannotating && !state.cropMode;
+    maskCanvas.style.pointerEvents = (enabled || state.cropMode) ? "" : "none";
     setControls(enabled);
     if (enabled) updateHistoryButtons();
     else {
@@ -100,7 +106,25 @@
   }
 
   function currentBase() {
-    return `/api/projects/${encodeURIComponent(state.project.project_id)}/pages/${state.page.page_number}`;
+    const pageBase = `/api/projects/${encodeURIComponent(state.project.project_id)}/pages/${state.page.page_number}`;
+    return state.region
+      ? `${pageBase}/regions/${encodeURIComponent(state.region.region_id)}`
+      : pageBase;
+  }
+
+  function currentTarget() {
+    return state.region || state.page;
+  }
+
+  function currentPreparation() {
+    return currentTarget()?.preparation || null;
+  }
+
+  function hasConfirmedTarget() {
+    return state.pages.some((page) => (
+      page.status === "confirmed"
+      || Object.values(page.regions || {}).some((region) => region.status === "confirmed")
+    ));
   }
 
   async function refreshProjects(selectId = null) {
@@ -122,6 +146,8 @@
     state.pageGeneration = generation;
     state.project = state.projects.find((project) => project.project_id === projectId) || null;
     state.page = null;
+    state.region = null;
+    state.regions = [];
     clearCanvas();
     if (!state.project) {
       $("#page-select").disabled = true;
@@ -141,8 +167,9 @@
     $("#prepare-page").disabled = (
       state.preparing || !$("#page-select").value
     );
-    $("#export").disabled = !state.pages.some((page) => page.status === "confirmed");
+    $("#export").disabled = !hasConfirmedTarget();
     renderPageList();
+    renderRegionList();
   }
 
   function statusText(status) {
@@ -161,15 +188,42 @@
     ).join("") || '<p class="empty">没有页面</p>';
   }
 
+  function renderRegionList() {
+    $("#target-full-page").disabled = !state.page?.preparation;
+    $("#start-crop").disabled = !state.page?.preparation;
+    $("#target-full-page").classList.toggle("active", Boolean(state.page && !state.region));
+    $("#region-list").innerHTML = state.regions.length
+      ? state.regions.map((region) => (
+        `<button type="button" class="region-chip${state.region?.region_id === region.region_id ? " active" : ""}" `
+        + `data-region-id="${escapeHtml(region.region_id)}" data-status="${escapeHtml(region.status)}">`
+        + `<span>${escapeHtml(region.name)}</span><span>${statusText(region.status)}</span></button>`
+      )).join("")
+      : '<p class="empty">当前页暂无裁剪区域</p>';
+    $$(".region-chip").forEach((button) => button.addEventListener("click", () => {
+      selectRegion(button.dataset.regionId).catch(handleError);
+    }));
+  }
+
   function setCurrentPageStatus(status) {
     if (!state.page) return;
-    state.page.status = status;
-    const storedPage = state.pages.find((page) => page.page_number === state.page.page_number);
-    if (storedPage) storedPage.status = status;
-    const option = [...$("#page-select").options]
-      .find((item) => Number(item.value) === state.page.page_number);
-    if (option) option.textContent = `第 ${state.page.page_number} 页 · ${statusText(status)}`;
-    $("#page-status").textContent = `第 ${state.page.page_number} 页 · ${statusText(status)}`;
+    if (state.region) {
+      state.region.status = status;
+      const stored = state.page.regions?.[state.region.region_id];
+      if (stored) stored.status = status;
+      $("#page-status").textContent = (
+        `第 ${state.page.page_number} 页 / ${state.region.name} · ${statusText(status)}`
+      );
+      renderRegionList();
+    } else {
+      state.page.status = status;
+      const storedPage = state.pages.find((page) => page.page_number === state.page.page_number);
+      if (storedPage) storedPage.status = status;
+      const option = [...$("#page-select").options]
+        .find((item) => Number(item.value) === state.page.page_number);
+      if (option) option.textContent = `第 ${state.page.page_number} 页 · ${statusText(status)}`;
+      $("#page-status").textContent = `第 ${state.page.page_number} 页 · ${statusText(status)}`;
+    }
+    $("#export").disabled = !hasConfirmedTarget();
     renderPageList();
   }
 
@@ -179,25 +233,51 @@
     const generation = state.pageGeneration + 1;
     state.pageGeneration = generation;
     state.page = state.pages.find((page) => page.page_number === Number(pageNumber)) || null;
+    state.region = null;
+    state.regions = Object.values(state.page?.regions || {});
+    cancelCropMode();
     setEditingReady(false);
+    renderRegionList();
     if (!state.page) return clearCanvas();
-    $("#page-status").textContent = `第 ${state.page.page_number} 页 · ${statusText(state.page.status)}`;
     if (!state.page.preparation) {
       clearCanvas();
       log("该页尚未准备，请点击“准备所选页面”");
       return;
     }
-    state.width = state.page.preparation.model_input.original_size[0];
-    state.height = state.page.preparation.model_input.original_size[1];
+    await loadCurrentTarget(generation);
+  }
+
+  async function selectRegion(regionId) {
+    if (!state.page?.preparation) return;
+    if (state.dirty) await saveMask(true);
+    else if (state.saving) await state.saving;
+    const generation = state.pageGeneration + 1;
+    state.pageGeneration = generation;
+    state.region = state.regions.find((region) => region.region_id === regionId) || null;
+    cancelCropMode();
+    renderRegionList();
+    await loadCurrentTarget(generation);
+  }
+
+  async function loadCurrentTarget(generation = state.pageGeneration) {
+    const target = currentTarget();
+    const preparation = currentPreparation();
+    if (!state.page || !target || !preparation) return clearCanvas();
+    const targetKey = state.region?.region_id || "full-page";
+    $("#page-status").textContent = state.region
+      ? `第 ${state.page.page_number} 页 / ${state.region.name} · ${statusText(target.status)}`
+      : `第 ${state.page.page_number} 页 · ${statusText(target.status)}`;
+    state.width = preparation.model_input.original_size[0];
+    state.height = preparation.model_input.original_size[1];
     setupCanvases();
     const requestBase = currentBase();
     const width = state.width;
     const height = state.height;
-    const pageTasks = [
+    const targetTasks = [
       loadBackground(requestBase, generation, width, height),
     ];
-    if (state.page.current_version) {
-      pageTasks.push(loadMask(requestBase, generation, width, height));
+    if (target.current_version) {
+      targetTasks.push(loadMask(requestBase, generation, width, height));
     } else {
       state.mask = new Uint8Array(width * height);
       renderMask();
@@ -205,10 +285,10 @@
       state.editRevision = 0;
       setSaveState("已载入", "idle");
     }
-    await Promise.all(pageTasks);
+    await Promise.all(targetTasks);
     if (
       generation !== state.pageGeneration
-      || state.page?.page_number !== Number(pageNumber)
+      || (state.region?.region_id || "full-page") !== targetKey
     ) return;
     resetHistory();
     fitView();
@@ -319,8 +399,62 @@
     };
   }
 
+  function renderCropSelection() {
+    const selection = $("#crop-selection");
+    if (!state.cropBox) {
+      selection.hidden = true;
+      return;
+    }
+    const [x0, y0, x1, y1] = state.cropBox;
+    selection.style.left = `${x0}px`;
+    selection.style.top = `${y0}px`;
+    selection.style.width = `${x1 - x0}px`;
+    selection.style.height = `${y1 - y0}px`;
+    selection.hidden = false;
+  }
+
+  function updateCropCreateButton() {
+    const valid = (
+      state.cropBox
+      && window.AnnotationCropRegion.validateCrop(
+        state.cropBox,
+        state.width,
+        state.height
+      )
+      && $("#crop-region-name").value.trim()
+    );
+    $("#create-crop-region").disabled = !valid;
+  }
+
+  function beginCropMode() {
+    if (!state.page?.preparation || state.region) return;
+    state.cropMode = true;
+    state.cropping = false;
+    state.cropStart = null;
+    state.cropBox = null;
+    $("#crop-controls").hidden = false;
+    $("#crop-selection").hidden = true;
+    viewport.dataset.cropMode = "true";
+    setEditingReady(state.editingReady);
+    updateCropCreateButton();
+    log("请在整页图纸上拖动鼠标框选一个楼层区域");
+  }
+
+  function cancelCropMode() {
+    state.cropMode = false;
+    state.cropping = false;
+    state.cropStart = null;
+    state.cropBox = null;
+    if ($("#crop-controls")) $("#crop-controls").hidden = true;
+    if ($("#crop-selection")) $("#crop-selection").hidden = true;
+    if (viewport) delete viewport.dataset.cropMode;
+    if ($("#crop-region-name")) $("#crop-region-name").value = "";
+    if ($("#create-crop-region")) $("#create-crop-region").disabled = true;
+    if (state.page?.preparation) setEditingReady(state.editingReady);
+  }
+
   function brushWidth() {
-    const resizeScale = state.page?.preparation?.model_input?.resize_scale || 1;
+    const resizeScale = currentPreparation()?.model_input?.resize_scale || 1;
     return Math.max(1, state.brushModelPx / resizeScale);
   }
 
@@ -462,6 +596,7 @@
     const requestBase = currentBase();
     const projectId = state.project.project_id;
     const pageNumber = state.page.page_number;
+    const regionId = state.region?.region_id || null;
     const revision = state.editRevision;
     const maskSnapshot = state.mask.slice();
     const width = state.width;
@@ -479,10 +614,11 @@
       const stillCurrent = (
         state.project?.project_id === projectId
         && state.page?.page_number === pageNumber
+        && (state.region?.region_id || null) === regionId
       );
       if (stillCurrent) {
         window.AnnotationSavedMaskLoader.rememberCurrentVersion(
-          state.page,
+          currentTarget(),
           result
         );
         state.dirty = state.editRevision !== revision;
@@ -525,6 +661,7 @@
   }
 
   function clearCanvas() {
+    cancelCropMode();
     state.width = 0;
     state.height = 0;
     state.mask = null;
@@ -554,6 +691,61 @@
   $("#page-select").addEventListener("change", (event) => {
     $("#prepare-page").disabled = state.preparing || !event.target.value;
     selectPage(event.target.value).catch(handleError);
+  });
+
+  $("#target-full-page").addEventListener("click", () => {
+    selectRegion(null).catch(handleError);
+  });
+
+  $("#start-crop").addEventListener("click", async () => {
+    try {
+      if (state.region) await selectRegion(null);
+      beginCropMode();
+    } catch (error) {
+      handleError(error);
+    }
+  });
+
+  $("#cancel-crop").addEventListener("click", cancelCropMode);
+  $("#crop-region-name").addEventListener("input", updateCropCreateButton);
+  $("#create-crop-region").addEventListener("click", async () => {
+    if (!state.cropBox || !state.page || state.region) return;
+    const name = $("#crop-region-name").value.trim();
+    if (!window.AnnotationCropRegion.validateCrop(
+      state.cropBox,
+      state.width,
+      state.height
+    )) return;
+    const pageNumber = state.page.page_number;
+    const pageBase = (
+      `/api/projects/${encodeURIComponent(state.project.project_id)}`
+      + `/pages/${pageNumber}`
+    );
+    try {
+      $("#create-crop-region").disabled = true;
+      const body = await api(`${pageBase}/regions`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          name,
+          crop_bbox_px: state.cropBox,
+        }),
+      });
+      const region = body.region;
+      state.page.regions ||= {};
+      state.page.regions[region.region_id] = region;
+      state.regions = Object.values(state.page.regions);
+      cancelCropMode();
+      renderRegionList();
+      await selectRegion(region.region_id);
+      log(
+        `裁剪区域“${region.name}”已创建`,
+        `来源：第 ${pageNumber} 页；范围：${region.crop_bbox_px.join(", ")}`
+      );
+    } catch (error) {
+      handleError(error);
+      updateCropCreateButton();
+    }
   });
 
   $("#prepare-page").addEventListener("click", async () => {
@@ -597,7 +789,7 @@
   });
 
   $$(".segmented button").forEach((button) => button.addEventListener("click", async () => {
-    if (!state.page?.preparation) return;
+    if (!currentPreparation()) return;
     state.view = button.dataset.view;
     $$(".segmented button").forEach((item) => item.classList.toggle("active", item === button));
     try { await loadBackground(); } catch (error) { handleError(error); }
@@ -614,6 +806,15 @@
   });
 
   maskCanvas.addEventListener("pointerdown", (event) => {
+    if (state.cropMode && !state.spaceDown && event.button === 0) {
+      state.cropping = true;
+      state.cropStart = canvasPoint(event);
+      state.cropBox = null;
+      maskCanvas.setPointerCapture(event.pointerId);
+      renderCropSelection();
+      updateCropCreateButton();
+      return;
+    }
     if (
       !state.editingReady
       || !state.mask
@@ -627,12 +828,38 @@
     drawSegment(state.lastPoint, state.lastPoint);
   });
   maskCanvas.addEventListener("pointermove", (event) => {
+    if (state.cropping) {
+      state.cropBox = window.AnnotationCropRegion.normalizeCrop(
+        state.cropStart,
+        canvasPoint(event),
+        state.width,
+        state.height
+      );
+      renderCropSelection();
+      updateCropCreateButton();
+      return;
+    }
     if (!state.drawing) return;
     const point = canvasPoint(event);
     drawSegment(state.lastPoint, point);
     state.lastPoint = point;
   });
   maskCanvas.addEventListener("pointerup", (event) => {
+    if (state.cropping) {
+      state.cropping = false;
+      state.cropBox = window.AnnotationCropRegion.normalizeCrop(
+        state.cropStart,
+        canvasPoint(event),
+        state.width,
+        state.height
+      );
+      maskCanvas.releasePointerCapture(event.pointerId);
+      renderCropSelection();
+      updateCropCreateButton();
+      const [x0, y0, x1, y1] = state.cropBox;
+      log("已框选区域", `${x1 - x0} × ${y1 - y0} 像素`);
+      return;
+    }
     if (!state.drawing) return;
     state.drawing = false;
     maskCanvas.releasePointerCapture(event.pointerId);
@@ -733,7 +960,7 @@
       }
       if (generation !== state.pageGeneration) return;
       window.AnnotationSavedMaskLoader.rememberCurrentVersion(
-        state.page,
+        currentTarget(),
         result
       );
       showWarnings(result.warnings);
@@ -770,7 +997,7 @@
       $("#prepare-page").disabled = (
         state.preparing || !state.project || !$("#page-select").value
       );
-      if (state.page?.preparation) {
+      if (currentPreparation()) {
         setEditingReady(state.editingReady);
       } else {
         setEditingReady(false);
@@ -787,7 +1014,7 @@
         body: JSON.stringify({ author: "local-user" }),
       });
       window.AnnotationSavedMaskLoader.rememberCurrentVersion(
-        state.page,
+        currentTarget(),
         result
       );
       setCurrentPageStatus(result.status);

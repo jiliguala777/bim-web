@@ -884,6 +884,12 @@ class AnnotationTemplateTests(unittest.TestCase):
             "view-original",
             "view-cleaned",
             "view-model",
+            "target-full-page",
+            "start-crop",
+            "crop-region-name",
+            "create-crop-region",
+            "crop-selection",
+            "region-list",
             "mask-canvas",
             "undo",
             "redo",
@@ -928,15 +934,15 @@ class AnnotationTemplateTests(unittest.TestCase):
             Path(__file__).resolve().parents[1]
             / "annotation_tool/static/app.js"
         ).read_text(encoding="utf-8")
-        select_page = script.split(
-            "async function selectPage(pageNumber) {", 1
+        select_target = script.split(
+            "async function loadCurrentTarget(generation = state.pageGeneration) {", 1
         )[1].split("function setupCanvases()", 1)[0]
 
-        self.assertIn("const pageTasks = [", select_page)
-        self.assertIn("if (state.page.current_version) {", select_page)
+        self.assertIn("const targetTasks = [", select_target)
+        self.assertIn("if (target.current_version) {", select_target)
         self.assertIn(
-            "pageTasks.push(loadMask(requestBase, generation, width, height));",
-            select_page,
+            "targetTasks.push(loadMask(requestBase, generation, width, height));",
+            select_target,
         )
         self.assertIn(
             """} else {
@@ -946,16 +952,12 @@ class AnnotationTemplateTests(unittest.TestCase):
       state.editRevision = 0;
       setSaveState("已载入", "idle");
     }""",
-            select_page,
+            select_target,
         )
-        self.assertIn("await Promise.all(pageTasks);", select_page)
-        self.assertLess(
-            select_page.index("setEditingReady(false);"),
-            select_page.index("const pageTasks = ["),
-        )
+        self.assertIn("await Promise.all(targetTasks);", select_target)
         self.assertGreater(
-            select_page.index("setEditingReady(true);"),
-            select_page.index("await Promise.all(pageTasks);"),
+            select_target.index("setEditingReady(true);"),
+            select_target.index("await Promise.all(targetTasks);"),
         )
         setup_canvases = script.split(
             "function setupCanvases() {", 1

@@ -12,7 +12,12 @@ import cv2
 import numpy as np
 import torch
 
-from .dataset import IMAGENET_MEAN, IMAGENET_STD, ExportedFloorplanDataset
+from .dataset import (
+    IMAGENET_MEAN,
+    IMAGENET_STD,
+    ExportedFloorplanDataset,
+    validate_export,
+)
 from .losses import dice_per_class
 from .train_floorplan import build_floorplan_model, load_model_strict
 
@@ -115,6 +120,8 @@ def evaluate_checkpoint(
 ) -> dict:
     destination = Path(output_dir).resolve()
     destination.mkdir(parents=True, exist_ok=True)
+    validated = validate_export(dataset_path)
+    experiment_type = validated["manifest"].get("experiment_type")
     dataset = ExportedFloorplanDataset(dataset_path, augment=False, seed=0)
     model = load_model_strict(checkpoint_path, model_factory, device=device)
     model.eval()
@@ -156,6 +163,7 @@ def evaluate_checkpoint(
             if first_visual is None:
                 first_visual = (image_rgb, prediction, target)
     report = {
+        "experiment_type": experiment_type,
         "checkpoint": str(Path(checkpoint_path).resolve()),
         "sample_count": len(dataset),
         "confusion_matrix": total_confusion.tolist(),
@@ -232,7 +240,7 @@ def compare_checkpoints(
     _write_image(destination / "ground_truth.png", ground_truth)
     _write_image(destination / "comparison.png", np.hstack(panels))
     report = {
-        "experiment_type": "single_page_overfit",
+        "experiment_type": old_report["experiment_type"],
         "has_independent_validation": False,
         "old_model": old_report,
         "new_model": new_report,

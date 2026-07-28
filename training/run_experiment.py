@@ -104,6 +104,8 @@ def run_experiment(
     sample_parity_function=verify_sample_parity,
 ) -> ExperimentResult:
     training = train(config, model_factory=model_factory)
+    training_metrics = json.loads(training.metrics_path.read_text(encoding="utf-8"))
+    experiment_type = training_metrics["experiment_type"]
     comparison = compare_checkpoints(
         config.checkpoint_path,
         training.best_checkpoint,
@@ -123,7 +125,7 @@ def run_experiment(
         device=config.device,
     )
     report = {
-        "experiment_type": "single_page_overfit",
+        "experiment_type": experiment_type,
         "checker_and_random_input_parity": export_report,
         "confirmed_sample_parity": sample_parity,
         "comparison_report": str(comparison_path),

@@ -311,6 +311,37 @@ class TrainingExperimentTests(unittest.TestCase):
         self.assertTrue((output / "comparison.png").is_file())
         self.assertEqual(result.sample_parity["status"], "passed")
 
+    def test_fine_tune_experiment_reports_keep_the_dataset_type(self):
+        self._set_experiment_type("fine_tune")
+        self._add_second_sample()
+        output = self.root / "fine-tune-orchestrated"
+
+        def fake_export(checkpoint, destination):
+            Path(destination).write_bytes(b"test-onnx")
+            return {
+                "checker": {"status": "passed", "returncode": 0},
+                "metrics": {"argmax_pixel_agreement": 1.0, "max_abs_error": 0.0},
+            }
+
+        run_experiment(
+            self._training_config("fine-tune-orchestrated"),
+            model_factory=TinySegmentationModel,
+            export_function=fake_export,
+            sample_parity_function=lambda *args, **kwargs: {
+                "argmax_pixel_agreement": 1.0,
+                "status": "passed",
+            },
+        )
+
+        export_report = json.loads(
+            (output / "export_report.json").read_text(encoding="utf-8")
+        )
+        comparison_report = json.loads(
+            (output / "comparison_metrics.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(export_report["experiment_type"], "fine_tune")
+        self.assertEqual(comparison_report["experiment_type"], "fine_tune")
+
     def test_confirmed_sample_gate_uses_class_mask_agreement(self):
         require_class_mask_equivalent(
             {"max_abs_error": 0.001, "argmax_pixel_agreement": 1.0}

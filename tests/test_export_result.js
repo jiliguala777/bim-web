@@ -14,5 +14,5 @@ assert.equal(
     experiment_type: "single_page_overfit",
     export_path: exportPath,
   }),
-  `1 页 · single_page_overfit\n导出路径：${exportPath}`,
+  `1 个样本 · single_page_overfit\n导出路径：${exportPath}`,
 );

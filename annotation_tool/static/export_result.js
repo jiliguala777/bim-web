@@ -14,7 +14,7 @@
 
     function formatExportDetail(result) {
       return (
-        `${result.sample_count} 页 · ${result.experiment_type}\n` +
+        `${result.sample_count} 个样本 · ${result.experiment_type}\n` +
         `导出路径：${result.export_path}`
       );
     }

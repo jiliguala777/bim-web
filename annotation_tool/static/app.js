@@ -1019,7 +1019,7 @@
       );
       setCurrentPageStatus(result.status);
       $("#export").disabled = false;
-      log("本页已确认，可导出训练数据");
+      log("当前标注已确认，可导出训练数据");
     } catch (error) { handleError(error); }
   });
 

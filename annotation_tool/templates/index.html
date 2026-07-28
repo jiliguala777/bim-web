@@ -121,13 +121,13 @@
         </div>
         <button id="preannotate" type="button" disabled>运行当前 ONNX 预标注</button>
         <button id="save" type="button" disabled>保存草稿</button>
-        <button id="confirm" type="button" class="primary" disabled>确认本页标注</button>
+        <button id="confirm" type="button" class="primary" disabled>确认当前标注</button>
       </section>
 
       <section>
         <h2>4. 导出训练数据</h2>
-        <p class="hint">只有“已确认”的页面会进入训练集。单页导出会标记为 single_page_overfit。</p>
-        <button id="export" type="button" disabled>导出已确认页面</button>
+        <p class="hint">只有“已确认”的整页或裁剪区域会进入训练集；只有一个样本时标记为 single_page_overfit。</p>
+        <button id="export" type="button" disabled>导出已确认样本</button>
       </section>
 
       <section>

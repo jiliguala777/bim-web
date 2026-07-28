@@ -276,6 +276,9 @@ class AnnotationStore:
         page_number: int,
         name: str,
         crop_bbox_px,
+        *,
+        region_id: str | None = None,
+        preparation: dict | None = None,
     ) -> dict:
         if page_number < 1:
             raise ValueError("page_number must be positive")
@@ -302,8 +305,14 @@ class AnnotationStore:
         regions = page.setdefault("regions", {})
         if any(payload.get("name") == region_name for payload in regions.values()):
             raise ValueError("region name must be unique within the page")
-        region_id = uuid.uuid4().hex[:12]
+        region_id = (
+            self._validated_region_id(region_id)
+            if region_id is not None
+            else uuid.uuid4().hex[:12]
+        )
         while region_id in regions:
+            if preparation is not None:
+                raise ValueError("region_id already exists")
             region_id = uuid.uuid4().hex[:12]
         created_at = _now()
         region = {
@@ -316,6 +325,8 @@ class AnnotationStore:
             "created_at": created_at,
             "updated_at": created_at,
         }
+        if preparation is not None:
+            region["preparation"] = preparation
         regions[region_id] = region
         page["updated_at"] = created_at
         project["updated_at"] = created_at

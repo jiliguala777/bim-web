@@ -62,6 +62,67 @@ class AnnotationApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 201, response.get_json())
         return response.get_json()["project"]
 
+    def _install_prepared_page(self, project, *, width=400, height=300):
+        store = self.app.extensions["annotation_store"]
+        page_dir = store.project_directory(project["project_id"]) / "pages" / "1"
+        page_dir.mkdir(parents=True, exist_ok=True)
+        y, x = np.indices((height, width))
+        source = np.stack(
+            (
+                (x % 256).astype(np.uint8),
+                (y % 256).astype(np.uint8),
+                ((x + y) % 256).astype(np.uint8),
+            ),
+            axis=2,
+        )
+        artifacts = {}
+        filenames = {
+            "render": "page_render.png",
+            "cleaned": "cleaned_page.png",
+            "model_view": "model_view.png",
+        }
+        for key, filename in filenames.items():
+            path = page_dir / filename
+            _write_test_png(path, source)
+            artifacts[key] = {
+                "path": str(path.relative_to(store.root)),
+                "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+            }
+        model_input = np.zeros((512, 512, 3), dtype=np.uint8)
+        model_input_path = page_dir / "model_input_512.png"
+        _write_test_png(model_input_path, model_input)
+        artifacts["model_input_512"] = {
+            "path": str(model_input_path.relative_to(store.root)),
+            "sha256": hashlib.sha256(model_input_path.read_bytes()).hexdigest(),
+        }
+        metadata_path = page_dir / "preprocessing.json"
+        metadata_path.write_text("{}", encoding="utf-8")
+        artifacts["metadata"] = {
+            "path": str(metadata_path.relative_to(store.root)),
+            "sha256": hashlib.sha256(metadata_path.read_bytes()).hexdigest(),
+        }
+        store.save_page_manifest(
+            project["project_id"],
+            1,
+            {
+                "preprocessing_version": 1,
+                "page_count": 2,
+                "image_size": [width, height],
+                "model_input": {
+                    "original_size": [width, height],
+                    "resized_size": [512, round(height * 512 / width)],
+                    "padding": [64, 0, 64, 0],
+                    "resize_scale": 512 / width,
+                },
+                "scale_calibration": {"status": "manual_required"},
+                "vector_analysis": {"status": "completed"},
+                "vector_cleanup": {"enabled": False},
+                "inference_roi": None,
+                "artifacts": artifacts,
+            },
+        )
+        return source
+
     def _fake_prepared_page(self, output_dir: Path):
         output_dir.mkdir(parents=True, exist_ok=True)
         artifacts = {}
@@ -199,6 +260,83 @@ class AnnotationApiTests(unittest.TestCase):
         self.assertTrue(
             np.array_equal(decoded, np.array([[0, 1], [2, 3]], dtype=np.uint8))
         )
+
+    def test_service_creates_a_lossless_region_and_independent_model_input(self):
+        project = self._create_project()
+        source = self._install_prepared_page(project)
+        service = self.app.extensions["annotation_service"]
+
+        region = service.create_region(
+            project["project_id"],
+            1,
+            "四层",
+            [100, 50, 300, 250],
+        )
+
+        self.assertEqual(region["name"], "四层")
+        self.assertEqual(region["crop_bbox_px"], [100, 50, 300, 250])
+        self.assertEqual(
+            region["preparation"]["model_input"]["original_size"],
+            [200, 200],
+        )
+        cropped = cv2.imread(
+            str(
+                service.region_artifact_path(
+                    project["project_id"],
+                    1,
+                    region["region_id"],
+                    "model_view",
+                )
+            ),
+            cv2.IMREAD_COLOR,
+        )
+        self.assertTrue(np.array_equal(cropped, source[50:250, 100:300]))
+        model_input = cv2.imread(
+            str(
+                service.region_artifact_path(
+                    project["project_id"],
+                    1,
+                    region["region_id"],
+                    "model_input_512",
+                )
+            ),
+            cv2.IMREAD_COLOR,
+        )
+        self.assertEqual(model_input.shape[:2], (512, 512))
+
+    def test_service_rejects_invalid_region_rectangles_and_mask_dimensions(self):
+        project = self._create_project()
+        self._install_prepared_page(project)
+        service = self.app.extensions["annotation_service"]
+
+        for bbox in (
+            [-1, 0, 200, 200],
+            [100, 100, 90, 200],
+            [0, 0, 80, 200],
+            [0, 0, 401, 200],
+        ):
+            with self.subTest(bbox=bbox):
+                with self.assertRaises(ValueError):
+                    service.create_region(
+                        project["project_id"],
+                        1,
+                        "invalid",
+                        bbox,
+                    )
+
+        region = service.create_region(
+            project["project_id"],
+            1,
+            "四层",
+            [100, 50, 300, 250],
+        )
+        with self.assertRaisesRegex(ValueError, "200x200"):
+            service.save_region_mask(
+                project["project_id"],
+                1,
+                region["region_id"],
+                np.zeros((199, 200), dtype=np.uint8),
+            )
 
     def test_duplicate_page_preparation_returns_conflict(self):
         project = self._create_project()

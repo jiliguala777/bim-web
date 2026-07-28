@@ -12,6 +12,7 @@ import shutil
 import tempfile
 import threading
 from typing import Any
+import uuid
 
 import cv2
 import numpy as np
@@ -259,6 +260,249 @@ class AnnotationService:
         if not preparation:
             raise ValueError("page must be prepared before annotation")
         return preparation
+
+    def _region_dir(
+        self,
+        project_id: str,
+        page_number: int,
+        region_id: str,
+    ) -> Path:
+        region_id = self.store._validated_region_id(region_id)
+        page_dir = self._page_dir(project_id, page_number)
+        path = (page_dir / "regions" / region_id).resolve()
+        path.relative_to(page_dir)
+        return path
+
+    def _region_preparation(
+        self,
+        project_id: str,
+        page_number: int,
+        region_id: str,
+    ) -> dict:
+        region_id = self.store._validated_region_id(region_id)
+        project = self._project(project_id)
+        self._validate_page(project, page_number)
+        region = (
+            project.get("pages", {})
+            .get(str(page_number), {})
+            .get("regions", {})
+            .get(region_id)
+        )
+        if region is None:
+            raise FileNotFoundError("Annotation region does not exist")
+        preparation = region.get("preparation")
+        if not preparation:
+            raise ValueError("region preparation is missing")
+        return preparation
+
+    @staticmethod
+    def _letterbox_image(image: np.ndarray) -> tuple[np.ndarray, dict]:
+        height, width = image.shape[:2]
+        resize_scale = 512 / max(width, height)
+        resized_width = max(1, round(width * resize_scale))
+        resized_height = max(1, round(height * resize_scale))
+        resized = cv2.resize(
+            image,
+            (resized_width, resized_height),
+            interpolation=cv2.INTER_LINEAR,
+        )
+        top = (512 - resized_height) // 2
+        left = (512 - resized_width) // 2
+        canvas = np.zeros((512, 512, 3), dtype=np.uint8)
+        canvas[top:top + resized_height, left:left + resized_width] = resized
+        metadata = {
+            "original_size": [width, height],
+            "resized_size": [resized_width, resized_height],
+            "padding": [
+                top,
+                left,
+                512 - resized_height - top,
+                512 - resized_width - left,
+            ],
+            "resize_scale": float(resize_scale),
+        }
+        return canvas, metadata
+
+    def create_region(
+        self,
+        project_id: str,
+        page_number: int,
+        name: str,
+        crop_bbox_px,
+    ) -> dict:
+        page_preparation = self._preparation(project_id, page_number)
+        if (
+            not isinstance(crop_bbox_px, (list, tuple))
+            or len(crop_bbox_px) != 4
+            or any(
+                isinstance(value, bool) or not isinstance(value, (int, np.integer))
+                for value in crop_bbox_px
+            )
+        ):
+            raise ValueError("crop_bbox_px must contain four integers")
+        x0, y0, x1, y1 = (int(value) for value in crop_bbox_px)
+        page_width, page_height = (
+            int(value)
+            for value in page_preparation["model_input"]["original_size"]
+        )
+        crop_width = x1 - x0
+        crop_height = y1 - y0
+        if (
+            x0 < 0
+            or y0 < 0
+            or x1 > page_width
+            or y1 > page_height
+            or crop_width < 128
+            or crop_height < 128
+            or crop_width * crop_height < page_width * page_height * 0.01
+        ):
+            raise ValueError(
+                "crop_bbox_px must be inside the page and at least 128x128 pixels"
+            )
+
+        region_id = uuid.uuid4().hex[:12]
+        page_dir = self._page_dir(project_id, page_number)
+        regions_dir = page_dir / "regions"
+        regions_dir.mkdir(parents=True, exist_ok=True)
+        final_dir = self._region_dir(project_id, page_number, region_id)
+        temporary_dir = Path(
+            tempfile.mkdtemp(prefix=f".{region_id}-", dir=regions_dir)
+        )
+        try:
+            cropped_images = {}
+            artifact_filenames = {
+                "render": ARTIFACT_NAMES["render"],
+                "cleaned": ARTIFACT_NAMES["cleaned"],
+                "model_view": ARTIFACT_NAMES["model_view"],
+            }
+            artifact_hashes = {}
+            for artifact_name, filename in artifact_filenames.items():
+                source = _read_image(
+                    self.artifact_path(project_id, page_number, artifact_name)
+                )
+                if source is None:
+                    raise ValueError(f"{artifact_name} artifact cannot be read")
+                cropped = np.ascontiguousarray(source[y0:y1, x0:x1])
+                if cropped.shape[:2] != (crop_height, crop_width):
+                    raise ValueError("crop_bbox_px produced an invalid image")
+                target = temporary_dir / filename
+                _write_image(target, cropped)
+                cropped_images[artifact_name] = cropped
+                artifact_hashes[artifact_name] = _sha256(target)
+
+            model_input, model_input_metadata = self._letterbox_image(
+                cropped_images["model_view"]
+            )
+            model_input_path = temporary_dir / ARTIFACT_NAMES["model_input_512"]
+            _write_image(model_input_path, model_input)
+            artifact_hashes["model_input_512"] = _sha256(model_input_path)
+            metadata = {
+                "preprocessing_version": PREPROCESSING_VERSION,
+                "source_page_number": page_number,
+                "region_id": region_id,
+                "region_name": str(name).strip(),
+                "crop_bbox_px": [x0, y0, x1, y1],
+                "image_size": [crop_width, crop_height],
+                "model_input": model_input_metadata,
+                "inference_roi": None,
+            }
+            metadata_path = temporary_dir / ARTIFACT_NAMES["metadata"]
+            self.store._atomic_json(metadata_path, metadata)
+            artifact_hashes["metadata"] = _sha256(metadata_path)
+
+            os.replace(temporary_dir, final_dir)
+            artifacts = {}
+            for artifact_name, filename in ARTIFACT_NAMES.items():
+                artifact_path = final_dir / filename
+                artifacts[artifact_name] = {
+                    "path": str(artifact_path.relative_to(self.store.root)),
+                    "sha256": artifact_hashes[artifact_name],
+                }
+            metadata["artifacts"] = artifacts
+            try:
+                return self.store.create_region(
+                    project_id,
+                    page_number,
+                    name,
+                    [x0, y0, x1, y1],
+                    region_id=region_id,
+                    preparation=metadata,
+                )
+            except Exception:
+                shutil.rmtree(final_dir, ignore_errors=True)
+                raise
+        finally:
+            if temporary_dir.exists():
+                shutil.rmtree(temporary_dir, ignore_errors=True)
+
+    def list_regions(self, project_id: str, page_number: int) -> list[dict]:
+        return self.store.list_regions(project_id, page_number)
+
+    def region_artifact_path(
+        self,
+        project_id: str,
+        page_number: int,
+        region_id: str,
+        name: str,
+    ) -> Path:
+        if name not in ARTIFACT_NAMES:
+            raise ValueError("artifact name is invalid")
+        preparation = self._region_preparation(
+            project_id,
+            page_number,
+            region_id,
+        )
+        artifact = preparation.get("artifacts", {}).get(name)
+        if artifact is None:
+            raise FileNotFoundError("Artifact does not exist")
+        path = (self.store.root / artifact["path"]).resolve()
+        region_dir = self._region_dir(project_id, page_number, region_id)
+        try:
+            path.relative_to(region_dir)
+        except ValueError as exc:
+            raise ValueError("artifact path is invalid") from exc
+        if not path.is_file():
+            raise FileNotFoundError("Artifact does not exist")
+        return path
+
+    def save_region_mask(
+        self,
+        project_id: str,
+        page_number: int,
+        region_id: str,
+        payload: Any,
+        *,
+        status: str = "draft",
+        author: str = "local-user",
+    ) -> tuple[MaskVersion, list[str]]:
+        preparation = self._region_preparation(
+            project_id,
+            page_number,
+            region_id,
+        )
+        mask = self.decode_mask(payload)
+        width, height = (
+            int(value) for value in preparation["model_input"]["original_size"]
+        )
+        if mask.shape != (height, width):
+            raise ValueError(
+                f"mask dimensions must be {width}x{height}; "
+                f"received {mask.shape[1]}x{mask.shape[0]}"
+            )
+        model_mask = self._mask_512(mask, preparation["model_input"])
+        version = self.store.save_region_mask_version(
+            project_id,
+            page_number,
+            region_id,
+            mask,
+            status=status,
+            author=author,
+        )
+        model_path = version.mask_path.with_name(
+            f"{version.version_id}.mask_512.npy"
+        )
+        self.store._atomic_npy(model_path, model_mask)
+        return version, self._mask_warnings(mask, model_mask)
 
     @staticmethod
     def decode_mask(payload: Any) -> np.ndarray:

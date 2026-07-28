@@ -5,8 +5,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 import json
+import multiprocessing
 import os
 from pathlib import Path
+import tempfile
 from typing import Any
 
 import cv2
@@ -27,6 +29,116 @@ from vector_pdf_scale import (
 )
 
 
+DEFAULT_VECTOR_TIMEOUT_SECONDS = 15.0
+
+
+@dataclass(frozen=True)
+class VectorAnalysisOutcome:
+    page_data: dict[str, Any] | None
+    evidence: dict[str, Any]
+
+
+def _vector_analysis_worker(
+    result_path: str,
+    source: str,
+    page_index: int,
+    dpi: int,
+) -> None:
+    try:
+        page_data = extract_vector_page(source, page_index=page_index, dpi=dpi)
+        payload = {"ok": True, "page_data": page_data}
+    except BaseException as exc:
+        payload = {
+            "ok": False,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+    Path(result_path).write_text(
+        json.dumps(payload, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+
+def _run_vector_analysis(
+    source: Path,
+    page_index: int,
+    dpi: int,
+    timeout_seconds: float,
+    *,
+    worker_target=None,
+) -> VectorAnalysisOutcome:
+    if timeout_seconds <= 0:
+        raise ValueError("vector_timeout_seconds must be positive")
+    target = worker_target or _vector_analysis_worker
+    context = multiprocessing.get_context("spawn")
+    with tempfile.TemporaryDirectory(prefix="floorplan-vector-") as directory:
+        result_path = Path(directory) / "result.json"
+        process = context.Process(
+            target=target,
+            args=(str(result_path), str(source), page_index, dpi),
+            daemon=True,
+        )
+        process.start()
+        process.join(timeout_seconds)
+        if process.is_alive():
+            process.terminate()
+            process.join()
+            return VectorAnalysisOutcome(
+                None,
+                {
+                    "status": "timed_out",
+                    "mode": "raster_fallback",
+                    "timeout_seconds": timeout_seconds,
+                    "reason": (
+                        f"vector extraction exceeded {timeout_seconds:g} seconds"
+                    ),
+                },
+            )
+        if not result_path.is_file():
+            return VectorAnalysisOutcome(
+                None,
+                {
+                    "status": "failed",
+                    "mode": "raster_fallback",
+                    "timeout_seconds": timeout_seconds,
+                    "reason": (
+                        "vector extraction worker exited without a result "
+                        f"(exit code {process.exitcode})"
+                    ),
+                },
+            )
+        try:
+            payload = json.loads(result_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            return VectorAnalysisOutcome(
+                None,
+                {
+                    "status": "failed",
+                    "mode": "raster_fallback",
+                    "timeout_seconds": timeout_seconds,
+                    "reason": f"invalid vector worker result: {exc}",
+                },
+            )
+    if not payload["ok"]:
+        return VectorAnalysisOutcome(
+            None,
+            {
+                "status": "failed",
+                "mode": "raster_fallback",
+                "timeout_seconds": timeout_seconds,
+                "reason": payload["error"],
+            },
+        )
+    return VectorAnalysisOutcome(
+        payload["page_data"],
+        {
+            "status": "completed",
+            "mode": "vector",
+            "timeout_seconds": timeout_seconds,
+            "reason": None,
+        },
+    )
+
+
 @dataclass(frozen=True)
 class PreparedFloorplanPage:
     page_number: int
@@ -36,6 +148,7 @@ class PreparedFloorplanPage:
     model_view_rgb: np.ndarray
     model_input_512: np.ndarray
     model_input_metadata: dict[str, Any]
+    vector_analysis: dict[str, Any]
     scale_calibration: dict[str, Any]
     vector_cleanup: dict[str, Any]
     inference_roi: list[int] | None
@@ -90,6 +203,7 @@ def prepare_pdf_page(
     poppler_path: str | None,
     segmenter,
     output_dir: str | Path | None = None,
+    vector_timeout_seconds: float = DEFAULT_VECTOR_TIMEOUT_SECONDS,
 ) -> PreparedFloorplanPage:
     """Prepare one 1-based PDF page with the same inputs used by recognition."""
     source = Path(pdf_path).resolve()
@@ -101,9 +215,14 @@ def prepare_pdf_page(
         raise ValueError(f"page_number must be between 1 and {page_count}")
 
     vector_dpi = 100
-    page_data = extract_vector_page(source, page_index=page_number - 1, dpi=vector_dpi)
-    page_data["page_count"] = page_count
-    render_dpi = vector_dpi if page_data["is_vector_pdf"] else 200
+    vector_outcome = _run_vector_analysis(
+        source,
+        page_index=page_number - 1,
+        dpi=vector_dpi,
+        timeout_seconds=vector_timeout_seconds,
+    )
+    page_data = vector_outcome.page_data
+    render_dpi = vector_dpi if page_data is None or page_data["is_vector_pdf"] else 200
     rendered = convert_from_path(
         str(source),
         dpi=render_dpi,
@@ -114,6 +233,25 @@ def prepare_pdf_page(
     if len(rendered) != 1:
         raise ValueError("PDF renderer did not return exactly one selected page")
     render_bgr = cv2.cvtColor(np.asarray(rendered[0]), cv2.COLOR_RGB2BGR)
+    if page_data is None:
+        page_data = {
+            "page_size_pt": [
+                render_bgr.shape[1] * 72.0 / render_dpi,
+                render_bgr.shape[0] * 72.0 / render_dpi,
+            ],
+            "render_size_px": [render_bgr.shape[1], render_bgr.shape[0]],
+            "dpi": render_dpi,
+            "text_spans": [],
+            "segments": [],
+            "styled_edges": [],
+            "vector_text_count": 0,
+            "vector_segment_count": 0,
+            "styled_edge_count": 0,
+            "has_vector_text": False,
+            "has_vector_geometry": False,
+            "is_vector_pdf": False,
+        }
+    page_data["page_count"] = page_count
     page_data["render_size_px"] = [render_bgr.shape[1], render_bgr.shape[0]]
 
     scale_calibration = _default_scale_calibration(
@@ -224,6 +362,7 @@ def prepare_pdf_page(
                     "page_count": page_count,
                     "render_dpi": render_dpi,
                     "model_input": model_input_metadata,
+                    "vector_analysis": vector_outcome.evidence,
                     "scale_calibration": scale_calibration,
                     "vector_cleanup": vector_cleanup,
                     "inference_roi": inference_roi,
@@ -243,6 +382,7 @@ def prepare_pdf_page(
         model_view_rgb=model_view_rgb,
         model_input_512=model_input_512,
         model_input_metadata=model_input_metadata,
+        vector_analysis=vector_outcome.evidence,
         scale_calibration=scale_calibration,
         vector_cleanup=vector_cleanup,
         inference_roi=inference_roi,

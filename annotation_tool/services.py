@@ -549,6 +549,7 @@ class AnnotationService:
         self.store._atomic_json(export_dir / "dataset_report.json", report)
         return {
             "export_id": export_id,
+            "export_path": str(export_dir),
             "experiment_type": experiment_type,
             "sample_count": len(samples),
         }

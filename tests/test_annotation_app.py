@@ -554,6 +554,10 @@ class AnnotationApiTests(unittest.TestCase):
         )
         export_id = exported.get_json()["export"]["export_id"]
         export_root = store.root / "exports" / export_id
+        self.assertEqual(
+            exported.get_json()["export"]["export_path"],
+            str(export_root),
+        )
         manifest = json.loads((export_root / "manifest.json").read_text(encoding="utf-8"))
         exported_image = cv2.imread(
             str(export_root / manifest["samples"][0]["image"]),

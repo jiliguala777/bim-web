@@ -799,7 +799,10 @@
   $("#export").addEventListener("click", async () => {
     try {
       const body = await api(`/api/projects/${encodeURIComponent(state.project.project_id)}/export`, { method: "POST" });
-      log("训练数据已导出", `${body.export.sample_count} 页 · ${body.export.experiment_type}`);
+      log(
+        "训练数据已导出",
+        window.AnnotationExportResult.formatExportDetail(body.export)
+      );
     } catch (error) { handleError(error); }
   });
 

@@ -175,9 +175,85 @@ class AnnotationApiTests(unittest.TestCase):
                 first_response = first.result(timeout=5)
 
         self.assertEqual(second.status_code, 409)
-        self.assertIn("正在准备", second.get_json()["error"])
+        self.assertEqual(
+            second.get_json(),
+            {"error": "\u8be5\u9875\u9762\u6b63\u5728\u51c6\u5907\uff0c\u8bf7\u7b49\u5f85\u5f53\u524d\u4efb\u52a1\u5b8c\u6210"},
+        )
         self.assertEqual(first_response.status_code, 200)
         self.assertEqual(calls, 1)
+
+    def test_duplicate_preparation_after_validation_returns_conflict(self):
+        project = self._create_project()
+        service = self.app.extensions["annotation_service"]
+        service.segmenter_factory = object
+        first_started = threading.Event()
+        release_first = threading.Event()
+        second_validated = threading.Event()
+        release_second = threading.Event()
+        validation_lock = threading.Lock()
+        validation_calls = 0
+        prepare_lock = threading.Lock()
+        prepare_calls = 0
+        original_validate = service._validate_page
+
+        def blocking_validate(project_data, page_number):
+            nonlocal validation_calls
+            with validation_lock:
+                validation_calls += 1
+                validation_call = validation_calls
+            original_validate(project_data, page_number)
+            if validation_call == 2:
+                second_validated.set()
+                self.assertTrue(release_second.wait(5))
+
+        def blocking_prepare(*args, **kwargs):
+            nonlocal prepare_calls
+            with prepare_lock:
+                prepare_calls += 1
+                prepare_call = prepare_calls
+            if prepare_call == 1:
+                first_started.set()
+                self.assertTrue(release_first.wait(5))
+            return self._fake_prepared_page(Path(kwargs["output_dir"]))
+
+        with patch.object(
+            service,
+            "_validate_page",
+            side_effect=blocking_validate,
+        ), patch(
+            "annotation_tool.services.prepare_pdf_page",
+            side_effect=blocking_prepare,
+        ):
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                try:
+                    first = pool.submit(
+                        lambda: self.app.test_client().post(
+                            f"/api/projects/{project['project_id']}/pages/prepare",
+                            json={"page_number": 1},
+                        )
+                    )
+                    self.assertTrue(first_started.wait(5))
+                    second = pool.submit(
+                        lambda: self.app.test_client().post(
+                            f"/api/projects/{project['project_id']}/pages/prepare",
+                            json={"page_number": 1},
+                        )
+                    )
+                    self.assertFalse(second_validated.wait(0.2))
+                    release_first.set()
+                    first_response = first.result(timeout=5)
+                    second_response = second.result(timeout=5)
+                finally:
+                    release_first.set()
+                    release_second.set()
+
+        self.assertEqual(first_response.status_code, 200)
+        self.assertEqual(
+            second_response.get_json(),
+            {"error": "\u8be5\u9875\u9762\u6b63\u5728\u51c6\u5907\uff0c\u8bf7\u7b49\u5f85\u5f53\u524d\u4efb\u52a1\u5b8c\u6210"},
+        )
+        self.assertEqual(second_response.status_code, 409)
+        self.assertEqual(prepare_calls, 1)
 
     def test_failed_page_preparation_releases_the_guard(self):
         project = self._create_project()

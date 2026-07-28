@@ -163,19 +163,19 @@ class AnnotationService:
         return result
 
     def prepare_page(self, project_id: str, page_number: int) -> dict:
-        project = self._project(project_id)
-        self._validate_page(project, page_number)
-        existing_page = project.get("pages", {}).get(str(page_number), {})
-        if existing_page.get("current_version"):
-            raise ValueError(
-                "page has an annotation; create a new project before re-preparing it"
-            )
         key = (project_id, page_number)
         with self._preparing_lock:
             if key in self._preparing_pages:
                 raise PreparationInProgressError(project_id, page_number)
             self._preparing_pages.add(key)
         try:
+            project = self._project(project_id)
+            self._validate_page(project, page_number)
+            existing_page = project.get("pages", {}).get(str(page_number), {})
+            if existing_page.get("current_version"):
+                raise ValueError(
+                    "page has an annotation; create a new project before re-preparing it"
+                )
             return self._prepare_page_once(project_id, page_number, project)
         finally:
             with self._preparing_lock:

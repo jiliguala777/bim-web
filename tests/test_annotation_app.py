@@ -503,6 +503,23 @@ class AnnotationTemplateTests(unittest.TestCase):
         self.assertIn("replacedDirty", script)
         self.assertIn("appliedPreannotation", script)
 
+    def test_prepare_button_has_a_single_request_busy_state(self):
+        script = (
+            Path(__file__).resolve().parents[1]
+            / "annotation_tool/static/app.js"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("preparing: false", script)
+        self.assertIn("function setPreparing(active)", script)
+        self.assertIn(
+            r'"\u6b63\u5728\u51c6\u5907\uff0c\u8bf7\u52ff\u91cd\u590d\u70b9\u51fb\u2026"',
+            script,
+        )
+        self.assertIn("state.preparing", script)
+        self.assertIn("setPreparing(true)", script)
+        self.assertIn("setPreparing(false)", script)
+        self.assertIn("raster_fallback", script)
+
     def test_default_segmenter_uses_the_configured_onnx_model_path(self):
         store = self.app.extensions["annotation_store"]
         with patch.dict(os.environ, {"ONNX_MODEL_PATH": r"G:\models\custom.onnx"}):

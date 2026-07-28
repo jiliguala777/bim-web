@@ -36,6 +36,7 @@
     editRevision: 0,
     pageGeneration: 0,
     preannotating: false,
+    preparing: false,
   };
 
   const imageCanvas = $("#image-canvas");
@@ -62,6 +63,17 @@
     const target = $("#save-state");
     target.textContent = label;
     target.dataset.state = kind;
+  }
+
+  function setPreparing(active) {
+    state.preparing = active;
+    const button = $("#prepare-page");
+    button.textContent = active
+      ? "\u6b63\u5728\u51c6\u5907\uff0c\u8bf7\u52ff\u91cd\u590d\u70b9\u51fb\u2026"
+      : "\u51c6\u5907\u6240\u9009\u9875\u9762";
+    $("#project-select").disabled = active;
+    $("#page-select").disabled = active || !state.project;
+    button.disabled = active || !state.project || !$("#page-select").value;
   }
 
   function showWarnings(warnings = []) {
@@ -112,8 +124,10 @@
     $("#page-select").innerHTML = '<option value="">请选择</option>' + state.pages
       .map((page) => `<option value="${page.page_number}">第 ${page.page_number} 页 · ${statusText(page.status)}</option>`)
       .join("");
-    $("#page-select").disabled = false;
-    $("#prepare-page").disabled = false;
+    $("#page-select").disabled = state.preparing;
+    $("#prepare-page").disabled = (
+      state.preparing || !$("#page-select").value
+    );
     $("#export").disabled = !state.pages.some((page) => page.status === "confirmed");
     renderPageList();
   }
@@ -519,23 +533,49 @@
   });
 
   $("#project-select").addEventListener("change", (event) => selectProject(event.target.value).catch(handleError));
-  $("#page-select").addEventListener("change", (event) => selectPage(event.target.value).catch(handleError));
+  $("#page-select").addEventListener("change", (event) => {
+    $("#prepare-page").disabled = state.preparing || !event.target.value;
+    selectPage(event.target.value).catch(handleError);
+  });
 
   $("#prepare-page").addEventListener("click", async () => {
-    if (!state.project || !$("#page-select").value) return;
+    if (
+      state.preparing
+      || !state.project
+      || !$("#page-select").value
+    ) return;
+    const projectId = state.project.project_id;
+    const pageNumber = Number($("#page-select").value);
+    setPreparing(true);
     try {
-      const pageNumber = Number($("#page-select").value);
-      setSaveState("页面处理中…", "saving");
-      await api(`/api/projects/${encodeURIComponent(state.project.project_id)}/pages/prepare`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ page_number: pageNumber }),
-      });
-      await selectProject(state.project.project_id);
+      setSaveState("页面准备中…", "saving");
+      const body = await api(
+        `/api/projects/${encodeURIComponent(projectId)}/pages/prepare`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ page_number: pageNumber }),
+        }
+      );
+      const fallback = (
+        body.page.preparation?.vector_analysis?.mode === "raster_fallback"
+      );
+      await selectProject(projectId);
       $("#page-select").value = String(pageNumber);
       await selectPage(pageNumber);
-      log(`第 ${pageNumber} 页准备完成`);
-    } catch (error) { handleError(error); }
+      if (fallback) {
+        log(
+          `第 ${pageNumber} 页准备完成`,
+          "复杂 PDF 已使用栅格模式准备，可正常标注墙、窗、门。"
+        );
+      } else {
+        log(`第 ${pageNumber} 页准备完成`);
+      }
+    } catch (error) {
+      handleError(error);
+    } finally {
+      setPreparing(false);
+    }
   });
 
   $$(".segmented button").forEach((button) => button.addEventListener("click", async () => {
@@ -701,9 +741,11 @@
       }
       state.preannotating = false;
       maskCanvas.style.pointerEvents = "";
-      $("#project-select").disabled = false;
-      $("#page-select").disabled = !state.project;
-      $("#prepare-page").disabled = !state.project;
+      $("#project-select").disabled = state.preparing;
+      $("#page-select").disabled = state.preparing || !state.project;
+      $("#prepare-page").disabled = (
+        state.preparing || !state.project || !$("#page-select").value
+      );
       if (state.page?.preparation) {
         setControls(true);
         updateHistoryButtons();

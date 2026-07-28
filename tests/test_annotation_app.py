@@ -965,6 +965,21 @@ class AnnotationTemplateTests(unittest.TestCase):
         self.assertIn("state.mask = null;", setup_canvases)
         self.assertNotIn("new Uint8Array", setup_canvases)
 
+    def test_switching_annotation_regions_disables_editing_until_load_finishes(self):
+        script = (
+            Path(__file__).resolve().parents[1]
+            / "annotation_tool/static/app.js"
+        ).read_text(encoding="utf-8")
+        select_region = script.split(
+            "async function selectRegion(regionId) {", 1
+        )[1].split("async function loadCurrentTarget", 1)[0]
+
+        self.assertIn("setEditingReady(false);", select_region)
+        self.assertLess(
+            select_region.index("setEditingReady(false);"),
+            select_region.index("await loadCurrentTarget(generation);"),
+        )
+
     def test_saved_mask_loader_handles_2xx_404_and_500(self):
         repository = Path(__file__).resolve().parents[1]
         result = subprocess.run(

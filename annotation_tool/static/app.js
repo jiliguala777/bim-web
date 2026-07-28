@@ -255,6 +255,7 @@
     state.pageGeneration = generation;
     state.region = state.regions.find((region) => region.region_id === regionId) || null;
     cancelCropMode();
+    setEditingReady(false);
     renderRegionList();
     await loadCurrentTarget(generation);
   }

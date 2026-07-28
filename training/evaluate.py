@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from pathlib import Path
 from typing import Callable
 
@@ -50,6 +51,13 @@ def _read_image(path: Path) -> np.ndarray | None:
     if encoded.size == 0:
         return None
     return cv2.imdecode(encoded, cv2.IMREAD_COLOR)
+
+
+def _safe_sample_id(sample_id: str) -> str:
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "-", str(sample_id)).strip("-")
+    if not safe:
+        raise ValueError("sample_id must contain a safe filename character")
+    return safe
 
 
 def _confusion(prediction: np.ndarray, target: np.ndarray) -> np.ndarray:
@@ -124,14 +132,28 @@ def evaluate_checkpoint(
                 logits.cpu(),
                 sample["mask"].unsqueeze(0),
             )
+            safe_sample_id = _safe_sample_id(sample["sample_id"])
+            relative_sample_dir = Path("samples") / safe_sample_id
+            sample_dir = destination / relative_sample_dir
+            sample_dir.mkdir(parents=True, exist_ok=False)
+            image_rgb = _denormalize(sample["image"])
+            _write_image(
+                sample_dir / "overlay.png",
+                cv2.cvtColor(_overlay(image_rgb, prediction), cv2.COLOR_RGB2BGR),
+            )
+            _write_image(
+                sample_dir / "ground_truth.png",
+                cv2.cvtColor(_overlay(image_rgb, target), cv2.COLOR_RGB2BGR),
+            )
+            np.save(sample_dir / "prediction.npy", prediction, allow_pickle=False)
             samples.append(
                 {
                     "sample_id": sample["sample_id"],
                     "classes": {str(key): value for key, value in class_report.items()},
+                    "artifact_directory": relative_sample_dir.as_posix(),
                 }
             )
             if first_visual is None:
-                image_rgb = _denormalize(sample["image"])
                 first_visual = (image_rgb, prediction, target)
     report = {
         "checkpoint": str(Path(checkpoint_path).resolve()),

@@ -194,6 +194,28 @@ class TrainingExperimentTests(unittest.TestCase):
         self.assertTrue((output / "evaluation" / "overlay.png").is_file())
         self.assertEqual(len(evaluation["confusion_matrix"]), 4)
 
+    def test_evaluation_writes_artifacts_for_every_sample(self):
+        self._add_second_sample()
+        output = self.root / "multi-sample-evaluation"
+
+        evaluation = evaluate_checkpoint(
+            self.initial,
+            self.export,
+            output,
+            model_factory=TinySegmentationModel,
+            device="cpu",
+        )
+
+        self.assertEqual(len(evaluation["samples"]), 2)
+        for sample in evaluation["samples"]:
+            sample_dir = output / sample["artifact_directory"]
+            self.assertTrue((sample_dir / "prediction.npy").is_file())
+            self.assertTrue((sample_dir / "overlay.png").is_file())
+            self.assertTrue((sample_dir / "ground_truth.png").is_file())
+        self.assertTrue((output / "prediction.npy").is_file())
+        self.assertTrue((output / "overlay.png").is_file())
+        self.assertTrue((output / "ground_truth.png").is_file())
+
     def test_checkpoint_loading_is_strict_for_injected_model(self):
         incompatible = self.root / "incompatible.pt"
         torch.save({"model_state_dict": {"wrong.weight": torch.ones(1)}}, incompatible)

@@ -581,6 +581,32 @@ class AnnotationApiTests(unittest.TestCase):
         self.assertIn("annotation", repeated.get_json()["error"])
         prepare.assert_not_called()
 
+    def test_prepare_without_poppler_returns_a_clear_configuration_error(self):
+        project = self._create_project()
+        service = self.app.extensions["annotation_service"]
+        service.poppler_path = None
+
+        with patch.object(
+            service,
+            "_segmenter",
+            side_effect=AssertionError("model must not load before Poppler validation"),
+        ):
+            response = self.client.post(
+                f"/api/projects/{project['project_id']}/pages/prepare",
+                json={"page_number": 2},
+            )
+
+        self.assertEqual(response.status_code, 400, response.get_json())
+        self.assertEqual(
+            response.get_json(),
+            {
+                "error": (
+                    "未找到 Poppler。请设置 POPPLER_PATH，"
+                    "或使用 start_annotation_tool.ps1 启动标注工具。"
+                )
+            },
+        )
+
 
 class AnnotationTemplateTests(unittest.TestCase):
     def setUp(self):
@@ -709,7 +735,6 @@ class AnnotationTemplateTests(unittest.TestCase):
                 service._segmenter()
 
         get_segmenter.assert_called_once_with(r"G:\models\custom.onnx")
-
 
 if __name__ == "__main__":
     unittest.main()

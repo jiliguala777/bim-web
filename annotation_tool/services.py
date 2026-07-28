@@ -21,6 +21,7 @@ from PIL import Image
 from floorplan_onnx import get_segmenter
 from floorplan_page_pipeline import _write_image, prepare_pdf_page
 
+from .config import resolve_poppler_path
 from .storage import AnnotationStore, MaskVersion, ProjectRecord
 
 
@@ -84,7 +85,7 @@ class AnnotationService:
         segmenter_factory=None,
     ):
         self.store = store
-        self.poppler_path = poppler_path or os.environ.get("POPPLER_PATH")
+        self.poppler_path = resolve_poppler_path(poppler_path)
         self.segmenter_factory = segmenter_factory
         self._preparing_lock = threading.Lock()
         self._preparing_pages: set[tuple[str, int]] = set()
@@ -194,6 +195,11 @@ class AnnotationService:
         page_number: int,
         project: dict,
     ) -> dict:
+        if not self.poppler_path:
+            raise ValueError(
+                "未找到 Poppler。请设置 POPPLER_PATH，"
+                "或使用 start_annotation_tool.ps1 启动标注工具。"
+            )
         output_dir = self._page_dir(project_id, page_number)
         segmenter = self._segmenter()
         prepared = prepare_pdf_page(

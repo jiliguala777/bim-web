@@ -11,7 +11,7 @@ except ImportError as exc:
     raise unittest.SkipTest("training tests require .venv-train") from exc
 from torch import nn
 
-from training.evaluate import evaluate_checkpoint
+from training.evaluate import compare_checkpoints, evaluate_checkpoint
 from training.run_experiment import require_class_mask_equivalent, run_experiment
 from training.train_floorplan import (
     TrainingConfig,
@@ -131,6 +131,32 @@ class TrainingExperimentTests(unittest.TestCase):
 
         with self.assertRaisesRegex(RuntimeError, "state_dict"):
             load_model_strict(incompatible, TinySegmentationModel, device="cpu")
+
+    def test_comparison_writes_visuals_under_a_unicode_output_path(self):
+        output = self.root / "模型" / "文化宫一层"
+
+        compare_checkpoints(
+            self.initial,
+            self.initial,
+            self.export,
+            output,
+            model_factory=TinySegmentationModel,
+            device="cpu",
+        )
+
+        for filename in (
+            "old_model_overlay.png",
+            "new_model_overlay.png",
+            "ground_truth.png",
+            "comparison.png",
+        ):
+            path = output / filename
+            self.assertTrue(path.is_file(), filename)
+            image = cv2.imdecode(
+                np.frombuffer(path.read_bytes(), dtype=np.uint8),
+                cv2.IMREAD_COLOR,
+            )
+            self.assertIsNotNone(image, filename)
 
     def test_training_refuses_to_reuse_a_nonempty_output_directory(self):
         output = self.root / "existing-output"

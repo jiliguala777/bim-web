@@ -71,6 +71,49 @@ class TrainingDatasetTests(unittest.TestCase):
         self.assertEqual(str(sample["image"].dtype), "torch.float32")
         self.assertEqual(str(sample["mask"].dtype), "torch.int64")
 
+    def test_export_under_a_unicode_root_loads_the_training_image(self):
+        unicode_root = self.root / "标注数据"
+        image_path = unicode_root / "images" / "第13页.png"
+        mask_path = unicode_root / "masks" / "第13页.npy"
+        image_path.parent.mkdir(parents=True)
+        mask_path.parent.mkdir(parents=True)
+        image = np.full((512, 512, 3), 255, dtype=np.uint8)
+        cv2.line(image, (50, 100), (460, 100), (0, 0, 0), 5)
+        encoded, buffer = cv2.imencode(".png", image)
+        self.assertTrue(encoded)
+        image_path.write_bytes(buffer.tobytes())
+        np.save(mask_path, np.zeros((512, 512), dtype=np.uint8), allow_pickle=False)
+        (unicode_root / "manifest.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "experiment_type": "single_page_overfit",
+                    "samples": [
+                        {
+                            "sample_id": "page-13",
+                            "page_number": 13,
+                            "status": "confirmed",
+                            "image": "images/第13页.png",
+                            "mask": "masks/第13页.npy",
+                        }
+                    ],
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+
+        report = validate_export(unicode_root)
+        sample = ExportedFloorplanDataset(
+            unicode_root,
+            augment=False,
+            seed=7,
+        )[0]
+
+        self.assertEqual(report["sample_count"], 1)
+        self.assertEqual(tuple(sample["image"].shape), (3, 512, 512))
+        self.assertEqual(sample["sample_id"], "page-13")
+
     def test_invalid_exports_raise_descriptive_errors(self):
         cases = {}
 

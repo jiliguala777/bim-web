@@ -41,6 +41,13 @@ def _load_manifest(root: Path) -> dict[str, Any]:
     return manifest
 
 
+def _read_image(path: Path) -> np.ndarray | None:
+    encoded = np.frombuffer(path.read_bytes(), dtype=np.uint8)
+    if encoded.size == 0:
+        return None
+    return cv2.imdecode(encoded, cv2.IMREAD_COLOR)
+
+
 def validate_export(root: str | Path) -> dict[str, Any]:
     export_root = Path(root).resolve()
     manifest = _load_manifest(export_root)
@@ -50,7 +57,7 @@ def validate_export(root: str | Path) -> dict[str, Any]:
             raise ValueError(f"sample {index} must have confirmed status")
         image_path = _safe_file(export_root, sample.get("image", ""), "image")
         mask_path = _safe_file(export_root, sample.get("mask", ""), "mask")
-        image = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
+        image = _read_image(image_path)
         if image is None:
             raise ValueError(f"image cannot be decoded: {sample.get('image')}")
         if image.shape[:2] != (IMAGE_SIZE, IMAGE_SIZE):
@@ -164,7 +171,7 @@ class ExportedFloorplanDataset(Dataset):
 
     def __getitem__(self, index: int) -> dict[str, Any]:
         sample = self.samples[index]
-        image_bgr = cv2.imread(str(sample["_image_path"]), cv2.IMREAD_COLOR)
+        image_bgr = _read_image(sample["_image_path"])
         if image_bgr is None:
             raise ValueError(f"image cannot be decoded: {sample['image']}")
         image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)

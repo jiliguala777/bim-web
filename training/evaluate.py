@@ -32,6 +32,26 @@ def _atomic_json(path: Path, payload: dict) -> None:
     os.replace(temporary, path)
 
 
+def _write_image(path: Path, image: np.ndarray) -> None:
+    encoded, buffer = cv2.imencode(path.suffix, image)
+    if not encoded:
+        raise ValueError(f"image could not be encoded: {path.name}")
+    temporary = path.with_name(path.name + ".tmp")
+    try:
+        temporary.write_bytes(buffer.tobytes())
+        os.replace(temporary, path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def _read_image(path: Path) -> np.ndarray | None:
+    encoded = np.frombuffer(path.read_bytes(), dtype=np.uint8)
+    if encoded.size == 0:
+        return None
+    return cv2.imdecode(encoded, cv2.IMREAD_COLOR)
+
+
 def _confusion(prediction: np.ndarray, target: np.ndarray) -> np.ndarray:
     encoded = target.reshape(-1) * 4 + prediction.reshape(-1)
     return np.bincount(encoded, minlength=16).reshape(4, 4)
@@ -124,12 +144,12 @@ def evaluate_checkpoint(
     _atomic_json(destination / "metrics.json", report)
     if first_visual is not None:
         image_rgb, prediction, target = first_visual
-        cv2.imwrite(
-            str(destination / "overlay.png"),
+        _write_image(
+            destination / "overlay.png",
             cv2.cvtColor(_overlay(image_rgb, prediction), cv2.COLOR_RGB2BGR),
         )
-        cv2.imwrite(
-            str(destination / "ground_truth.png"),
+        _write_image(
+            destination / "ground_truth.png",
             cv2.cvtColor(_overlay(image_rgb, target), cv2.COLOR_RGB2BGR),
         )
         np.save(destination / "prediction.npy", prediction, allow_pickle=False)
@@ -162,9 +182,9 @@ def compare_checkpoints(
         model_factory=model_factory,
         device=device,
     )
-    old_overlay = cv2.imread(str(old_dir / "overlay.png"))
-    new_overlay = cv2.imread(str(new_dir / "overlay.png"))
-    ground_truth = cv2.imread(str(new_dir / "ground_truth.png"))
+    old_overlay = _read_image(old_dir / "overlay.png")
+    new_overlay = _read_image(new_dir / "overlay.png")
+    ground_truth = _read_image(new_dir / "ground_truth.png")
     panels = []
     for label, image in (
         ("OLD MODEL", old_overlay),
@@ -185,10 +205,10 @@ def compare_checkpoints(
         )
         panels.append(panel)
     destination.mkdir(parents=True, exist_ok=True)
-    cv2.imwrite(str(destination / "old_model_overlay.png"), old_overlay)
-    cv2.imwrite(str(destination / "new_model_overlay.png"), new_overlay)
-    cv2.imwrite(str(destination / "ground_truth.png"), ground_truth)
-    cv2.imwrite(str(destination / "comparison.png"), np.hstack(panels))
+    _write_image(destination / "old_model_overlay.png", old_overlay)
+    _write_image(destination / "new_model_overlay.png", new_overlay)
+    _write_image(destination / "ground_truth.png", ground_truth)
+    _write_image(destination / "comparison.png", np.hstack(panels))
     report = {
         "experiment_type": "single_page_overfit",
         "has_independent_validation": False,

@@ -19,7 +19,7 @@ import pdfplumber
 from PIL import Image
 
 from floorplan_onnx import get_segmenter
-from floorplan_page_pipeline import prepare_pdf_page
+from floorplan_page_pipeline import _write_image, prepare_pdf_page
 
 from .storage import AnnotationStore, MaskVersion, ProjectRecord
 
@@ -47,6 +47,13 @@ def _sha256(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _read_image(path: Path, flags: int = cv2.IMREAD_COLOR) -> np.ndarray | None:
+    encoded = np.frombuffer(path.read_bytes(), dtype=np.uint8)
+    if encoded.size == 0:
+        return None
+    return cv2.imdecode(encoded, flags)
 
 
 def _json_safe_project(project: dict) -> dict:
@@ -363,7 +370,7 @@ class AnnotationService:
     ) -> tuple[MaskVersion, list[str]]:
         preparation = self._preparation(project_id, page_number)
         cleaned_path = self.artifact_path(project_id, page_number, "cleaned")
-        cleaned = cv2.imread(str(cleaned_path), cv2.IMREAD_COLOR)
+        cleaned = _read_image(cleaned_path)
         if cleaned is None:
             raise ValueError("prepared page image cannot be read")
         segmenter = self._segmenter()
@@ -452,7 +459,7 @@ class AnnotationService:
             artifact = preparation["artifacts"]["model_input_512"]
             if _sha256(image_source) != artifact.get("sha256"):
                 raise ValueError("model input artifact hash does not match its manifest")
-            image = cv2.imread(str(image_source), cv2.IMREAD_COLOR)
+            image = _read_image(image_source)
             if image is None or image.shape[:2] != (512, 512):
                 raise ValueError("model input artifact must be a readable 512x512 image")
             model_mask_path = version.mask_path.with_name(
@@ -500,8 +507,7 @@ class AnnotationService:
             mask_png_target = masks_dir / f"{stem}.png"
             shutil.copyfile(image_source, image_target)
             self.store._atomic_npy(mask_target, mask)
-            if not cv2.imwrite(str(mask_png_target), mask):
-                raise OSError("could not write exported mask preview")
+            _write_image(mask_png_target, mask)
             for class_id in range(4):
                 class_pixels[str(class_id)] += int(np.sum(mask == class_id))
             samples.append(

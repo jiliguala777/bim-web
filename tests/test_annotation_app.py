@@ -2,6 +2,7 @@ import io
 import hashlib
 import json
 import os
+import subprocess
 import tempfile
 import threading
 import unittest
@@ -29,6 +30,13 @@ def _two_page_pdf() -> bytes:
     document.showPage()
     document.save()
     return buffer.getvalue()
+
+
+def _write_test_png(path: Path, image: np.ndarray) -> None:
+    encoded, buffer = cv2.imencode(".png", image)
+    if not encoded:
+        raise AssertionError(f"could not encode test PNG: {path.name}")
+    path.write_bytes(buffer.tobytes())
 
 
 class AnnotationApiTests(unittest.TestCase):
@@ -63,17 +71,22 @@ class AnnotationApiTests(unittest.TestCase):
             "model_view": "model_view.png",
             "model_input_512": "model_input_512.png",
         }.items():
-            self.assertTrue(
-                cv2.imwrite(
-                    str(output_dir / filename),
-                    np.full((4, 4, 3), 255, np.uint8),
-                )
+            image_size = 512 if key == "model_input_512" else 4
+            _write_test_png(
+                output_dir / filename,
+                np.full((image_size, image_size, 3), 255, np.uint8),
             )
-            artifacts[key] = {"path": filename, "sha256": key}
+            artifact_path = output_dir / filename
+            artifacts[key] = {
+                "path": filename,
+                "sha256": hashlib.sha256(artifact_path.read_bytes()).hexdigest(),
+            }
         (output_dir / "preprocessing.json").write_text("{}", encoding="utf-8")
         artifacts["metadata"] = {
             "path": "preprocessing.json",
-            "sha256": "metadata",
+            "sha256": hashlib.sha256(
+                (output_dir / "preprocessing.json").read_bytes()
+            ).hexdigest(),
         }
         return SimpleNamespace(
             page_count=2,
@@ -93,6 +106,56 @@ class AnnotationApiTests(unittest.TestCase):
             vector_cleanup={"enabled": False},
             inference_roi=None,
             artifacts=artifacts,
+        )
+
+    def _create_unicode_preannotation_fixture(self):
+        unicode_config = AnnotationConfig(
+            data_root=Path(self.temporary.name) / "标注数据"
+        )
+        unicode_app = create_app(unicode_config)
+        unicode_app.config["TESTING"] = True
+        unicode_client = unicode_app.test_client()
+        created = unicode_client.post(
+            "/api/projects",
+            data={
+                "name": "Unicode Path",
+                "pdf": (io.BytesIO(_two_page_pdf()), "building.pdf"),
+            },
+            content_type="multipart/form-data",
+        )
+        self.assertEqual(created.status_code, 201, created.get_json())
+        project = created.get_json()["project"]
+        predicted_images = []
+
+        class FakeSegmenter:
+            def predict(self, image, **kwargs):
+                predicted_images.append(image.copy())
+                return {"mask": np.ones(image.shape[:2], dtype=np.uint8)}
+
+        service = unicode_app.extensions["annotation_service"]
+        service.segmenter_factory = FakeSegmenter
+
+        def fake_prepare(source, page_number, **kwargs):
+            return self._fake_prepared_page(Path(kwargs["output_dir"]))
+
+        with patch(
+            "annotation_tool.services.prepare_pdf_page",
+            side_effect=fake_prepare,
+        ):
+            prepared = unicode_client.post(
+                f"/api/projects/{project['project_id']}/pages/prepare",
+                json={"page_number": 1},
+            )
+        self.assertEqual(prepared.status_code, 200, prepared.get_json())
+        preannotation = unicode_client.post(
+            f"/api/projects/{project['project_id']}/pages/1/preannotate"
+        )
+        return (
+            unicode_app,
+            unicode_client,
+            project,
+            predicted_images,
+            preannotation,
         )
 
     def test_pdf_upload_creates_a_project_and_lists_it(self):
@@ -364,6 +427,65 @@ class AnnotationApiTests(unittest.TestCase):
         )
         self.assertEqual(evidence["inference_status"], "failed")
 
+    def test_unicode_data_root_prepared_page_enters_preannotation(self):
+        (
+            _,
+            _,
+            _,
+            predicted_images,
+            preannotation,
+        ) = self._create_unicode_preannotation_fixture()
+
+        self.assertEqual(
+            preannotation.status_code,
+            200,
+            preannotation.get_json(),
+        )
+        self.assertEqual(preannotation.get_json()["status"], "preannotated")
+        self.assertEqual(len(predicted_images), 1)
+        self.assertEqual(predicted_images[0].shape, (4, 4, 3))
+
+    def test_unicode_data_root_exports_a_confirmed_preannotation(self):
+        (
+            unicode_app,
+            unicode_client,
+            project,
+            _,
+            preannotation,
+        ) = self._create_unicode_preannotation_fixture()
+        self.assertEqual(
+            preannotation.status_code,
+            200,
+            preannotation.get_json(),
+        )
+        confirmation = unicode_client.post(
+            f"/api/projects/{project['project_id']}/pages/1/confirm",
+            json={"author": "unicode-test"},
+        )
+        self.assertEqual(confirmation.status_code, 200, confirmation.get_json())
+
+        exported = unicode_client.post(
+            f"/api/projects/{project['project_id']}/export"
+        )
+
+        self.assertEqual(exported.status_code, 201, exported.get_json())
+        export_id = exported.get_json()["export"]["export_id"]
+        export_root = (
+            unicode_app.extensions["annotation_store"].root
+            / "exports"
+            / export_id
+        )
+        manifest = json.loads(
+            (export_root / "manifest.json").read_text(encoding="utf-8")
+        )
+        mask_preview = export_root / manifest["samples"][0]["mask_preview"]
+        decoded = cv2.imdecode(
+            np.frombuffer(mask_preview.read_bytes(), dtype=np.uint8),
+            cv2.IMREAD_UNCHANGED,
+        )
+        self.assertIsNotNone(decoded)
+        self.assertEqual(decoded.shape, (512, 512))
+
     def test_draft_confirmation_and_single_page_export_keep_preparation_data(self):
         project = self._create_project()
         store = self.app.extensions["annotation_store"]
@@ -537,6 +659,7 @@ class AnnotationTemplateTests(unittest.TestCase):
         )
         self.assertIn(
             """} else {
+      state.mask = new Uint8Array(width * height);
       renderMask();
       state.dirty = false;
       state.editRevision = 0;
@@ -545,6 +668,38 @@ class AnnotationTemplateTests(unittest.TestCase):
             select_page,
         )
         self.assertIn("await Promise.all(pageTasks);", select_page)
+        self.assertLess(
+            select_page.index("setEditingReady(false);"),
+            select_page.index("const pageTasks = ["),
+        )
+        self.assertGreater(
+            select_page.index("setEditingReady(true);"),
+            select_page.index("await Promise.all(pageTasks);"),
+        )
+        setup_canvases = script.split(
+            "function setupCanvases() {", 1
+        )[1].split("async function loadImage", 1)[0]
+        self.assertIn("state.mask = null;", setup_canvases)
+        self.assertNotIn("new Uint8Array", setup_canvases)
+
+    def test_saved_mask_loader_handles_2xx_404_and_500(self):
+        repository = Path(__file__).resolve().parents[1]
+        result = subprocess.run(
+            [
+                "node",
+                str(repository / "tests" / "test_saved_mask_loader.js"),
+            ],
+            cwd=repository,
+            text=True,
+            capture_output=True,
+            timeout=15,
+        )
+
+        self.assertEqual(
+            result.returncode,
+            0,
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+        )
 
     def test_default_segmenter_uses_the_configured_onnx_model_path(self):
         store = self.app.extensions["annotation_store"]

@@ -5,9 +5,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 import json
-import multiprocessing
 import os
 from pathlib import Path
+import subprocess
+import sys
 import tempfile
 from typing import Any
 
@@ -30,6 +31,9 @@ from vector_pdf_scale import (
 
 
 DEFAULT_VECTOR_TIMEOUT_SECONDS = 15.0
+VECTOR_WORKER_SCRIPT = Path(__file__).with_name("floorplan_vector_worker.py")
+PROCESS_TERMINATE_TIMEOUT_SECONDS = 1.0
+PROCESS_KILL_TIMEOUT_SECONDS = 1.0
 
 
 @dataclass(frozen=True)
@@ -38,24 +42,43 @@ class VectorAnalysisOutcome:
     evidence: dict[str, Any]
 
 
-def _vector_analysis_worker(
-    result_path: str,
-    source: str,
-    page_index: int,
-    dpi: int,
-) -> None:
-    try:
-        page_data = extract_vector_page(source, page_index=page_index, dpi=dpi)
-        payload = {"ok": True, "page_data": page_data}
-    except BaseException as exc:
-        payload = {
-            "ok": False,
-            "error": f"{type(exc).__name__}: {exc}",
-        }
-    Path(result_path).write_text(
-        json.dumps(payload, ensure_ascii=False),
-        encoding="utf-8",
+def _failure_outcome(timeout_seconds: float, reason: str) -> VectorAnalysisOutcome:
+    return VectorAnalysisOutcome(
+        None,
+        {
+            "status": "failed",
+            "mode": "raster_fallback",
+            "timeout_seconds": timeout_seconds,
+            "reason": reason,
+        },
     )
+
+
+def _terminate_and_reap(
+    process,
+    *,
+    terminate_timeout_seconds: float = PROCESS_TERMINATE_TIMEOUT_SECONDS,
+    kill_timeout_seconds: float = PROCESS_KILL_TIMEOUT_SECONDS,
+) -> None:
+    """Terminate a worker, escalating to kill without an unbounded wait."""
+    process.terminate()
+    try:
+        process.wait(timeout=terminate_timeout_seconds)
+        return
+    except subprocess.TimeoutExpired:
+        process.kill()
+    try:
+        process.wait(timeout=kill_timeout_seconds)
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError("vector extraction worker could not be reaped") from exc
+
+
+def _close_process_handle(process) -> None:
+    """Explicitly close the Windows process handle after wait/reaping."""
+    handle = getattr(process, "_handle", None)
+    close = getattr(handle, "Close", None)
+    if callable(close):
+        close()
 
 
 def _run_vector_analysis(
@@ -64,79 +87,101 @@ def _run_vector_analysis(
     dpi: int,
     timeout_seconds: float,
     *,
-    worker_target=None,
+    worker_script: str | Path | None = None,
 ) -> VectorAnalysisOutcome:
     if timeout_seconds <= 0:
         raise ValueError("vector_timeout_seconds must be positive")
-    target = worker_target or _vector_analysis_worker
-    context = multiprocessing.get_context("spawn")
+    script = Path(worker_script or VECTOR_WORKER_SCRIPT).resolve()
     with tempfile.TemporaryDirectory(prefix="floorplan-vector-") as directory:
         result_path = Path(directory) / "result.json"
-        process = context.Process(
-            target=target,
-            args=(str(result_path), str(source), page_index, dpi),
-            daemon=True,
-        )
-        process.start()
-        process.join(timeout_seconds)
-        if process.is_alive():
-            process.terminate()
-            process.join()
-            return VectorAnalysisOutcome(
-                None,
-                {
-                    "status": "timed_out",
-                    "mode": "raster_fallback",
-                    "timeout_seconds": timeout_seconds,
-                    "reason": (
-                        f"vector extraction exceeded {timeout_seconds:g} seconds"
-                    ),
-                },
-            )
-        if not result_path.is_file():
-            return VectorAnalysisOutcome(
-                None,
-                {
-                    "status": "failed",
-                    "mode": "raster_fallback",
-                    "timeout_seconds": timeout_seconds,
-                    "reason": (
-                        "vector extraction worker exited without a result "
-                        f"(exit code {process.exitcode})"
-                    ),
-                },
-            )
+        process = None
+        cleanup_attempted = False
         try:
-            payload = json.loads(result_path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-            return VectorAnalysisOutcome(
-                None,
-                {
-                    "status": "failed",
-                    "mode": "raster_fallback",
-                    "timeout_seconds": timeout_seconds,
-                    "reason": f"invalid vector worker result: {exc}",
-                },
-            )
-    if not payload["ok"]:
-        return VectorAnalysisOutcome(
-            None,
-            {
-                "status": "failed",
-                "mode": "raster_fallback",
-                "timeout_seconds": timeout_seconds,
-                "reason": payload["error"],
-            },
-        )
-    return VectorAnalysisOutcome(
-        payload["page_data"],
-        {
-            "status": "completed",
-            "mode": "vector",
-            "timeout_seconds": timeout_seconds,
-            "reason": None,
-        },
-    )
+            try:
+                process = subprocess.Popen(
+                    [
+                        sys.executable,
+                        str(script),
+                        str(result_path),
+                        str(Path(source).resolve()),
+                        str(page_index),
+                        str(dpi),
+                    ],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    shell=False,
+                )
+            except OSError as exc:
+                return _failure_outcome(
+                    timeout_seconds,
+                    f"vector extraction worker could not start: {exc}",
+                )
+            try:
+                process.wait(timeout=timeout_seconds)
+            except subprocess.TimeoutExpired:
+                cleanup_attempted = True
+                _terminate_and_reap(process)
+                return VectorAnalysisOutcome(
+                    None,
+                    {
+                        "status": "timed_out",
+                        "mode": "raster_fallback",
+                        "timeout_seconds": timeout_seconds,
+                        "reason": (
+                            f"vector extraction exceeded {timeout_seconds:g} seconds"
+                        ),
+                    },
+                )
+            if not result_path.is_file():
+                return _failure_outcome(
+                    timeout_seconds,
+                    (
+                        "vector extraction worker exited without a result "
+                        f"(exit code {process.returncode})"
+                    ),
+                )
+            try:
+                payload = json.loads(result_path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+                return _failure_outcome(
+                    timeout_seconds,
+                    f"invalid vector worker result: {exc}",
+                )
+            if not isinstance(payload, dict) or type(payload.get("ok")) is not bool:
+                return _failure_outcome(
+                    timeout_seconds,
+                    "invalid vector worker result: payload schema is invalid",
+                )
+            if payload["ok"]:
+                if not isinstance(payload.get("page_data"), dict):
+                    return _failure_outcome(
+                        timeout_seconds,
+                        "invalid vector worker result: page_data is invalid",
+                    )
+                return VectorAnalysisOutcome(
+                    payload["page_data"],
+                    {
+                        "status": "completed",
+                        "mode": "vector",
+                        "timeout_seconds": timeout_seconds,
+                        "reason": None,
+                    },
+                )
+            error = payload.get("error")
+            if not isinstance(error, str) or not error:
+                return _failure_outcome(
+                    timeout_seconds,
+                    "invalid vector worker result: error is invalid",
+                )
+            return _failure_outcome(timeout_seconds, error)
+        finally:
+            if process is not None:
+                try:
+                    if process.returncode is None and not cleanup_attempted:
+                        _terminate_and_reap(process)
+                finally:
+                    _close_process_handle(process)
 
 
 @dataclass(frozen=True)
@@ -165,15 +210,42 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _write_image(path: Path, image: np.ndarray) -> dict[str, str]:
+def _write_image(
+    path: Path,
+    image: np.ndarray,
+    parameters: list[int] | None = None,
+) -> dict[str, str]:
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(path.name + ".tmp.png")
-    encoded, buffer = cv2.imencode(temporary.suffix, image)
+    extension = path.suffix.lower()
+    if not extension:
+        raise OSError(f"Cannot write image artifact without an extension: {path.name}")
+    try:
+        if parameters is None:
+            encoded, buffer = cv2.imencode(extension, image)
+        else:
+            encoded, buffer = cv2.imencode(extension, image, parameters)
+    except cv2.error as exc:
+        raise OSError(f"Cannot write image artifact: {path.name}") from exc
     if not encoded:
         raise OSError(f"Cannot write image artifact: {path.name}")
-    with temporary.open("wb") as handle:
-        handle.write(buffer.tobytes())
-    os.replace(temporary, path)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temporary = Path(handle.name)
+            handle.write(buffer.tobytes())
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    except BaseException:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+        raise
     return {"path": path.name, "sha256": _sha256(path)}
 
 
@@ -225,6 +297,7 @@ def prepare_pdf_page(
         timeout_seconds=vector_timeout_seconds,
     )
     page_data = vector_outcome.page_data
+    using_raster_fallback = page_data is None
     render_dpi = vector_dpi if page_data is None or page_data["is_vector_pdf"] else 200
     rendered = convert_from_path(
         str(source),
@@ -258,7 +331,13 @@ def prepare_pdf_page(
     page_data["render_size_px"] = [render_bgr.shape[1], render_bgr.shape[0]]
 
     scale_calibration = _default_scale_calibration(
-        "vector_pdf_overall_dimensions" if page_data["is_vector_pdf"] else "scanned_pdf_manual"
+        "raster_fallback_manual"
+        if using_raster_fallback
+        else (
+            "vector_pdf_overall_dimensions"
+            if page_data["is_vector_pdf"]
+            else "scanned_pdf_manual"
+        )
     )
     dimension_candidates: list[dict[str, Any]] = []
     cleanup_candidates: list[dict[str, Any]] = []

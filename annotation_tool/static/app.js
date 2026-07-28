@@ -37,6 +37,7 @@
     pageGeneration: 0,
     preannotating: false,
     preparing: false,
+    editingReady: false,
   };
 
   const imageCanvas = $("#image-canvas");
@@ -74,6 +75,18 @@
     $("#project-select").disabled = active;
     $("#page-select").disabled = active || !state.project;
     button.disabled = active || !state.project || !$("#page-select").value;
+  }
+
+  function setEditingReady(ready) {
+    state.editingReady = Boolean(ready);
+    const enabled = state.editingReady && !state.preannotating;
+    maskCanvas.style.pointerEvents = enabled ? "" : "none";
+    setControls(enabled);
+    if (enabled) updateHistoryButtons();
+    else {
+      $("#undo").disabled = true;
+      $("#redo").disabled = true;
+    }
   }
 
   function showWarnings(warnings = []) {
@@ -166,6 +179,7 @@
     const generation = state.pageGeneration + 1;
     state.pageGeneration = generation;
     state.page = state.pages.find((page) => page.page_number === Number(pageNumber)) || null;
+    setEditingReady(false);
     if (!state.page) return clearCanvas();
     $("#page-status").textContent = `第 ${state.page.page_number} 页 · ${statusText(state.page.status)}`;
     if (!state.page.preparation) {
@@ -185,6 +199,7 @@
     if (state.page.current_version) {
       pageTasks.push(loadMask(requestBase, generation, width, height));
     } else {
+      state.mask = new Uint8Array(width * height);
       renderMask();
       state.dirty = false;
       state.editRevision = 0;
@@ -197,7 +212,7 @@
     ) return;
     resetHistory();
     fitView();
-    setControls(!state.preannotating);
+    setEditingReady(true);
   }
 
   function setupCanvases() {
@@ -209,7 +224,7 @@
     }
     transform.style.width = `${state.width}px`;
     transform.style.height = `${state.height}px`;
-    state.mask = new Uint8Array(state.width * state.height);
+    state.mask = null;
     $("#canvas-empty").hidden = true;
   }
 
@@ -247,25 +262,14 @@
   ) {
     const response = await fetch(`${requestBase}/mask`, { cache: "no-store" });
     if (generation !== state.pageGeneration) return false;
-    const loadedMask = new Uint8Array(width * height);
-    if (response.ok) {
-      const bitmap = await createImageBitmap(await response.blob());
-      if (generation !== state.pageGeneration) {
-        bitmap.close();
-        return false;
-      }
-      const temporary = document.createElement("canvas");
-      temporary.width = width;
-      temporary.height = height;
-      const context = temporary.getContext("2d", { willReadFrequently: true });
-      context.imageSmoothingEnabled = false;
-      context.drawImage(bitmap, 0, 0, width, height);
-      bitmap.close();
-      const pixels = context.getImageData(0, 0, width, height).data;
-      for (let index = 0; index < loadedMask.length; index += 1) {
-        loadedMask[index] = pixels[index * 4];
-      }
-    }
+    const loadedMask = await (
+      window.AnnotationSavedMaskLoader.decodeSavedMaskResponse(
+        response,
+        width,
+        height,
+        { disableEditing: () => setEditingReady(false) }
+      )
+    );
     if (generation !== state.pageGeneration) return false;
     state.mask = loadedMask;
     renderMask();
@@ -477,6 +481,10 @@
         && state.page?.page_number === pageNumber
       );
       if (stillCurrent) {
+        window.AnnotationSavedMaskLoader.rememberCurrentVersion(
+          state.page,
+          result
+        );
         state.dirty = state.editRevision !== revision;
         setSaveState(state.dirty ? "有未保存修改" : "已保存", state.dirty ? "dirty" : "idle");
         showWarnings(result.warnings);
@@ -512,6 +520,8 @@
 
   function setControls(enabled) {
     for (const id of ["save", "confirm", "preannotate"]) $( `#${id}` ).disabled = !enabled;
+    for (const button of $$(".class-tool")) button.disabled = !enabled;
+    $("#brush-size").disabled = !enabled;
   }
 
   function clearCanvas() {
@@ -520,7 +530,7 @@
     state.mask = null;
     imageCanvas.width = maskCanvas.width = 0;
     $("#canvas-empty").hidden = false;
-    setControls(false);
+    setEditingReady(false);
     $("#page-status").textContent = "未选择页面";
   }
 
@@ -604,7 +614,13 @@
   });
 
   maskCanvas.addEventListener("pointerdown", (event) => {
-    if (!state.mask || state.preannotating || state.spaceDown || event.button === 1) return;
+    if (
+      !state.editingReady
+      || !state.mask
+      || state.preannotating
+      || state.spaceDown
+      || event.button === 1
+    ) return;
     state.drawing = true;
     state.lastPoint = canvasPoint(event);
     maskCanvas.setPointerCapture(event.pointerId);
@@ -692,13 +708,10 @@
       const width = state.width;
       const height = state.height;
       state.preannotating = true;
-      maskCanvas.style.pointerEvents = "none";
+      setEditingReady(state.editingReady);
       $("#project-select").disabled = true;
       $("#page-select").disabled = true;
       $("#prepare-page").disabled = true;
-      setControls(false);
-      $("#undo").disabled = true;
-      $("#redo").disabled = true;
       setSaveState("模型识别中…", "saving");
       const requestPreannotation = (allowBlank) => api(`${requestBase}/preannotate`, {
           method: "POST",
@@ -719,6 +732,10 @@
         result = await requestPreannotation(true);
       }
       if (generation !== state.pageGeneration) return;
+      window.AnnotationSavedMaskLoader.rememberCurrentVersion(
+        state.page,
+        result
+      );
       showWarnings(result.warnings);
       await loadMask(requestBase, generation, width, height);
       if (generation !== state.pageGeneration) return;
@@ -748,15 +765,15 @@
         );
       }
       state.preannotating = false;
-      maskCanvas.style.pointerEvents = "";
       $("#project-select").disabled = state.preparing;
       $("#page-select").disabled = state.preparing || !state.project;
       $("#prepare-page").disabled = (
         state.preparing || !state.project || !$("#page-select").value
       );
       if (state.page?.preparation) {
-        setControls(true);
-        updateHistoryButtons();
+        setEditingReady(state.editingReady);
+      } else {
+        setEditingReady(false);
       }
     }
   });
@@ -769,6 +786,10 @@
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ author: "local-user" }),
       });
+      window.AnnotationSavedMaskLoader.rememberCurrentVersion(
+        state.page,
+        result
+      );
       setCurrentPageStatus(result.status);
       $("#export").disabled = false;
       log("本页已确认，可导出训练数据");

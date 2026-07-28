@@ -739,6 +739,141 @@ class EnergyRouteClientTests(unittest.TestCase):
             self.assertIsNotNone(saved_model_input)
             self.assertEqual(int(saved_model_input.max()), 0)
 
+    def test_ai_recognize_atomically_writes_artifacts_under_unicode_upload_root(self):
+        from floorplan_page_pipeline import PreparedFloorplanPage
+
+        with tempfile.TemporaryDirectory() as directory:
+            upload_root = Path(directory) / "网站产物"
+            previous_upload = self.server.app.config["UPLOAD_FOLDER"]
+            self.server.app.config["UPLOAD_FOLDER"] = str(upload_root)
+            try:
+                prepared_upload = self.client.post(
+                    "/energy/pdf_prepare",
+                    data={
+                        "report_number": "UNICODE-WRITES",
+                        "raster_file": (
+                            self.make_pdf_bytes(["ONE"]),
+                            "floor.pdf",
+                        ),
+                    },
+                    content_type="multipart/form-data",
+                ).get_json()
+                prepared_page = PreparedFloorplanPage(
+                    page_number=1,
+                    page_count=1,
+                    render_bgr=np.full((2, 2, 3), 240, dtype=np.uint8),
+                    cleaned_bgr=np.full((2, 2, 3), 180, dtype=np.uint8),
+                    model_view_rgb=np.zeros((2, 2, 3), dtype=np.uint8),
+                    model_input_512=np.zeros(
+                        (1, 3, 512, 512),
+                        dtype=np.float32,
+                    ),
+                    model_input_metadata={
+                        "original_size": [2, 2],
+                        "resized_size": [512, 512],
+                        "padding": [0, 0, 0, 0],
+                        "resize_scale": 256.0,
+                    },
+                    vector_analysis={
+                        "status": "completed",
+                        "mode": "vector",
+                        "timeout_seconds": 15.0,
+                        "reason": None,
+                    },
+                    scale_calibration={
+                        "status": "manual_required",
+                        "method": "test",
+                    },
+                    vector_cleanup={
+                        "enabled": True,
+                        "has_vector_geometry": True,
+                        "has_vector_text": False,
+                        "structural_mask": {"enabled": True},
+                        "building_roi": {
+                            "enabled": False,
+                            "bbox_px": None,
+                        },
+                    },
+                    inference_roi=None,
+                    cleanup_mask=np.array([[255, 0], [0, 0]], dtype=np.uint8),
+                    structural_support_mask=np.full(
+                        (2, 2),
+                        255,
+                        dtype=np.uint8,
+                    ),
+                    artifacts={},
+                )
+                segmenter = MagicMock()
+                segmenter.predict.return_value = {
+                    "mask": np.array([[0, 1], [2, 3]], dtype=np.uint8),
+                    "raw_model_mask": np.ones((2, 2), dtype=np.uint8),
+                    "overlay": np.full((2, 2, 3), 120, dtype=np.uint8),
+                    "stats": {},
+                    "geometry": {"walls": [], "windows": [], "doors": []},
+                    "room_topology": {
+                        "status": "no_closed_rooms",
+                        "room_count": 0,
+                        "rooms": [],
+                        "total_area_px2": 0.0,
+                        "total_area_m2": None,
+                        "load_geometry_ready": False,
+                    },
+                    "image_size": [2, 2],
+                }
+                with (
+                    patch.object(self.server, "HAS_FLOORPLAN_AI", True),
+                    patch.object(
+                        self.server,
+                        "_floorplan_segmenter",
+                        segmenter,
+                        create=True,
+                    ),
+                    patch.object(
+                        self.server,
+                        "prepare_pdf_page",
+                        return_value=prepared_page,
+                        create=True,
+                    ),
+                ):
+                    response = self.client.post(
+                        "/energy/ai_recognize",
+                        data={
+                            "report_number": "UNICODE-WRITES",
+                            "pdf_upload_token": prepared_upload["upload_token"],
+                            "pdf_page_number": "1",
+                        },
+                    )
+            finally:
+                self.server.app.config["UPLOAD_FOLDER"] = previous_upload
+
+            self.assertEqual(response.status_code, 200, response.get_json())
+            target = upload_root / "energy" / "UNICODE-WRITES"
+            artifact_names = (
+                "building_plan_ai.png",
+                "pdf_nonstructural_mask.png",
+                "pdf_structural_mask.png",
+                "pdf_model_input.png",
+                "ai_overlay.jpg",
+                "ai_raw_model_mask.png",
+                "ai_mask.png",
+            )
+            for artifact_name in artifact_names:
+                with self.subTest(artifact=artifact_name):
+                    artifact = target / artifact_name
+                    self.assertTrue(artifact.is_file())
+                    decoded = cv2.imdecode(
+                        np.frombuffer(artifact.read_bytes(), dtype=np.uint8),
+                        cv2.IMREAD_UNCHANGED,
+                    )
+                    self.assertIsNotNone(decoded)
+            self.assertTrue(
+                (target / "ai_overlay.jpg").read_bytes().startswith(b"\xff\xd8\xff")
+            )
+            self.assertEqual(
+                list(target.glob("*.tmp*")),
+                [],
+            )
+
     def test_ai_recognize_rejects_invalid_prepared_pdf_reference_or_page(self):
         with tempfile.TemporaryDirectory() as upload_root:
             previous_upload = self.server.app.config["UPLOAD_FOLDER"]

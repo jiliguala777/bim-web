@@ -1,4 +1,5 @@
 import os
+from pathlib import Path
 import secrets
 import json
 import math
@@ -41,7 +42,7 @@ except ImportError as e:
 # --- AI 图纸识别模块 ---
 try:
     from floorplan_onnx import get_segmenter
-    from floorplan_page_pipeline import prepare_pdf_page
+    from floorplan_page_pipeline import _write_image, prepare_pdf_page
     from floorplan_rooms import apply_scale_to_room_topology
     _floorplan_segmenter = get_segmenter(ONNX_MODEL_PATH)
     HAS_FLOORPLAN_AI = True
@@ -1569,7 +1570,7 @@ def ai_recognize():
                 scale_calibration = prepared_page.scale_calibration
                 vector_cleanup = prepared_page.vector_cleanup
                 png_path = os.path.join(target_dir, 'building_plan_ai.png')
-                cv2.imwrite(png_path, prepared_page.render_bgr)
+                _write_image(Path(png_path), prepared_page.render_bgr)
                 raster_path = png_path
             except Exception as e:
                 return jsonify({'error': f'PDF conversion failed: {e}'}), 500
@@ -1610,16 +1611,16 @@ def ai_recognize():
 
         if prepared_page is not None and has_vector_geometry:
             if np.any(combined_cleanup_mask):
-                cv2.imwrite(
-                    os.path.join(target_dir, 'pdf_nonstructural_mask.png'),
+                _write_image(
+                    Path(target_dir) / 'pdf_nonstructural_mask.png',
                     combined_cleanup_mask,
                 )
             if (
                 structural_support_mask is not None
                 and vector_cleanup.get('structural_mask', {}).get('enabled')
             ):
-                cv2.imwrite(
-                    os.path.join(target_dir, 'pdf_structural_mask.png'),
+                _write_image(
+                    Path(target_dir) / 'pdf_structural_mask.png',
                     structural_support_mask,
                 )
             building_roi = vector_cleanup.get('building_roi') or {
@@ -1631,7 +1632,7 @@ def ai_recognize():
                 json.dump(building_roi, roi_file, ensure_ascii=False, indent=2)
 
         if prepared_page is not None and has_vector_geometry:
-            cv2.imwrite(os.path.join(target_dir, 'pdf_model_input.png'), img_bgr)
+            _write_image(Path(target_dir) / 'pdf_model_input.png', img_bgr)
 
         predict_kwargs = {}
         if has_vector_geometry:
@@ -1701,7 +1702,11 @@ def ai_recognize():
         # 保存结果
         overlay_path = os.path.join(target_dir, 'ai_overlay.jpg')
         mask_path = os.path.join(target_dir, 'ai_mask.png')
-        cv2.imwrite(overlay_path, overlay, [cv2.IMWRITE_JPEG_QUALITY, 90])
+        _write_image(
+            Path(overlay_path),
+            overlay,
+            [cv2.IMWRITE_JPEG_QUALITY, 90],
+        )
 
         raw_model_mask = result.get('raw_model_mask')
         if raw_model_mask is not None:
@@ -1709,14 +1714,14 @@ def ai_recognize():
             raw_mask_color[raw_model_mask == 1] = (60, 76, 231)
             raw_mask_color[raw_model_mask == 2] = (219, 152, 52)
             raw_mask_color[raw_model_mask == 3] = (113, 204, 46)
-            cv2.imwrite(os.path.join(target_dir, 'ai_raw_model_mask.png'), raw_mask_color)
+            _write_image(Path(target_dir) / 'ai_raw_model_mask.png', raw_mask_color)
 
         # mask 转彩色保存
         mask_color = np.zeros((h, w, 3), dtype=np.uint8)
         mask_color[mask == 1] = (60, 76, 231)   # wall - red
         mask_color[mask == 2] = (219, 152, 52)   # window - blue
         mask_color[mask == 3] = (113, 204, 46)   # door - green
-        cv2.imwrite(mask_path, mask_color)
+        _write_image(Path(mask_path), mask_color)
 
         # 编码为base64用于前端展示
         _, overlay_buf = cv2.imencode('.jpg', overlay, [cv2.IMWRITE_JPEG_QUALITY, 85])

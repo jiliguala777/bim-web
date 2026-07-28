@@ -3,7 +3,9 @@ import hashlib
 import json
 import os
 import tempfile
+import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -52,6 +54,47 @@ class AnnotationApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 201, response.get_json())
         return response.get_json()["project"]
 
+    def _fake_prepared_page(self, output_dir: Path):
+        output_dir.mkdir(parents=True, exist_ok=True)
+        artifacts = {}
+        for key, filename in {
+            "render": "page_render.png",
+            "cleaned": "cleaned_page.png",
+            "model_view": "model_view.png",
+            "model_input_512": "model_input_512.png",
+        }.items():
+            self.assertTrue(
+                cv2.imwrite(
+                    str(output_dir / filename),
+                    np.full((4, 4, 3), 255, np.uint8),
+                )
+            )
+            artifacts[key] = {"path": filename, "sha256": key}
+        (output_dir / "preprocessing.json").write_text("{}", encoding="utf-8")
+        artifacts["metadata"] = {
+            "path": "preprocessing.json",
+            "sha256": "metadata",
+        }
+        return SimpleNamespace(
+            page_count=2,
+            render_bgr=np.full((4, 4, 3), 255, np.uint8),
+            model_input_metadata={
+                "original_size": [4, 4],
+                "resized_size": [512, 512],
+                "padding": [0, 0, 0, 0],
+            },
+            scale_calibration={"status": "manual_required"},
+            vector_analysis={
+                "status": "completed",
+                "mode": "vector",
+                "timeout_seconds": 15,
+                "reason": None,
+            },
+            vector_cleanup={"enabled": False},
+            inference_roi=None,
+            artifacts=artifacts,
+        )
+
     def test_pdf_upload_creates_a_project_and_lists_it(self):
         project = self._create_project()
 
@@ -94,6 +137,77 @@ class AnnotationApiTests(unittest.TestCase):
             np.array_equal(decoded, np.array([[0, 1], [2, 3]], dtype=np.uint8))
         )
 
+    def test_duplicate_page_preparation_returns_conflict(self):
+        project = self._create_project()
+        self.app.extensions["annotation_service"].segmenter_factory = object
+        started = threading.Event()
+        release = threading.Event()
+        call_lock = threading.Lock()
+        calls = 0
+
+        def blocking_prepare(*args, **kwargs):
+            nonlocal calls
+            with call_lock:
+                calls += 1
+                call_number = calls
+            if call_number == 1:
+                started.set()
+                self.assertTrue(release.wait(5))
+            return self._fake_prepared_page(Path(kwargs["output_dir"]))
+
+        with patch(
+            "annotation_tool.services.prepare_pdf_page",
+            side_effect=blocking_prepare,
+        ):
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                first = pool.submit(
+                    lambda: self.app.test_client().post(
+                        f"/api/projects/{project['project_id']}/pages/prepare",
+                        json={"page_number": 1},
+                    )
+                )
+                self.assertTrue(started.wait(5))
+                second = self.app.test_client().post(
+                    f"/api/projects/{project['project_id']}/pages/prepare",
+                    json={"page_number": 1},
+                )
+                release.set()
+                first_response = first.result(timeout=5)
+
+        self.assertEqual(second.status_code, 409)
+        self.assertIn("正在准备", second.get_json()["error"])
+        self.assertEqual(first_response.status_code, 200)
+        self.assertEqual(calls, 1)
+
+    def test_failed_page_preparation_releases_the_guard(self):
+        project = self._create_project()
+        self.app.extensions["annotation_service"].segmenter_factory = object
+        attempts = 0
+
+        def fail_then_succeed(*args, **kwargs):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise ValueError("render failed")
+            return self._fake_prepared_page(Path(kwargs["output_dir"]))
+
+        with patch(
+            "annotation_tool.services.prepare_pdf_page",
+            side_effect=fail_then_succeed,
+        ) as prepare:
+            first = self.client.post(
+                f"/api/projects/{project['project_id']}/pages/prepare",
+                json={"page_number": 1},
+            )
+            second = self.client.post(
+                f"/api/projects/{project['project_id']}/pages/prepare",
+                json={"page_number": 1},
+            )
+
+        self.assertEqual(first.status_code, 400)
+        self.assertEqual(second.status_code, 200)
+        self.assertEqual(prepare.call_count, 2)
+
     def test_prepare_and_preannotate_use_the_shared_page_contract(self):
         project = self._create_project()
         service = self.app.extensions["annotation_service"]
@@ -107,37 +221,7 @@ class AnnotationApiTests(unittest.TestCase):
         service.segmenter_factory = FakeSegmenter
 
         def fake_prepare(source, page_number, **kwargs):
-            output_dir = Path(kwargs["output_dir"])
-            output_dir.mkdir(parents=True, exist_ok=True)
-            artifacts = {}
-            for key, filename in {
-                "render": "page_render.png",
-                "cleaned": "cleaned_page.png",
-                "model_view": "model_view.png",
-                "model_input_512": "model_input_512.png",
-            }.items():
-                self.assertTrue(
-                    cv2.imwrite(str(output_dir / filename), np.full((4, 4, 3), 255, np.uint8))
-                )
-                artifacts[key] = {"path": filename, "sha256": key}
-            (output_dir / "preprocessing.json").write_text("{}", encoding="utf-8")
-            artifacts["metadata"] = {
-                "path": "preprocessing.json",
-                "sha256": "metadata",
-            }
-            return SimpleNamespace(
-                page_count=2,
-                render_bgr=np.full((4, 4, 3), 255, np.uint8),
-                model_input_metadata={
-                    "original_size": [4, 4],
-                    "resized_size": [512, 512],
-                    "padding": [0, 0, 0, 0],
-                },
-                scale_calibration={},
-                vector_cleanup={},
-                inference_roi=None,
-                artifacts=artifacts,
-            )
+            return self._fake_prepared_page(Path(kwargs["output_dir"]))
 
         with patch("annotation_tool.services.prepare_pdf_page", side_effect=fake_prepare) as prepare:
             response = self.client.post(
@@ -147,6 +231,15 @@ class AnnotationApiTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200, response.get_json())
         self.assertEqual(prepare.call_args.args[1], 1)
+        self.assertEqual(
+            response.get_json()["page"]["preparation"]["vector_analysis"],
+            {
+                "status": "completed",
+                "mode": "vector",
+                "timeout_seconds": 15,
+                "reason": None,
+            },
+        )
         artifact = self.client.get(
             f"/api/projects/{project['project_id']}/pages/1/artifact/model_view"
         )

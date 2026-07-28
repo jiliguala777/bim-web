@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import shutil
 import tempfile
+import threading
 from typing import Any
 
 import cv2
@@ -31,6 +32,13 @@ ARTIFACT_NAMES = {
     "model_input_512": "model_input_512.png",
     "metadata": "preprocessing.json",
 }
+
+
+class PreparationInProgressError(RuntimeError):
+    def __init__(self, project_id: str, page_number: int):
+        super().__init__("该页面正在准备，请等待当前任务完成")
+        self.project_id = project_id
+        self.page_number = page_number
 
 
 def _sha256(path: Path) -> str:
@@ -71,6 +79,8 @@ class AnnotationService:
         self.store = store
         self.poppler_path = poppler_path or os.environ.get("POPPLER_PATH")
         self.segmenter_factory = segmenter_factory
+        self._preparing_lock = threading.Lock()
+        self._preparing_pages: set[tuple[str, int]] = set()
 
     def _segmenter(self):
         if self.segmenter_factory is not None:
@@ -160,6 +170,23 @@ class AnnotationService:
             raise ValueError(
                 "page has an annotation; create a new project before re-preparing it"
             )
+        key = (project_id, page_number)
+        with self._preparing_lock:
+            if key in self._preparing_pages:
+                raise PreparationInProgressError(project_id, page_number)
+            self._preparing_pages.add(key)
+        try:
+            return self._prepare_page_once(project_id, page_number, project)
+        finally:
+            with self._preparing_lock:
+                self._preparing_pages.discard(key)
+
+    def _prepare_page_once(
+        self,
+        project_id: str,
+        page_number: int,
+        project: dict,
+    ) -> dict:
         output_dir = self._page_dir(project_id, page_number)
         segmenter = self._segmenter()
         prepared = prepare_pdf_page(
@@ -183,6 +210,7 @@ class AnnotationService:
             "image_size": [prepared.render_bgr.shape[1], prepared.render_bgr.shape[0]],
             "model_input": prepared.model_input_metadata,
             "scale_calibration": prepared.scale_calibration,
+            "vector_analysis": prepared.vector_analysis,
             "vector_cleanup": prepared.vector_cleanup,
             "inference_roi": prepared.inference_roi,
             "artifacts": artifacts,

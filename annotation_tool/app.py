@@ -11,7 +11,7 @@ import numpy as np
 from flask import Flask, jsonify, render_template, request, send_file
 
 from .config import AnnotationConfig
-from .services import AnnotationService
+from .services import AnnotationService, PreparationInProgressError
 from .storage import AnnotationStore
 
 
@@ -43,6 +43,10 @@ def create_app(config: AnnotationConfig | None = None) -> Flask:
     @app.get("/")
     def workspace():
         return render_template("index.html")
+
+    @app.errorhandler(PreparationInProgressError)
+    def preparation_conflict(error):
+        return jsonify({"error": str(error)}), 409
 
     @app.errorhandler(ValueError)
     def invalid_request(error):

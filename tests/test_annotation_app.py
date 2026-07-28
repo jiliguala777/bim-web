@@ -188,23 +188,26 @@ class AnnotationApiTests(unittest.TestCase):
         service.segmenter_factory = object
         first_started = threading.Event()
         release_first = threading.Event()
-        second_validated = threading.Event()
-        release_second = threading.Event()
-        validation_lock = threading.Lock()
-        validation_calls = 0
+        second_guard_attempted = threading.Event()
         prepare_lock = threading.Lock()
         prepare_calls = 0
-        original_validate = service._validate_page
 
-        def blocking_validate(project_data, page_number):
-            nonlocal validation_calls
-            with validation_lock:
-                validation_calls += 1
-                validation_call = validation_calls
-            original_validate(project_data, page_number)
-            if validation_call == 2:
-                second_validated.set()
-                self.assertTrue(release_second.wait(5))
+        class ObservedPreparingLock:
+            def __init__(self):
+                self._lock = threading.Lock()
+                self._attempts_lock = threading.Lock()
+                self._attempts = 0
+
+            def __enter__(self):
+                with self._attempts_lock:
+                    self._attempts += 1
+                    if self._attempts == 2:
+                        second_guard_attempted.set()
+                self._lock.acquire()
+                return self
+
+            def __exit__(self, exc_type, exc_value, traceback):
+                self._lock.release()
 
         def blocking_prepare(*args, **kwargs):
             nonlocal prepare_calls
@@ -216,11 +219,16 @@ class AnnotationApiTests(unittest.TestCase):
                 self.assertTrue(release_first.wait(5))
             return self._fake_prepared_page(Path(kwargs["output_dir"]))
 
+        observed_lock = ObservedPreparingLock()
         with patch.object(
             service,
+            "_preparing_lock",
+            observed_lock,
+        ), patch.object(
+            service,
             "_validate_page",
-            side_effect=blocking_validate,
-        ), patch(
+            wraps=service._validate_page,
+        ) as validate_page, patch(
             "annotation_tool.services.prepare_pdf_page",
             side_effect=blocking_prepare,
         ):
@@ -239,13 +247,12 @@ class AnnotationApiTests(unittest.TestCase):
                             json={"page_number": 1},
                         )
                     )
-                    self.assertFalse(second_validated.wait(0.2))
+                    self.assertTrue(second_guard_attempted.wait(5))
                     release_first.set()
                     first_response = first.result(timeout=5)
                     second_response = second.result(timeout=5)
                 finally:
                     release_first.set()
-                    release_second.set()
 
         self.assertEqual(first_response.status_code, 200)
         self.assertEqual(
@@ -254,6 +261,7 @@ class AnnotationApiTests(unittest.TestCase):
         )
         self.assertEqual(second_response.status_code, 409)
         self.assertEqual(prepare_calls, 1)
+        self.assertEqual(validate_page.call_count, 1)
 
     def test_failed_page_preparation_releases_the_guard(self):
         project = self._create_project()

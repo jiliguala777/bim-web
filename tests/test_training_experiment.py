@@ -90,6 +90,75 @@ class TrainingExperimentTests(unittest.TestCase):
     def tearDown(self):
         self.temporary.cleanup()
 
+    def _set_experiment_type(self, experiment_type):
+        manifest_path = self.export / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["experiment_type"] = experiment_type
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    def _add_second_sample(self):
+        image = cv2.imread(str(self.export / "images" / "page-1.png"))
+        mask = np.load(self.export / "masks" / "page-1.npy", allow_pickle=False)
+        cv2.imwrite(str(self.export / "images" / "page-2.png"), image)
+        np.save(self.export / "masks" / "page-2.npy", mask, allow_pickle=False)
+        manifest_path = self.export / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["samples"].append(
+            {
+                "sample_id": "page-2",
+                "page_number": 2,
+                "status": "confirmed",
+                "image": "images/page-2.png",
+                "mask": "masks/page-2.npy",
+            }
+        )
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    def _training_config(self, output_name, *, epochs=1):
+        return TrainingConfig(
+            dataset_path=self.export,
+            checkpoint_path=self.initial,
+            output_dir=self.root / output_name,
+            epochs=epochs,
+            learning_rate=1e-3,
+            patience=max(1, epochs),
+            device="cpu",
+            augmentation_count=1,
+        )
+
+    def test_train_accepts_multi_sample_fine_tune_export(self):
+        self._set_experiment_type("fine_tune")
+        self._add_second_sample()
+
+        result = train(
+            self._training_config("fine-tune", epochs=2),
+            model_factory=TinySegmentationModel,
+        )
+
+        metrics = json.loads(result.metrics_path.read_text(encoding="utf-8"))
+        self.assertEqual(metrics["experiment_type"], "fine_tune")
+        self.assertEqual(result.epochs_completed, 2)
+        self.assertFalse(metrics["has_independent_validation"])
+        self.assertFalse(metrics["generalization_claim"])
+
+    def test_train_rejects_single_sample_fine_tune_export(self):
+        self._set_experiment_type("fine_tune")
+
+        with self.assertRaisesRegex(ValueError, "at least two"):
+            train(
+                self._training_config("invalid-fine-tune"),
+                model_factory=TinySegmentationModel,
+            )
+
+    def test_train_rejects_unsupported_experiment_type(self):
+        self._set_experiment_type("evaluation_only")
+
+        with self.assertRaisesRegex(ValueError, "unsupported experiment_type"):
+            train(
+                self._training_config("unsupported"),
+                model_factory=TinySegmentationModel,
+            )
+
     def test_two_epoch_cpu_training_writes_reproducible_artifacts(self):
         output = self.root / "experiment"
         config = TrainingConfig(

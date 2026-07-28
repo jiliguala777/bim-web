@@ -163,6 +163,20 @@ def _serialized_config(config: TrainingConfig) -> dict:
     return payload
 
 
+def _validate_experiment(validated: dict) -> str:
+    experiment_type = validated["manifest"].get("experiment_type")
+    sample_count = int(validated["sample_count"])
+    if experiment_type == "single_page_overfit":
+        if sample_count != 1:
+            raise ValueError("single_page_overfit requires exactly one sample")
+        return experiment_type
+    if experiment_type == "fine_tune":
+        if sample_count < 2:
+            raise ValueError("fine_tune requires at least two samples")
+        return experiment_type
+    raise ValueError(f"unsupported experiment_type: {experiment_type}")
+
+
 def train(
     config: TrainingConfig,
     *,
@@ -170,11 +184,7 @@ def train(
 ) -> TrainingResult:
     _set_deterministic(config.seed)
     validated = validate_export(config.dataset_path)
-    experiment_type = validated["manifest"].get("experiment_type")
-    if experiment_type != "single_page_overfit":
-        raise ValueError(
-            "this first training workflow requires a single_page_overfit export"
-        )
+    experiment_type = _validate_experiment(validated)
     device = torch.device(config.device)
     if device.type == "cuda" and not torch.cuda.is_available():
         raise ValueError("CUDA was requested but is not available")
@@ -261,7 +271,7 @@ def train(
         )
         _write_log(log_path, log_rows)
         metrics = {
-            "experiment_type": "single_page_overfit",
+            "experiment_type": experiment_type,
             "config": _serialized_config(config),
             "class_weights": weights,
             "epochs_completed": epoch,

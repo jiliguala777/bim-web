@@ -168,8 +168,11 @@ def _sha256(path: Path) -> str:
 def _write_image(path: Path, image: np.ndarray) -> dict[str, str]:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(path.name + ".tmp.png")
-    if not cv2.imwrite(str(temporary), image):
+    encoded, buffer = cv2.imencode(temporary.suffix, image)
+    if not encoded:
         raise OSError(f"Cannot write image artifact: {path.name}")
+    with temporary.open("wb") as handle:
+        handle.write(buffer.tobytes())
     os.replace(temporary, path)
     return {"path": path.name, "sha256": _sha256(path)}
 

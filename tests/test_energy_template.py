@@ -548,6 +548,7 @@ class EnergyRouteClientTests(unittest.TestCase):
 
     def test_ai_recognize_uses_prepared_pdf_selected_page_and_persists_metadata(self):
         from PIL import Image
+        from floorplan_page_pipeline import VectorAnalysisOutcome
 
         with tempfile.TemporaryDirectory() as upload_root:
             previous_upload = self.server.app.config["UPLOAD_FOLDER"]
@@ -586,9 +587,17 @@ class EnergyRouteClientTests(unittest.TestCase):
                     patch.object(self.server, "HAS_VECTOR_PDF_SCALE", True),
                     patch.object(self.server, "_floorplan_segmenter", segmenter, create=True),
                     patch(
-                        "floorplan_page_pipeline.extract_vector_page",
-                        return_value=page_data,
-                    ) as extract_page,
+                        "floorplan_page_pipeline._run_vector_analysis",
+                        return_value=VectorAnalysisOutcome(
+                            page_data,
+                            {
+                                "status": "completed",
+                                "mode": "vector",
+                                "timeout_seconds": 15.0,
+                                "reason": None,
+                            },
+                        ),
+                    ) as run_analysis,
                     patch(
                         "floorplan_page_pipeline.convert_from_path",
                         return_value=[Image.new("RGB", (2, 2), "white")],
@@ -607,10 +616,11 @@ class EnergyRouteClientTests(unittest.TestCase):
                 self.server.app.config["UPLOAD_FOLDER"] = previous_upload
 
             self.assertEqual(response.status_code, 200, response.get_json())
-            extract_page.assert_called_once_with(
+            run_analysis.assert_called_once_with(
                 next((Path(upload_root) / "energy" / "PAGE-TWO").glob("building_plan_prepared_*.pdf")).resolve(),
                 page_index=1,
                 dpi=100,
+                timeout_seconds=15.0,
             )
             self.assertEqual(render_page.call_args.kwargs["dpi"], 200)
             self.assertEqual(render_page.call_args.kwargs["first_page"], 2)
@@ -657,6 +667,12 @@ class EnergyRouteClientTests(unittest.TestCase):
                         "resized_size": [512, 512],
                         "padding": [0, 0, 0, 0],
                         "resize_scale": 256.0,
+                    },
+                    vector_analysis={
+                        "status": "completed",
+                        "mode": "vector",
+                        "timeout_seconds": 15.0,
+                        "reason": None,
                     },
                     scale_calibration={"status": "manual_required", "method": "test"},
                     vector_cleanup={
@@ -759,6 +775,7 @@ class EnergyRouteClientTests(unittest.TestCase):
 
     def test_vector_pdf_route_applies_cleanup_roi_and_conservative_topology(self):
         from PIL import Image
+        from floorplan_page_pipeline import VectorAnalysisOutcome
 
         with tempfile.TemporaryDirectory() as upload_root:
             previous_upload = self.server.app.config["UPLOAD_FOLDER"]
@@ -824,7 +841,18 @@ class EnergyRouteClientTests(unittest.TestCase):
                     patch.object(self.server, "HAS_FLOORPLAN_AI", True),
                     patch.object(self.server, "HAS_VECTOR_PDF_SCALE", True),
                     patch.object(self.server, "_floorplan_segmenter", segmenter, create=True),
-                    patch("floorplan_page_pipeline.extract_vector_page", return_value=page_data) as extract_page,
+                    patch(
+                        "floorplan_page_pipeline._run_vector_analysis",
+                        return_value=VectorAnalysisOutcome(
+                            page_data,
+                            {
+                                "status": "completed",
+                                "mode": "vector",
+                                "timeout_seconds": 15.0,
+                                "reason": None,
+                            },
+                        ),
+                    ) as run_analysis,
                     patch("floorplan_page_pipeline.build_nonstructural_vector_mask", return_value=(vector_mask, cleanup_evidence)),
                     patch("floorplan_page_pipeline.build_structural_vector_mask", return_value=(structural_mask, {"enabled": True, "dark_edge_count": 50, "masked_pixels": 8000})),
                     patch("floorplan_page_pipeline.detect_building_roi", return_value=roi),
@@ -842,7 +870,8 @@ class EnergyRouteClientTests(unittest.TestCase):
                 self.server.app.config["UPLOAD_FOLDER"] = previous_upload
 
             self.assertEqual(response.status_code, 200, response.get_json())
-            self.assertEqual(extract_page.call_args.kwargs["dpi"], 100)
+            self.assertEqual(run_analysis.call_args.kwargs["dpi"], 100)
+            self.assertEqual(run_analysis.call_args.kwargs["timeout_seconds"], 15.0)
             self.assertEqual(
                 [call.kwargs["dpi"] for call in render_page.call_args_list],
                 [100],

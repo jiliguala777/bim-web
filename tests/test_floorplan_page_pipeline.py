@@ -1,4 +1,5 @@
 import json
+import hashlib
 import os
 import tempfile
 import time
@@ -6,6 +7,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import cv2
 import numpy as np
 from reportlab.pdfgen import canvas
 
@@ -13,6 +15,7 @@ from floorplan_onnx import FloorplanSegmenterONNX
 from floorplan_page_pipeline import (
     VectorAnalysisOutcome,
     _run_vector_analysis,
+    _write_image,
     prepare_pdf_page,
 )
 
@@ -78,6 +81,26 @@ class PdfPagePipelineTests(unittest.TestCase):
         pdf.rect(295, 100, 80, 80, fill=1, stroke=0)
         pdf.save()
         return pdf_path
+
+    def test_write_image_supports_unicode_output_directory(self):
+        image = np.array(
+            [
+                [[0, 0, 0], [255, 255, 255]],
+                [[0, 0, 255], [0, 255, 0]],
+            ],
+            dtype=np.uint8,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "标注数据" / "页面渲染.png"
+
+            artifact = _write_image(output, image)
+
+            encoded = output.read_bytes()
+            decoded = cv2.imdecode(np.frombuffer(encoded, dtype=np.uint8), cv2.IMREAD_COLOR)
+            self.assertTrue(np.array_equal(decoded, image))
+            self.assertEqual(artifact["path"], "页面渲染.png")
+            self.assertEqual(artifact["sha256"], hashlib.sha256(encoded).hexdigest())
+            self.assertFalse(output.with_name(output.name + ".tmp.png").exists())
 
     def test_prepare_pdf_page_renders_only_the_requested_one_based_page(self):
         poppler_path = os.environ.get("POPPLER_PATH")

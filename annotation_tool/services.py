@@ -504,6 +504,105 @@ class AnnotationService:
         self.store._atomic_npy(model_path, model_mask)
         return version, self._mask_warnings(mask, model_mask)
 
+    def current_region_mask(
+        self,
+        project_id: str,
+        page_number: int,
+        region_id: str,
+    ):
+        return self.store.load_current_region_mask(
+            project_id,
+            page_number,
+            region_id,
+        )
+
+    def confirm_region(
+        self,
+        project_id: str,
+        page_number: int,
+        region_id: str,
+        *,
+        author: str,
+    ) -> MaskVersion:
+        current = self.current_region_mask(project_id, page_number, region_id)
+        if current is None:
+            raise ValueError("region has no mask to confirm")
+        mask, _ = current
+        version, _ = self.save_region_mask(
+            project_id,
+            page_number,
+            region_id,
+            mask,
+            status="confirmed",
+            author=author,
+        )
+        return version
+
+    def preannotate_region(
+        self,
+        project_id: str,
+        page_number: int,
+        region_id: str,
+        *,
+        author: str,
+        allow_blank: bool = False,
+    ) -> tuple[MaskVersion, list[str]]:
+        cleaned = _read_image(
+            self.region_artifact_path(
+                project_id,
+                page_number,
+                region_id,
+                "cleaned",
+            )
+        )
+        if cleaned is None:
+            raise ValueError("prepared region image cannot be read")
+        inference_failure = None
+        try:
+            prediction = self._segmenter().predict(
+                cleaned,
+                use_preprocessing=True,
+                inference_roi=None,
+                preserve_full_context=True,
+            )
+            mask = prediction["mask"]
+        except Exception as exc:
+            inference_failure = {
+                "type": type(exc).__name__,
+                "message": str(exc),
+            }
+            if not allow_blank:
+                raise ValueError(
+                    f"preannotation failed ({type(exc).__name__}); "
+                    "choose a blank mask explicitly if needed"
+                ) from exc
+            mask = np.zeros(cleaned.shape[:2], dtype=np.uint8)
+        version, warnings = self.save_region_mask(
+            project_id,
+            page_number,
+            region_id,
+            mask,
+            status="preannotated",
+            author=author,
+        )
+        if inference_failure is not None:
+            warnings.insert(
+                0,
+                "ONNX preannotation failed; an explicit blank mask was created",
+            )
+        evidence = {
+            "version_id": version.version_id,
+            "inference_status": "failed" if inference_failure else "passed",
+            "failure": inference_failure,
+        }
+        self.store._atomic_json(
+            version.mask_path.with_name(
+                f"{version.version_id}.preannotation.json"
+            ),
+            evidence,
+        )
+        return version, warnings
+
     @staticmethod
     def decode_mask(payload: Any) -> np.ndarray:
         if isinstance(payload, np.ndarray):
@@ -677,21 +776,52 @@ class AnnotationService:
 
     def export_confirmed(self, project_id: str) -> dict:
         project = self._project(project_id)
-        confirmed = self.store.list_confirmed_pages(project_id)
+        confirmed = self.store.list_confirmed_targets(project_id)
         if not confirmed:
-            raise ValueError("at least one confirmed page is required for export")
+            raise ValueError("at least one confirmed annotation target is required for export")
 
         validated_samples = []
-        for page in confirmed:
-            current = self.store.load_current_mask(project_id, page.page_number)
+        for target in confirmed:
+            if target.region_id is None:
+                current = self.store.load_current_mask(
+                    project_id,
+                    target.page_number,
+                )
+                preparation = self._preparation(
+                    project_id,
+                    target.page_number,
+                )
+                image_source = self.artifact_path(
+                    project_id,
+                    target.page_number,
+                    "model_input_512",
+                )
+            else:
+                current = self.store.load_current_region_mask(
+                    project_id,
+                    target.page_number,
+                    target.region_id,
+                )
+                preparation = self._region_preparation(
+                    project_id,
+                    target.page_number,
+                    target.region_id,
+                )
+                image_source = self.region_artifact_path(
+                    project_id,
+                    target.page_number,
+                    target.region_id,
+                    "model_input_512",
+                )
             if current is None:
-                raise ValueError("confirmed page mask is missing")
+                raise ValueError("confirmed annotation mask is missing")
             full_mask, version = current
             if _sha256(version.mask_path) != version.mask_sha256:
                 raise ValueError("confirmed mask hash does not match its version record")
-            preparation = self._preparation(project_id, page.page_number)
             if preparation.get("preprocessing_version") != PREPROCESSING_VERSION:
-                raise ValueError("confirmed page preprocessing version is incompatible")
+                raise ValueError(
+                    "confirmed annotation preprocessing version is incompatible"
+                )
             width, height = (
                 int(value) for value in preparation["model_input"]["original_size"]
             )
@@ -701,11 +831,6 @@ class AnnotationService:
                 int(full_mask.min()) < 0 or int(full_mask.max()) > 3
             ):
                 raise ValueError("confirmed mask values must be within 0..3")
-            image_source = self.artifact_path(
-                project_id,
-                page.page_number,
-                "model_input_512",
-            )
             artifact = preparation["artifacts"]["model_input_512"]
             if _sha256(image_source) != artifact.get("sha256"):
                 raise ValueError("model input artifact hash does not match its manifest")
@@ -736,7 +861,7 @@ class AnnotationService:
                     "confirmed 512 mask does not match the full-resolution version"
                 )
             validated_samples.append(
-                (page, version, image_source, model_mask)
+                (target, version, image_source, model_mask)
             )
 
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -750,8 +875,10 @@ class AnnotationService:
 
         samples = []
         class_pixels = {str(class_id): 0 for class_id in range(4)}
-        for page, version, image_source, mask in validated_samples:
-            stem = f"{project_id}-page-{page.page_number}"
+        for target, version, image_source, mask in validated_samples:
+            stem = f"{project_id}-page-{target.page_number}"
+            if target.region_id is not None:
+                stem += f"-region-{target.region_id}"
             image_target = images_dir / f"{stem}.png"
             mask_target = masks_dir / f"{stem}.npy"
             mask_png_target = masks_dir / f"{stem}.png"
@@ -763,7 +890,7 @@ class AnnotationService:
             samples.append(
                 {
                     "sample_id": stem,
-                    "page_number": page.page_number,
+                    "page_number": target.page_number,
                     "status": "confirmed",
                     "version_id": version.version_id,
                     "image": str(image_target.relative_to(export_dir)),
@@ -773,6 +900,15 @@ class AnnotationService:
                     "mask_sha256": _sha256(mask_target),
                 }
             )
+            if target.region_id is not None:
+                samples[-1].update(
+                    {
+                        "source_page_number": target.page_number,
+                        "region_id": target.region_id,
+                        "region_name": target.region_name,
+                        "crop_bbox_px": list(target.crop_bbox_px),
+                    }
+                )
         experiment_type = "single_page_overfit" if len(samples) == 1 else "fine_tune"
         manifest = {
             "schema_version": 1,
@@ -785,7 +921,17 @@ class AnnotationService:
         }
         report = {
             "sample_count": len(samples),
-            "confirmed_pages": [sample["page_number"] for sample in samples],
+            "confirmed_pages": [
+                target.page_number
+                for target in confirmed
+                if target.region_id is None
+            ],
+            "confirmed_page_count": sum(
+                target.region_id is None for target in confirmed
+            ),
+            "confirmed_region_count": sum(
+                target.region_id is not None for target in confirmed
+            ),
             "class_pixels": class_pixels,
             "experiment_type": experiment_type,
         }

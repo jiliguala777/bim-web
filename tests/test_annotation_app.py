@@ -338,6 +338,119 @@ class AnnotationApiTests(unittest.TestCase):
                 np.zeros((199, 200), dtype=np.uint8),
             )
 
+    def test_region_api_saves_confirms_and_exports_two_regions_from_one_page(self):
+        project = self._create_project()
+        self._install_prepared_page(project)
+        project_id = project["project_id"]
+        created_regions = []
+        for name, bbox in (
+            ("四层", [0, 0, 180, 200]),
+            ("五层", [200, 0, 400, 200]),
+        ):
+            created = self.client.post(
+                f"/api/projects/{project_id}/pages/1/regions",
+                json={"name": name, "crop_bbox_px": bbox},
+            )
+            self.assertEqual(created.status_code, 201, created.get_json())
+            region = created.get_json()["region"]
+            created_regions.append(region)
+            mask = np.zeros((200, bbox[2] - bbox[0]), dtype=np.uint8)
+            mask[20:28, 20:-20] = 1
+            saved = self.client.post(
+                (
+                    f"/api/projects/{project_id}/pages/1/regions/"
+                    f"{region['region_id']}/mask"
+                ),
+                json={"mask": mask.tolist(), "author": "tester"},
+            )
+            self.assertEqual(saved.status_code, 200, saved.get_json())
+            confirmed = self.client.post(
+                (
+                    f"/api/projects/{project_id}/pages/1/regions/"
+                    f"{region['region_id']}/confirm"
+                ),
+                json={"author": "tester"},
+            )
+            self.assertEqual(confirmed.status_code, 200, confirmed.get_json())
+
+        listed = self.client.get(
+            f"/api/projects/{project_id}/pages/1/regions"
+        )
+        self.assertEqual(listed.status_code, 200, listed.get_json())
+        self.assertEqual(
+            {region["name"] for region in listed.get_json()["regions"]},
+            {"四层", "五层"},
+        )
+        artifact = self.client.get(
+            (
+                f"/api/projects/{project_id}/pages/1/regions/"
+                f"{created_regions[0]['region_id']}/artifact/model_view"
+            )
+        )
+        self.assertEqual(artifact.status_code, 200)
+        artifact.close()
+
+        exported = self.client.post(f"/api/projects/{project_id}/export")
+        self.assertEqual(exported.status_code, 201, exported.get_json())
+        export_root = (
+            self.app.extensions["annotation_store"].root
+            / "exports"
+            / exported.get_json()["export"]["export_id"]
+        )
+        manifest = json.loads(
+            (export_root / "manifest.json").read_text(encoding="utf-8")
+        )
+        report = json.loads(
+            (export_root / "dataset_report.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(report["sample_count"], 2)
+        self.assertEqual(report["confirmed_page_count"], 0)
+        self.assertEqual(report["confirmed_region_count"], 2)
+        self.assertEqual(
+            {sample["region_name"] for sample in manifest["samples"]},
+            {"四层", "五层"},
+        )
+        self.assertEqual(len({sample["sample_id"] for sample in manifest["samples"]}), 2)
+        for sample in manifest["samples"]:
+            self.assertEqual(sample["source_page_number"], 1)
+            self.assertEqual(len(sample["crop_bbox_px"]), 4)
+            self.assertEqual(
+                np.load(export_root / sample["mask"], allow_pickle=False).shape,
+                (512, 512),
+            )
+
+    def test_region_preannotation_uses_only_the_cropped_image(self):
+        project = self._create_project()
+        self._install_prepared_page(project)
+        project_id = project["project_id"]
+        predicted_shapes = []
+
+        class FakeSegmenter:
+            def predict(self, image, **kwargs):
+                predicted_shapes.append(image.shape)
+                mask = np.zeros(image.shape[:2], dtype=np.uint8)
+                mask[20:30, 20:80] = 1
+                return {"mask": mask}
+
+        self.app.extensions["annotation_service"].segmenter_factory = FakeSegmenter
+        created = self.client.post(
+            f"/api/projects/{project_id}/pages/1/regions",
+            json={"name": "四层", "crop_bbox_px": [100, 50, 300, 250]},
+        )
+        self.assertEqual(created.status_code, 201, created.get_json())
+        region_id = created.get_json()["region"]["region_id"]
+
+        preannotated = self.client.post(
+            (
+                f"/api/projects/{project_id}/pages/1/regions/"
+                f"{region_id}/preannotate"
+            )
+        )
+
+        self.assertEqual(preannotated.status_code, 200, preannotated.get_json())
+        self.assertEqual(preannotated.get_json()["status"], "preannotated")
+        self.assertEqual(predicted_shapes, [(200, 200, 3)])
+
     def test_duplicate_page_preparation_returns_conflict(self):
         project = self._create_project()
         self.app.extensions["annotation_service"].segmenter_factory = object

@@ -80,6 +80,119 @@ def create_app(config: AnnotationConfig | None = None) -> Flask:
         page = service.prepare_page(project_id, int(payload["page_number"]))
         return jsonify({"page": page})
 
+    @app.get("/api/projects/<project_id>/pages/<int:page>/regions")
+    def list_regions(project_id, page):
+        return jsonify({"regions": service.list_regions(project_id, page)})
+
+    @app.post("/api/projects/<project_id>/pages/<int:page>/regions")
+    def create_region(project_id, page):
+        body = request.get_json(silent=True) or {}
+        if "name" not in body:
+            raise ValueError("region name is required")
+        if "crop_bbox_px" not in body:
+            raise ValueError("crop_bbox_px is required")
+        region = service.create_region(
+            project_id,
+            page,
+            body["name"],
+            body["crop_bbox_px"],
+        )
+        return jsonify({"region": region}), 201
+
+    @app.get(
+        "/api/projects/<project_id>/pages/<int:page>/regions/"
+        "<region_id>/artifact/<name>"
+    )
+    def get_region_artifact(project_id, page, region_id, name):
+        return send_file(
+            service.region_artifact_path(
+                project_id,
+                page,
+                region_id,
+                name,
+            )
+        )
+
+    @app.get(
+        "/api/projects/<project_id>/pages/<int:page>/regions/<region_id>/mask"
+    )
+    def get_region_mask(project_id, page, region_id):
+        current = service.current_region_mask(project_id, page, region_id)
+        if current is None:
+            raise FileNotFoundError("Region does not have an annotation mask")
+        mask, version = current
+        if request.args.get("space") == "model512":
+            mask_path = version.mask_path.with_name(
+                f"{version.version_id}.mask_512.npy"
+            )
+            if not mask_path.is_file():
+                raise FileNotFoundError("Model-space mask does not exist")
+            mask = np.load(mask_path, allow_pickle=False)
+        elif request.args.get("space") not in (None, "", "full"):
+            raise ValueError("mask space is invalid")
+        encoded, buffer = cv2.imencode(".png", mask)
+        if not encoded:
+            raise ValueError("mask could not be encoded")
+        response = send_file(
+            io.BytesIO(buffer.tobytes()),
+            mimetype="image/png",
+            download_name=f"region-{region_id}-{version.version_id}.png",
+        )
+        response.headers["X-Annotation-Version"] = version.version_id
+        response.headers["X-Annotation-Status"] = version.status
+        return response
+
+    @app.post(
+        "/api/projects/<project_id>/pages/<int:page>/regions/<region_id>/mask"
+    )
+    def save_region_mask(project_id, page, region_id):
+        if "mask" in request.files:
+            payload = request.files["mask"].read()
+            author = request.form.get("author", "local-user")
+        else:
+            body = request.get_json(silent=True) or {}
+            if "mask" not in body:
+                raise ValueError("mask is required")
+            payload = body["mask"]
+            author = body.get("author", "local-user")
+        version, warnings = service.save_region_mask(
+            project_id,
+            page,
+            region_id,
+            payload,
+            status="draft",
+            author=author,
+        )
+        return jsonify(_version_payload(version, warnings))
+
+    @app.post(
+        "/api/projects/<project_id>/pages/<int:page>/regions/<region_id>/confirm"
+    )
+    def confirm_region(project_id, page, region_id):
+        body = request.get_json(silent=True) or {}
+        version = service.confirm_region(
+            project_id,
+            page,
+            region_id,
+            author=body.get("author", "local-user"),
+        )
+        return jsonify(_version_payload(version))
+
+    @app.post(
+        "/api/projects/<project_id>/pages/<int:page>/regions/"
+        "<region_id>/preannotate"
+    )
+    def preannotate_region(project_id, page, region_id):
+        body = request.get_json(silent=True) or {}
+        version, warnings = service.preannotate_region(
+            project_id,
+            page,
+            region_id,
+            author=body.get("author", "onnx-preannotation"),
+            allow_blank=bool(body.get("allow_blank", False)),
+        )
+        return jsonify(_version_payload(version, warnings))
+
     @app.get("/api/projects/<project_id>/pages/<int:page>/artifact/<name>")
     def get_artifact(project_id, page, name):
         return send_file(service.artifact_path(project_id, page, name))

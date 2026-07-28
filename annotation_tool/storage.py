@@ -18,6 +18,7 @@ from .config import AnnotationConfig
 
 
 PROJECT_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,79}$")
+REGION_ID_RE = re.compile(r"^[a-f0-9]{12}$")
 VALID_STATUSES = {"draft", "preannotated", "confirmed"}
 
 
@@ -52,6 +53,16 @@ class PageRecord:
     page_number: int
     status: str
     version_id: str
+
+
+@dataclass(frozen=True)
+class AnnotationTarget:
+    page_number: int
+    status: str
+    version_id: str
+    region_id: str | None = None
+    region_name: str | None = None
+    crop_bbox_px: tuple[int, int, int, int] | None = None
 
 
 def _now() -> str:
@@ -252,6 +263,188 @@ class AnnotationStore:
         self._atomic_json(manifest_path, project)
         return project
 
+    @staticmethod
+    def _validated_region_id(region_id: str) -> str:
+        value = str(region_id)
+        if not REGION_ID_RE.fullmatch(value):
+            raise ValueError("region_id is invalid")
+        return value
+
+    def create_region(
+        self,
+        project_id: str,
+        page_number: int,
+        name: str,
+        crop_bbox_px,
+    ) -> dict:
+        if page_number < 1:
+            raise ValueError("page_number must be positive")
+        region_name = str(name).strip()
+        if not 1 <= len(region_name) <= 80:
+            raise ValueError("region name must contain 1..80 characters")
+        if (
+            not isinstance(crop_bbox_px, (list, tuple))
+            or len(crop_bbox_px) != 4
+            or any(
+                isinstance(value, bool) or not isinstance(value, (int, np.integer))
+                for value in crop_bbox_px
+            )
+        ):
+            raise ValueError("crop_bbox_px must contain four integers")
+        x0, y0, x1, y1 = (int(value) for value in crop_bbox_px)
+        if x0 < 0 or y0 < 0 or x1 <= x0 or y1 <= y0:
+            raise ValueError("crop_bbox_px must be a positive normalized rectangle")
+
+        manifest_path, project = self._load_project(project_id)
+        page = project.get("pages", {}).get(str(page_number))
+        if not page or "preparation" not in page:
+            raise ValueError("page must be prepared before creating a region")
+        regions = page.setdefault("regions", {})
+        if any(payload.get("name") == region_name for payload in regions.values()):
+            raise ValueError("region name must be unique within the page")
+        region_id = uuid.uuid4().hex[:12]
+        while region_id in regions:
+            region_id = uuid.uuid4().hex[:12]
+        created_at = _now()
+        region = {
+            "region_id": region_id,
+            "name": region_name,
+            "source_page_number": page_number,
+            "crop_bbox_px": [x0, y0, x1, y1],
+            "status": "prepared",
+            "current_version": None,
+            "created_at": created_at,
+            "updated_at": created_at,
+        }
+        regions[region_id] = region
+        page["updated_at"] = created_at
+        project["updated_at"] = created_at
+        self._atomic_json(manifest_path, project)
+        return dict(region)
+
+    def list_regions(self, project_id: str, page_number: int) -> list[dict]:
+        if page_number < 1:
+            raise ValueError("page_number must be positive")
+        _, project = self._load_project(project_id)
+        page = project.get("pages", {}).get(str(page_number))
+        if not page:
+            return []
+        return [
+            dict(region)
+            for region in sorted(
+                page.get("regions", {}).values(),
+                key=lambda payload: payload.get("created_at", ""),
+            )
+        ]
+
+    def save_region_mask_version(
+        self,
+        project_id: str,
+        page_number: int,
+        region_id: str,
+        mask: np.ndarray,
+        *,
+        status: str,
+        author: str,
+    ) -> MaskVersion:
+        region_id = self._validated_region_id(region_id)
+        if page_number < 1:
+            raise ValueError("page_number must be positive")
+        if status not in VALID_STATUSES:
+            raise ValueError("status is invalid")
+        array = np.asarray(mask)
+        if array.ndim != 2 or array.dtype != np.uint8:
+            raise ValueError("mask must be a two-dimensional uint8 array")
+        values = np.unique(array)
+        if np.any((values < 0) | (values > 3)):
+            raise ValueError("mask values must be within 0..3")
+
+        manifest_path, project = self._load_project(project_id)
+        page = project.get("pages", {}).get(str(page_number))
+        region = (page or {}).get("regions", {}).get(region_id)
+        if region is None:
+            raise FileNotFoundError("Annotation region does not exist")
+        previous = region.get("current_version")
+        version_id = (
+            datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+            + "-"
+            + uuid.uuid4().hex[:8]
+        )
+        versions_dir = self._inside_root(
+            self.root
+            / "annotations"
+            / project_id
+            / f"page-{page_number}"
+            / "regions"
+            / region_id
+            / "versions"
+        )
+        mask_path = versions_dir / f"{version_id}.npy"
+        self._atomic_npy(mask_path, array)
+        created_at = _now()
+        version = MaskVersion(
+            version_id=version_id,
+            status=status,
+            author=author.strip() or "unknown",
+            created_at=created_at,
+            mask_sha256=_sha256_file(mask_path),
+            mask_path=mask_path,
+            previous_version_id=previous,
+        )
+        payload = asdict(version)
+        payload["mask_path"] = str(mask_path.relative_to(self.root))
+        self._atomic_json(versions_dir / f"{version_id}.json", payload)
+
+        region.update(
+            {
+                "status": status,
+                "current_version": version_id,
+                "updated_at": created_at,
+            }
+        )
+        page["updated_at"] = created_at
+        project["updated_at"] = created_at
+        self._atomic_json(manifest_path, project)
+        return version
+
+    def load_current_region_mask(
+        self,
+        project_id: str,
+        page_number: int,
+        region_id: str,
+    ) -> tuple[np.ndarray, MaskVersion] | None:
+        region_id = self._validated_region_id(region_id)
+        _, project = self._load_project(project_id)
+        page = project.get("pages", {}).get(str(page_number))
+        region = (page or {}).get("regions", {}).get(region_id)
+        if region is None:
+            raise FileNotFoundError("Annotation region does not exist")
+        version_id = region.get("current_version")
+        if not version_id:
+            return None
+        version_path = (
+            self.root
+            / "annotations"
+            / project_id
+            / f"page-{page_number}"
+            / "regions"
+            / region_id
+            / "versions"
+            / f"{version_id}.json"
+        )
+        payload = json.loads(version_path.read_text(encoding="utf-8"))
+        mask_path = self._inside_root(self.root / payload["mask_path"])
+        version = MaskVersion(
+            version_id=payload["version_id"],
+            status=payload["status"],
+            author=payload["author"],
+            created_at=payload["created_at"],
+            mask_sha256=payload["mask_sha256"],
+            mask_path=mask_path,
+            previous_version_id=payload.get("previous_version_id"),
+        )
+        return np.load(mask_path, allow_pickle=False), version
+
     def save_mask_version(
         self,
         project_id: str,
@@ -357,3 +550,34 @@ class AnnotationStore:
                     )
                 )
         return sorted(confirmed, key=lambda item: item.page_number)
+
+    def list_confirmed_targets(self, project_id: str) -> list[AnnotationTarget]:
+        _, project = self._load_project(project_id)
+        confirmed = []
+        for payload in project.get("pages", {}).values():
+            page_number = int(payload["page_number"])
+            if payload.get("status") == "confirmed":
+                confirmed.append(
+                    AnnotationTarget(
+                        page_number=page_number,
+                        status="confirmed",
+                        version_id=payload["current_version"],
+                    )
+                )
+            for region in payload.get("regions", {}).values():
+                if region.get("status") != "confirmed":
+                    continue
+                confirmed.append(
+                    AnnotationTarget(
+                        page_number=page_number,
+                        status="confirmed",
+                        version_id=region["current_version"],
+                        region_id=region["region_id"],
+                        region_name=region["name"],
+                        crop_bbox_px=tuple(region["crop_bbox_px"]),
+                    )
+                )
+        return sorted(
+            confirmed,
+            key=lambda item: (item.page_number, item.region_id or ""),
+        )

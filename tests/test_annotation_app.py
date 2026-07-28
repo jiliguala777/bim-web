@@ -520,6 +520,32 @@ class AnnotationTemplateTests(unittest.TestCase):
         self.assertIn("setPreparing(false)", script)
         self.assertIn("raster_fallback", script)
 
+    def test_select_page_only_loads_a_mask_when_a_saved_version_exists(self):
+        script = (
+            Path(__file__).resolve().parents[1]
+            / "annotation_tool/static/app.js"
+        ).read_text(encoding="utf-8")
+        select_page = script.split(
+            "async function selectPage(pageNumber) {", 1
+        )[1].split("function setupCanvases()", 1)[0]
+
+        self.assertIn("const pageTasks = [", select_page)
+        self.assertIn("if (state.page.current_version) {", select_page)
+        self.assertIn(
+            "pageTasks.push(loadMask(requestBase, generation, width, height));",
+            select_page,
+        )
+        self.assertIn(
+            """} else {
+      renderMask();
+      state.dirty = false;
+      state.editRevision = 0;
+      setSaveState("已载入", "idle");
+    }""",
+            select_page,
+        )
+        self.assertIn("await Promise.all(pageTasks);", select_page)
+
     def test_default_segmenter_uses_the_configured_onnx_model_path(self):
         store = self.app.extensions["annotation_store"]
         with patch.dict(os.environ, {"ONNX_MODEL_PATH": r"G:\models\custom.onnx"}):

@@ -179,10 +179,18 @@
     const requestBase = currentBase();
     const width = state.width;
     const height = state.height;
-    await Promise.all([
+    const pageTasks = [
       loadBackground(requestBase, generation, width, height),
-      loadMask(requestBase, generation, width, height),
-    ]);
+    ];
+    if (state.page.current_version) {
+      pageTasks.push(loadMask(requestBase, generation, width, height));
+    } else {
+      renderMask();
+      state.dirty = false;
+      state.editRevision = 0;
+      setSaveState("已载入", "idle");
+    }
+    await Promise.all(pageTasks);
     if (
       generation !== state.pageGeneration
       || state.page?.page_number !== Number(pageNumber)

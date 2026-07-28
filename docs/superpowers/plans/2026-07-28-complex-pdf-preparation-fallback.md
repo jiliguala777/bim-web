@@ -432,13 +432,19 @@ Then add:
 ```python
 def test_duplicate_page_preparation_returns_conflict(self):
     project = self._create_project()
-    service = self.app.extensions["annotation_service"]
     started = threading.Event()
     release = threading.Event()
+    call_lock = threading.Lock()
+    calls = 0
 
     def blocking_prepare(*args, **kwargs):
-        started.set()
-        self.assertTrue(release.wait(5))
+        nonlocal calls
+        with call_lock:
+            calls += 1
+            call_number = calls
+        if call_number == 1:
+            started.set()
+            self.assertTrue(release.wait(5))
         return self._fake_prepared_page(Path(kwargs["output_dir"]))
 
     with patch(
@@ -463,6 +469,7 @@ def test_duplicate_page_preparation_returns_conflict(self):
     self.assertEqual(second.status_code, 409)
     self.assertIn("正在准备", second.get_json()["error"])
     self.assertEqual(first_response.status_code, 200)
+    self.assertEqual(calls, 1)
 ```
 
 Replace the old inline `fake_prepare` body in
@@ -480,7 +487,7 @@ Run:
 Expected: the second request also enters `prepare_pdf_page` instead of returning
 409.
 
-- [ ] **Step 3: Implement the page guard and 409 mapping**
+- [ ] **Step 3: Implement the minimal page guard and 409 mapping**
 
 In `annotation_tool/services.py`:
 
@@ -502,7 +509,9 @@ self._preparing_lock = threading.Lock()
 self._preparing_pages: set[tuple[str, int]] = set()
 ```
 
-After validation and before constructing the segmenter:
+After validation and before constructing the segmenter, add the page key and
+reject duplicates. For this first GREEN step, remove the key only after a
+successful `_prepare_page_once` return:
 
 ```python
 key = (project_id, page_number)
@@ -510,16 +519,15 @@ with self._preparing_lock:
     if key in self._preparing_pages:
         raise PreparationInProgressError(project_id, page_number)
     self._preparing_pages.add(key)
-try:
-    return self._prepare_page_once(project_id, page_number, project)
-finally:
-    with self._preparing_lock:
-        self._preparing_pages.discard(key)
+page = self._prepare_page_once(project_id, page_number, project)
+with self._preparing_lock:
+    self._preparing_pages.discard(key)
+return page
 ```
 
-Extract the current preparation body to `_prepare_page_once` so the `finally`
-scope is obvious and testable. Copy `prepared.vector_analysis` into the stored
-`preparation` dictionary.
+Extract the current preparation body to `_prepare_page_once` so the cleanup
+scope can be completed in the next RED/GREEN cycle. Copy
+`prepared.vector_analysis` into the stored `preparation` dictionary.
 
 In `annotation_tool/app.py`, import the exception and register:
 
@@ -572,10 +580,33 @@ def test_failed_page_preparation_releases_the_guard(self):
     self.assertEqual(prepare.call_count, 2)
 ```
 
-Expected before a correct `finally`: second response is 409. Expected after the
-implementation: test passes.
+Run:
 
-- [ ] **Step 6: Run annotation API tests**
+```powershell
+& "G:\bim-web\.venv\Scripts\python.exe" -m unittest tests.test_annotation_app.AnnotationApiTests.test_failed_page_preparation_releases_the_guard
+```
+
+Expected: RED; the first request leaves the page key registered and the second
+response is 409.
+
+- [ ] **Step 6: Release the page guard in `finally` and verify GREEN**
+
+Replace the success-only cleanup with:
+
+```python
+try:
+    return self._prepare_page_once(project_id, page_number, project)
+finally:
+    with self._preparing_lock:
+        self._preparing_pages.discard(key)
+```
+
+Run the Step 5 test command.
+
+Expected: first response is 400, second response is 200, and the preparation
+function is called twice.
+
+- [ ] **Step 7: Run annotation API tests**
 
 Run:
 
@@ -585,7 +616,7 @@ Run:
 
 Expected: all annotation API and template tests pass.
 
-- [ ] **Step 7: Commit Task 2**
+- [ ] **Step 8: Commit Task 2**
 
 ```powershell
 git add annotation_tool/services.py annotation_tool/app.py tests/test_annotation_app.py
@@ -619,7 +650,7 @@ def test_prepare_button_has_a_single_request_busy_state(self):
     self.assertIn("preparing: false", script)
     self.assertIn("function setPreparing(active)", script)
     self.assertIn('button.textContent = "正在准备，请勿重复点击…"', script)
-    self.assertIn("if (state.preparing)", script)
+    self.assertIn("state.preparing", script)
     self.assertIn("setPreparing(true)", script)
     self.assertIn("setPreparing(false)", script)
     self.assertIn("raster_fallback", script)

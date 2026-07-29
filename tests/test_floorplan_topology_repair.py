@@ -1,5 +1,6 @@
 import math
 import unittest
+from unittest.mock import patch
 
 import cv2
 import numpy as np
@@ -7,6 +8,7 @@ import numpy as np
 from floorplan_rooms import extract_room_topology
 from floorplan_topology_repair import (
     _dominant_span_rectangles,
+    _search_multi_gap_solution,
     repair_vector_floorplan_topology,
 )
 
@@ -88,6 +90,82 @@ class ConservativeTopologyRepairTests(unittest.TestCase):
         )
         self.assertEqual(topology["room_count"], 1)
         self.assertFalse(result["manual_exterior_wall_required"])
+
+    @patch("floorplan_topology_repair._room_topology")
+    def test_multi_gap_search_stops_after_sixteen_topology_evaluations(
+        self, room_topology
+    ):
+        empty = {"room_count": 0, "rooms": [], "total_area_px2": 0.0}
+        room_topology.return_value = empty
+        mask = np.zeros((30, 30), dtype=np.uint8)
+        candidates = [
+            {
+                "line_px": [index, 2, index, 8],
+                "score": 1.0,
+                "length_px": 6.0,
+            }
+            for index in range(1, 25)
+        ]
+
+        outcome = _search_multi_gap_solution(
+            mask,
+            candidates,
+            [0, 0, 30, 30],
+            20.0,
+            {"beam_width": 16, "max_lines": 16},
+        )
+
+        self.assertEqual(len(outcome), 3)
+        result, accepted, search = outcome
+        self.assertTrue(np.array_equal(result, mask))
+        self.assertEqual(accepted, [])
+        self.assertEqual(search["evaluation_count"], 16)
+        self.assertEqual(search["evaluation_limit"], 16)
+        self.assertTrue(search["budget_exhausted"])
+
+    @patch("floorplan_topology_repair._room_topology")
+    def test_multi_gap_search_keeps_reliable_solution_found_before_budget_exhaustion(
+        self, room_topology
+    ):
+        empty = {"room_count": 0, "rooms": [], "total_area_px2": 0.0}
+        plausible = {
+            "room_count": 1,
+            "rooms": [{"area_px2": 100.0, "bbox_px": [5, 5, 10, 10]}],
+            "total_area_px2": 100.0,
+        }
+        evaluation_index = 0
+
+        def topology_for_search(mask, min_room_area_px):
+            nonlocal evaluation_index
+            result = empty if evaluation_index == 0 else plausible
+            evaluation_index += 1
+            return result
+
+        room_topology.side_effect = topology_for_search
+        mask = np.zeros((30, 30), dtype=np.uint8)
+        candidates = [
+            {
+                "line_px": [index, 2, index, 8],
+                "score": 1.0,
+                "length_px": 6.0,
+            }
+            for index in range(1, 25)
+        ]
+
+        outcome = _search_multi_gap_solution(
+            mask,
+            candidates,
+            [0, 0, 30, 30],
+            20.0,
+            {"beam_width": 16, "max_lines": 16},
+        )
+
+        self.assertEqual(len(outcome), 3)
+        result, accepted, search = outcome
+        self.assertFalse(np.array_equal(result, mask))
+        self.assertEqual(len(accepted), 1)
+        self.assertEqual(search["evaluation_count"], 16)
+        self.assertTrue(search["budget_exhausted"])
 
     def test_uses_four_long_span_lines_for_fragmented_room_perimeter(self):
         mask = np.zeros((140, 180), dtype=np.uint8)

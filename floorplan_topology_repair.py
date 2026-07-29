@@ -14,6 +14,7 @@ DOMINANT_SPAN_MIN_VECTOR_SIDE_SUPPORT = 0.60
 DOMINANT_SPAN_MIN_MODEL_SIDE_SUPPORT = 0.15
 ALREADY_CLOSED_MIN_TOTAL_ROI_FRACTION = 0.20
 ALREADY_CLOSED_MIN_LARGEST_ROOM_ROI_FRACTION = 0.08
+MAX_MULTI_GAP_TOPOLOGY_EVALUATIONS = 16
 
 
 def _normalize_roi(roi, width: int, height: int) -> list[int] | None:
@@ -779,18 +780,26 @@ def _search_multi_gap_solution(
     roi: list[int],
     min_room_area_px: float,
     limits: dict,
-) -> tuple[np.ndarray, list[dict]]:
+) -> tuple[np.ndarray, list[dict], dict]:
     baseline = _room_topology(mask, min_room_area_px)
     baseline_area = float(baseline.get("total_area_px2") or 0.0)
     states = [(mask, [], 0.0, 0.0)]
     solutions = []
+    evaluation_count = 0
+    budget_exhausted = False
+    stop_search = False
     for candidate in candidates:
         expanded = list(states)
         for state_mask, accepted, _gain, evidence_score in states:
             if len(accepted) >= limits["max_lines"]:
                 continue
+            if evaluation_count >= MAX_MULTI_GAP_TOPOLOGY_EVALUATIONS:
+                budget_exhausted = True
+                stop_search = True
+                break
             simulated = _apply_wall_line(state_mask, candidate["line_px"])
             topology = _room_topology(simulated, min_room_area_px)
+            evaluation_count += 1
             if not _baseline_rooms_preserved(baseline, topology):
                 continue
             gain = max(
@@ -811,6 +820,8 @@ def _search_multi_gap_solution(
                 roi,
             ):
                 solutions.append(next_state)
+        if stop_search:
+            break
         expanded.sort(
             key=lambda state: (
                 state[2] > 0,
@@ -822,8 +833,13 @@ def _search_multi_gap_solution(
         )
         states = expanded[:limits["beam_width"]]
 
+    search_diagnostics = {
+        "evaluation_count": evaluation_count,
+        "evaluation_limit": MAX_MULTI_GAP_TOPOLOGY_EVALUATIONS,
+        "budget_exhausted": budget_exhausted,
+    }
     if not solutions:
-        return mask, []
+        return mask, [], search_diagnostics
     solutions.sort(
         key=lambda state: (
             state[2],
@@ -833,7 +849,7 @@ def _search_multi_gap_solution(
         reverse=True,
     )
     best_mask, accepted, _gain, _evidence = solutions[0]
-    return best_mask, accepted
+    return best_mask, accepted, search_diagnostics
 
 
 def _component_record(stats_row: np.ndarray, label: int) -> dict:
@@ -929,6 +945,11 @@ def repair_vector_floorplan_topology(
     span_rectangle = None
     exterior_candidates = []
     accepted_candidates = []
+    search_diagnostics = {
+        "evaluation_count": 0,
+        "evaluation_limit": MAX_MULTI_GAP_TOPOLOGY_EVALUATIONS,
+        "budget_exhausted": False,
+    }
     if not already_closed:
         result, span_rectangle = _search_dominant_span_rectangle(
             result,
@@ -943,7 +964,7 @@ def repair_vector_floorplan_topology(
                 roi,
                 limits,
             )
-            result, accepted_candidates = _search_multi_gap_solution(
+            result, accepted_candidates, search_diagnostics = _search_multi_gap_solution(
                 result,
                 exterior_candidates,
                 roi,
@@ -960,6 +981,7 @@ def repair_vector_floorplan_topology(
             "accepted_candidates": [],
             "round_count": 0,
             "limits": limits,
+            "search": search_diagnostics,
             "reason": "already_closed",
             "initial_closure": initial_closure,
         }
@@ -976,6 +998,7 @@ def repair_vector_floorplan_topology(
             }],
             "round_count": 1,
             "limits": limits,
+            "search": search_diagnostics,
             "reason": "dominant_span_rectangle",
         }
     elif accepted_candidates:
@@ -988,6 +1011,7 @@ def repair_vector_floorplan_topology(
             "accepted_candidates": accepted_candidates,
             "round_count": 1,
             "limits": limits,
+            "search": search_diagnostics,
             "reason": "multi_gap_solution",
         }
     else:
@@ -997,6 +1021,7 @@ def repair_vector_floorplan_topology(
             "accepted_lines_px": [],
             "round_count": 1,
             "limits": limits,
+            "search": search_diagnostics,
             "reason": "no_valid_multi_gap_solution",
         })
         diagnostics["manual_exterior_wall_required"] = True

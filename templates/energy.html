@@ -290,6 +290,54 @@
             cursor: pointer;
         }
 
+        .pdf-preview-frame {
+            margin-top: 16px;
+            padding: 12px;
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            background: rgba(0, 0, 0, 0.18);
+            text-align: center;
+            overflow: auto;
+        }
+
+        .pdf-preview-image-wrap {
+            position: relative;
+            display: inline-block;
+            max-width: 100%;
+            line-height: 0;
+            touch-action: none;
+        }
+
+        #pdf-page-preview-image {
+            display: block;
+            max-width: 100%;
+            max-height: 70vh;
+            user-select: none;
+        }
+
+        #pdf-crop-overlay {
+            position: absolute;
+            border: 2px solid var(--warning);
+            background: rgba(241, 196, 15, 0.18);
+            pointer-events: none;
+        }
+
+        .pdf-mode-controls {
+            display: flex;
+            gap: 16px;
+            align-items: center;
+            flex-wrap: wrap;
+            margin-top: 14px;
+        }
+
+        .pdf-mode-controls label {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            color: var(--text);
+            cursor: pointer;
+        }
+
         /* 输入控件 */
         .form-group {
             margin-bottom: 20px;
@@ -846,7 +894,28 @@
                         <label class="form-label" for="pdf-page-select">需要识别的页码</label>
                         <select id="pdf-page-select" class="form-control"></select>
                     </div>
-                    <button type="button" id="recognize-selected-page" class="btn btn-primary">开始识别所选页</button>
+                    <button type="button" id="reload-pdf-preview" class="btn btn-secondary">重新加载预览</button>
+                </div>
+                <div class="pdf-preview-frame">
+                    <div class="pdf-preview-image-wrap">
+                        <img id="pdf-page-preview-image" src="" alt="所选 PDF 页面预览" draggable="false">
+                        <div id="pdf-crop-overlay" class="hidden"></div>
+                    </div>
+                </div>
+                <div class="pdf-mode-controls">
+                    <label>
+                        <input type="radio" id="pdf-recognition-mode-full" name="pdf-recognition-mode" value="full_page" checked>
+                        识别整页
+                    </label>
+                    <label>
+                        <input type="radio" id="pdf-recognition-mode-crop" name="pdf-recognition-mode" value="crop_region">
+                        框选区域
+                    </label>
+                    <button type="button" id="clear-pdf-crop" class="btn btn-secondary" disabled>清除框选</button>
+                    <span id="pdf-crop-summary" style="color:var(--text-muted); font-size:13px;">整页识别模式</span>
+                </div>
+                <div style="margin-top:14px;">
+                    <button type="button" id="recognize-selected-page" class="btn btn-primary" disabled>开始识别整页</button>
                 </div>
             </div>
 
@@ -1547,11 +1616,17 @@
         </div>
     </div>
 
+    <script src="/energy/crop_region.js"></script>
     <script>
         let currentStep = 1;
         let reportNumber = '';
         let aiResultData = null;
         let preparedPdf = null;
+        let pdfRecognitionMode = 'full_page';
+        let pdfCropBBox = null;
+        let pdfCropStart = null;
+        let pdfCropDragging = false;
+        let pdfPreviewSize = null;
         let calibrationPoints = [];
         let energyResultData = null;
         let chartInstance = null;
@@ -2417,6 +2492,73 @@
             });
 
             document.getElementById('recognize-selected-page').addEventListener('click', recognizePreparedPdf);
+            document.getElementById('reload-pdf-preview').addEventListener('click', loadPreparedPdfPreview);
+            document.getElementById('pdf-page-select').addEventListener('change', async () => {
+                clearPreparedPdfPreview();
+                await loadPreparedPdfPreview();
+            });
+            document.getElementById('pdf-recognition-mode-full').addEventListener('change', (event) => {
+                if (event.target.checked) setPdfRecognitionMode('full_page');
+            });
+            document.getElementById('pdf-recognition-mode-crop').addEventListener('change', (event) => {
+                if (event.target.checked) setPdfRecognitionMode('crop_region');
+            });
+            document.getElementById('clear-pdf-crop').addEventListener('click', resetPdfCropSelection);
+
+            const previewImage = document.getElementById('pdf-page-preview-image');
+            previewImage.addEventListener('pointerdown', (event) => {
+                if (
+                    pdfRecognitionMode !== 'crop_region'
+                    || !pdfPreviewSize
+                    || event.button !== 0
+                ) return;
+                event.preventDefault();
+                pdfCropDragging = true;
+                pdfCropStart = pdfPreviewPoint(event);
+                pdfCropBBox = AnnotationCropRegion.normalizeCrop(
+                    pdfCropStart,
+                    pdfCropStart,
+                    previewImage.naturalWidth,
+                    previewImage.naturalHeight
+                );
+                previewImage.setPointerCapture(event.pointerId);
+                updatePdfCropOverlay();
+            });
+            previewImage.addEventListener('pointermove', (event) => {
+                if (!pdfCropDragging) return;
+                pdfCropBBox = AnnotationCropRegion.normalizeCrop(
+                    pdfCropStart,
+                    pdfPreviewPoint(event),
+                    previewImage.naturalWidth,
+                    previewImage.naturalHeight
+                );
+                updatePdfCropOverlay();
+            });
+            previewImage.addEventListener('pointerup', (event) => {
+                if (!pdfCropDragging) return;
+                pdfCropBBox = AnnotationCropRegion.normalizeCrop(
+                    pdfCropStart,
+                    pdfPreviewPoint(event),
+                    previewImage.naturalWidth,
+                    previewImage.naturalHeight
+                );
+                pdfCropDragging = false;
+                pdfCropStart = null;
+                if (previewImage.hasPointerCapture(event.pointerId)) {
+                    previewImage.releasePointerCapture(event.pointerId);
+                }
+                updatePdfCropOverlay();
+            });
+            previewImage.addEventListener('pointercancel', (event) => {
+                if (!pdfCropDragging) return;
+                pdfCropDragging = false;
+                pdfCropStart = null;
+                if (previewImage.hasPointerCapture(event.pointerId)) {
+                    previewImage.releasePointerCapture(event.pointerId);
+                }
+                updatePdfCropOverlay();
+            });
+            window.addEventListener('resize', updatePdfCropOverlay);
         }
 
         async function handleFile(file) {
@@ -2435,11 +2577,159 @@
             if (repNumInput) reportNumber = repNumInput;
         }
 
+        function updatePdfRecognitionControls() {
+            const previewImage = document.getElementById('pdf-page-preview-image');
+            const recognizeButton = document.getElementById('recognize-selected-page');
+            const cropValid = (
+                pdfRecognitionMode === 'crop_region'
+                && pdfPreviewSize
+                && AnnotationCropRegion.validateCrop(
+                    pdfCropBBox,
+                    previewImage.naturalWidth,
+                    previewImage.naturalHeight
+                )
+            );
+            recognizeButton.innerText = pdfRecognitionMode === 'crop_region'
+                ? '开始识别所选区域'
+                : '开始识别整页';
+            recognizeButton.disabled = (
+                !preparedPdf
+                || !pdfPreviewSize
+                || (pdfRecognitionMode === 'crop_region' && !cropValid)
+            );
+            document.getElementById('clear-pdf-crop').disabled = !pdfCropBBox;
+        }
+
+        function resetPdfCropSelection() {
+            pdfCropBBox = null;
+            pdfCropStart = null;
+            pdfCropDragging = false;
+            const overlay = document.getElementById('pdf-crop-overlay');
+            overlay.classList.add('hidden');
+            overlay.style.cssText = '';
+            document.getElementById('pdf-crop-summary').innerText =
+                pdfRecognitionMode === 'crop_region'
+                    ? '请在预览图上拖动框选识别区域'
+                    : '整页识别模式';
+            updatePdfRecognitionControls();
+        }
+
+        function clearPreparedPdfPreview() {
+            pdfPreviewSize = null;
+            const previewImage = document.getElementById('pdf-page-preview-image');
+            previewImage.removeAttribute('src');
+            resetPdfCropSelection();
+        }
+
+        function setPdfRecognitionMode(mode) {
+            pdfRecognitionMode = mode === 'crop_region' ? 'crop_region' : 'full_page';
+            document.getElementById('pdf-recognition-mode-full').checked =
+                pdfRecognitionMode === 'full_page';
+            document.getElementById('pdf-recognition-mode-crop').checked =
+                pdfRecognitionMode === 'crop_region';
+            document.getElementById('pdf-page-preview-image').style.cursor =
+                pdfRecognitionMode === 'crop_region' ? 'crosshair' : 'default';
+            if (pdfRecognitionMode === 'full_page') {
+                resetPdfCropSelection();
+            } else {
+                document.getElementById('pdf-crop-summary').innerText =
+                    '请在预览图上拖动框选识别区域';
+                updatePdfCropOverlay();
+            }
+        }
+
+        function pdfPreviewPoint(event) {
+            const previewImage = document.getElementById('pdf-page-preview-image');
+            const rect = previewImage.getBoundingClientRect();
+            return AnnotationCropRegion.canvasPointToImage(
+                { x: event.clientX, y: event.clientY },
+                {
+                    offsetX: rect.left,
+                    offsetY: rect.top,
+                    scale: rect.width / previewImage.naturalWidth,
+                    width: previewImage.naturalWidth,
+                    height: previewImage.naturalHeight
+                }
+            );
+        }
+
+        function updatePdfCropOverlay() {
+            const previewImage = document.getElementById('pdf-page-preview-image');
+            const overlay = document.getElementById('pdf-crop-overlay');
+            if (!pdfCropBBox || !pdfPreviewSize || !previewImage.naturalWidth) {
+                overlay.classList.add('hidden');
+                updatePdfRecognitionControls();
+                return;
+            }
+
+            const [x0, y0, x1, y1] = pdfCropBBox;
+            const scaleX = previewImage.clientWidth / previewImage.naturalWidth;
+            const scaleY = previewImage.clientHeight / previewImage.naturalHeight;
+            overlay.style.left = `${x0 * scaleX}px`;
+            overlay.style.top = `${y0 * scaleY}px`;
+            overlay.style.width = `${(x1 - x0) * scaleX}px`;
+            overlay.style.height = `${(y1 - y0) * scaleY}px`;
+            overlay.classList.remove('hidden');
+
+            const valid = AnnotationCropRegion.validateCrop(
+                pdfCropBBox,
+                previewImage.naturalWidth,
+                previewImage.naturalHeight
+            );
+            document.getElementById('pdf-crop-summary').innerText = valid
+                ? `已选择 ${x1 - x0} × ${y1 - y0} 像素`
+                : `所选区域 ${x1 - x0} × ${y1 - y0} 像素，区域过小`;
+            updatePdfRecognitionControls();
+        }
+
+        async function loadPreparedPdfPreview() {
+            if (!preparedPdf) return false;
+            updateReportNumberFromInput();
+            const fd = new FormData();
+            fd.append('report_number', reportNumber);
+            fd.append('pdf_upload_token', preparedPdf.uploadToken);
+            fd.append('pdf_page_number', document.getElementById('pdf-page-select').value);
+            showLoader('正在生成 PDF 页面预览...');
+
+            try {
+                const response = await fetch('/energy/pdf_page_preview', {
+                    method: 'POST',
+                    body: fd
+                });
+                const data = await response.json();
+                if (!response.ok || data.error) throw new Error(data.error || response.statusText);
+
+                const previewImage = document.getElementById('pdf-page-preview-image');
+                await new Promise((resolve, reject) => {
+                    previewImage.onload = resolve;
+                    previewImage.onerror = () => reject(new Error('无法显示 PDF 页面预览'));
+                    previewImage.src = 'data:image/jpeg;base64,' + data.image;
+                    if (previewImage.complete && previewImage.naturalWidth) resolve();
+                });
+                pdfPreviewSize = [previewImage.naturalWidth, previewImage.naturalHeight];
+                document.getElementById('pdf-page-summary').innerText =
+                    `${preparedPdf.filename} 共 ${preparedPdf.pageCount} 页，当前预览第 ${data.pdf_page_number} 页。`;
+                updatePdfCropOverlay();
+                return true;
+            } catch (error) {
+                document.getElementById('pdf-page-summary').innerText =
+                    `${preparedPdf.filename} 预览加载失败，可点击“重新加载预览”重试。`;
+                alert('加载 PDF 预览失败: ' + error.message);
+                updatePdfRecognitionControls();
+                return false;
+            } finally {
+                hideLoader();
+            }
+        }
+
         function resetPreparedPdfSelection() {
             preparedPdf = null;
             document.getElementById('pdf-page-selection').classList.add('hidden');
             document.getElementById('pdf-page-select').innerHTML = '';
-            document.getElementById('recognize-selected-page').disabled = false;
+            pdfRecognitionMode = 'full_page';
+            document.getElementById('pdf-recognition-mode-full').checked = true;
+            document.getElementById('pdf-recognition-mode-crop').checked = false;
+            clearPreparedPdfPreview();
         }
 
         async function preparePdf(file) {
@@ -2470,13 +2760,12 @@
                     pageSelect.appendChild(option);
                 }
 
-                if (preparedPdf.pageCount === 1) {
-                    await recognizePreparedPdf();
-                } else {
-                    document.getElementById('pdf-page-summary').innerText =
-                        `${preparedPdf.filename} 共 ${preparedPdf.pageCount} 页，请选择需要计算的楼层页。`;
-                    document.getElementById('pdf-page-selection').classList.remove('hidden');
-                }
+                document.getElementById('pdf-page-summary').innerText =
+                    `${preparedPdf.filename} 共 ${preparedPdf.pageCount} 页，正在加载第 1 页预览。`;
+                document.getElementById('pdf-page-selection').classList.remove('hidden');
+                setPdfRecognitionMode('full_page');
+                clearPreparedPdfPreview();
+                await loadPreparedPdfPreview();
             } catch (error) {
                 resetPreparedPdfSelection();
                 alert('读取 PDF 失败: ' + error.message);
@@ -2492,7 +2781,7 @@
             try {
                 await submitRecognition();
             } finally {
-                button.disabled = false;
+                updatePdfRecognitionControls();
             }
         }
 
@@ -2504,6 +2793,24 @@
             } else {
                 fd.append('pdf_upload_token', preparedPdf.uploadToken);
                 fd.append('pdf_page_number', document.getElementById('pdf-page-select').value);
+            }
+            const recognitionMode = file ? 'full_page' : pdfRecognitionMode;
+            fd.append('recognition_mode', recognitionMode);
+            if (recognitionMode === 'crop_region') {
+                const previewImage = document.getElementById('pdf-page-preview-image');
+                if (!AnnotationCropRegion.validateCrop(
+                    pdfCropBBox,
+                    previewImage.naturalWidth,
+                    previewImage.naturalHeight
+                )) {
+                    alert('请先框选有效的 PDF 识别区域。');
+                    return;
+                }
+                fd.append('crop_bbox_px', JSON.stringify(pdfCropBBox));
+                fd.append('crop_preview_size', JSON.stringify([
+                    previewImage.naturalWidth,
+                    previewImage.naturalHeight
+                ]));
             }
             fd.append('preprocessing', 'auto');
             updateReportNumberFromInput();

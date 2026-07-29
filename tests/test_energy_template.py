@@ -106,6 +106,49 @@ class EnergyTemplateTests(unittest.TestCase):
         self.assertIn("fd.append('pdf_upload_token', preparedPdf.uploadToken)", html)
         self.assertIn("fd.append('pdf_page_number', document.getElementById('pdf-page-select').value)", html)
 
+    def test_pdf_region_recognition_ui_exposes_preview_modes_and_crop_controls(self):
+        html = Path("templates/energy.html").read_text(encoding="utf-8")
+
+        for element_id in [
+            "pdf-recognition-mode-full",
+            "pdf-recognition-mode-crop",
+            "pdf-page-preview-image",
+            "pdf-crop-overlay",
+            "clear-pdf-crop",
+            "pdf-crop-summary",
+        ]:
+            with self.subTest(element_id=element_id):
+                self.assertIn(f'id="{element_id}"', html)
+        self.assertIn('<script src="/energy/crop_region.js">', html)
+
+    def test_pdf_region_recognition_ui_loads_preview_and_manages_crop_state(self):
+        html = Path("templates/energy.html").read_text(encoding="utf-8")
+
+        for function_name in [
+            "loadPreparedPdfPreview",
+            "resetPdfCropSelection",
+            "setPdfRecognitionMode",
+            "updatePdfCropOverlay",
+        ]:
+            with self.subTest(function_name=function_name):
+                self.assertIn(f"function {function_name}", html)
+        self.assertIn("fetch('/energy/pdf_page_preview'", html)
+
+        prepare_body = re.search(
+            r"async function preparePdf\(file\) \{(?P<body>.*?)\n        \}",
+            html,
+            re.S,
+        ).group("body")
+        self.assertNotIn("await recognizePreparedPdf()", prepare_body)
+        self.assertIn("await loadPreparedPdfPreview()", prepare_body)
+
+    def test_pdf_recognition_request_sends_mode_and_crop_coordinates(self):
+        html = Path("templates/energy.html").read_text(encoding="utf-8")
+
+        self.assertIn("fd.append('recognition_mode'", html)
+        self.assertIn("fd.append('crop_bbox_px'", html)
+        self.assertIn("fd.append('crop_preview_size'", html)
+
     def test_energy_request_and_server_forward_detailed_boundary_values(self):
         html = Path("templates/energy.html").read_text(encoding="utf-8")
         server = Path("web_server_server.py").read_text(encoding="utf-8")

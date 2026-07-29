@@ -31,6 +31,24 @@ assert.deepStrictEqual(
   [0, 0, 400, 300]
 );
 
+assert.deepStrictEqual(
+  crop.normalizeCrop(
+    { x: 450, y: 350 },
+    { x: -20, y: -10 },
+    400,
+    300
+  ),
+  [0, 0, 400, 300]
+);
+
+assert.deepStrictEqual(
+  crop.canvasPointToImage(
+    { x: -50, y: 900 },
+    { offsetX: 50, offsetY: 30, scale: 2, width: 400, height: 300 }
+  ),
+  { x: 0, y: 300 }
+);
+
 assert.strictEqual(crop.validateCrop([0, 0, 128, 128], 400, 300), true);
 assert.strictEqual(crop.validateCrop([0, 0, 127, 200], 400, 300), false);
 assert.strictEqual(crop.validateCrop([0, 0, 400, 2], 400, 300), false);

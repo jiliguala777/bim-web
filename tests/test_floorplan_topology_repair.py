@@ -5,7 +5,10 @@ import cv2
 import numpy as np
 
 from floorplan_rooms import extract_room_topology
-from floorplan_topology_repair import repair_vector_floorplan_topology
+from floorplan_topology_repair import (
+    _dominant_span_rectangles,
+    repair_vector_floorplan_topology,
+)
 
 
 class ConservativeTopologyRepairTests(unittest.TestCase):
@@ -116,6 +119,25 @@ class ConservativeTopologyRepairTests(unittest.TestCase):
             math.hypot(line[2] - line[0], line[3] - line[1]) >= 95
             for line in lines
         ))
+
+    def test_rejects_dominant_rectangle_when_any_side_has_weak_model_support(self):
+        mask = np.zeros((140, 180), dtype=np.uint8)
+        support = np.zeros_like(mask)
+        cv2.rectangle(support, (30, 20), (150, 120), 255, 3)
+
+        cv2.line(mask, (30, 20), (150, 20), 1, 3)
+        cv2.line(mask, (150, 20), (150, 120), 1, 3)
+        cv2.line(mask, (140, 120), (150, 120), 1, 3)
+        cv2.line(mask, (30, 20), (30, 22), 1, 3)
+
+        candidates = _dominant_span_rectangles(
+            mask,
+            support,
+            [10, 10, 170, 130],
+            min_room_area_px=1000,
+        )
+
+        self.assertEqual(candidates, [])
 
     def test_reports_partial_when_only_existing_small_room_is_closed(self):
         mask = np.zeros((140, 180), dtype=np.uint8)

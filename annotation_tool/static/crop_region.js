@@ -53,5 +53,14 @@
     );
   }
 
-  return { canvasPointToImage, normalizeCrop, validateCrop };
+  function restoreInterruptedCrop(previousBBox) {
+    return Array.isArray(previousBBox) ? previousBBox.slice() : null;
+  }
+
+  return {
+    canvasPointToImage,
+    normalizeCrop,
+    restoreInterruptedCrop,
+    validateCrop,
+  };
 });

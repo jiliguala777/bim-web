@@ -35,7 +35,8 @@ class EnergyTemplateTests(unittest.TestCase):
         self.assertIn("function startManualScaleCalibration()", html)
         self.assertIn("function saveManualScaleCalibration()", html)
         self.assertIn("fetch('/energy/scale_calibration'", html)
-        self.assertIn("if (!aiResultData?.room_topology?.load_geometry_ready)", html)
+        self.assertIn("!aiResultData?.room_topology?.load_geometry_ready", html)
+        self.assertIn("!hasCurrentAiRecognitionResult()", html)
         self.assertIn('id="param-scale" class="form-control" value=""', html)
         self.assertNotIn("const scale = 0.05;", html)
 
@@ -476,7 +477,10 @@ class EnergyTemplateTests(unittest.TestCase):
         reset_segment = html[html.index("function resetEnergyAssessment()"):html.index("async function handleFile(file)")]
         self.assertLess(reset_segment.index("invalidateEnergyResult();"), reset_segment.index("gotoStep(1);"))
 
-        self.assertLess(recognize_segment.index("invalidateEnergyResult();"), recognize_segment.index("fetch('/energy/ai_recognize'"))
+        self.assertLess(
+            recognize_segment.index("invalidatePdfRecognitionSelection("),
+            recognize_segment.index("fetch('/energy/ai_recognize'"),
+        )
         self.assertLess(calculate_segment.index("invalidateEnergyResult();"), calculate_segment.index("fetch('/energy/ai_simulate'"))
         self.assertNotIn("energyResultData =", calculate_failure)
 
@@ -744,6 +748,21 @@ class EnergyRouteClientTests(unittest.TestCase):
             (Path("annotation_tool") / "static" / "crop_region.js").read_bytes(),
         )
 
+    def test_pdf_recognition_state_helper_is_served_to_the_energy_ui(self):
+        response = self.client.get("/energy/pdf_recognition_state.js")
+        self.addCleanup(response.close)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("javascript", response.mimetype)
+        self.assertEqual(
+            response.get_data(),
+            (
+                Path("annotation_tool")
+                / "static"
+                / "energy_pdf_recognition_state.js"
+            ).read_bytes(),
+        )
+
     def test_ai_recognize_rejects_invalid_crop_region_requests(self):
         from floorplan_page_pipeline import PreparedFloorplanPage
 
@@ -797,6 +816,7 @@ class EnergyRouteClientTests(unittest.TestCase):
             )
             segmenter = MagicMock()
             segmenter.predict.return_value = prediction
+            huge_pixel_value = 10 ** 1000
             cases = [
                 (
                     "crop mode with a raster upload",
@@ -831,12 +851,45 @@ class EnergyRouteClientTests(unittest.TestCase):
                     },
                 ),
                 (
-                    "crop below minimum dimensions",
+                    "crop width below minimum dimensions",
                     {
                         "report_number": "CROP-INVALID",
                         "recognition_mode": "crop_region",
                         "crop_bbox_px": "[100, 50, 227, 350]",
                         "crop_preview_size": "[800, 600]",
+                        "pdf_upload_token": upload_token,
+                        "pdf_page_number": "1",
+                    },
+                ),
+                (
+                    "crop height below minimum dimensions",
+                    {
+                        "report_number": "CROP-INVALID",
+                        "recognition_mode": "crop_region",
+                        "crop_bbox_px": "[100, 50, 500, 177]",
+                        "crop_preview_size": "[800, 600]",
+                        "pdf_upload_token": upload_token,
+                        "pdf_page_number": "1",
+                    },
+                ),
+                (
+                    "crop area below one percent",
+                    {
+                        "report_number": "CROP-INVALID",
+                        "recognition_mode": "crop_region",
+                        "crop_bbox_px": "[100, 50, 228, 178]",
+                        "crop_preview_size": "[2000, 1000]",
+                        "pdf_upload_token": upload_token,
+                        "pdf_page_number": "1",
+                    },
+                ),
+                (
+                    "unreasonably large crop integer",
+                    {
+                        "report_number": "CROP-INVALID",
+                        "recognition_mode": "crop_region",
+                        "crop_bbox_px": f"[0, 0, 128, {huge_pixel_value}]",
+                        "crop_preview_size": f"[128, {huge_pixel_value}]",
                         "pdf_upload_token": upload_token,
                         "pdf_page_number": "1",
                     },
@@ -992,7 +1045,7 @@ class EnergyRouteClientTests(unittest.TestCase):
             "has_vector_geometry": True,
             "has_vector_text": True,
             "structural_mask": {"enabled": True},
-            "nonstructural_mask": {"enabled": False},
+            "nonstructural_mask": {"enabled": True},
             "building_roi": {
                 "enabled": True,
                 "bbox_px": [250, 150, 900, 650],
@@ -1035,12 +1088,25 @@ class EnergyRouteClientTests(unittest.TestCase):
                 "mask": np.zeros((height, width), dtype=np.uint8),
                 "overlay": np.zeros((height, width, 3), dtype=np.uint8),
                 "stats": {},
-                "geometry": {"walls": [], "windows": [], "doors": []},
+                "geometry": {
+                    "walls": [{
+                        "pts": [[20, 30], [780, 30]],
+                        "area": 760.0,
+                        "bbox": [20, 30, 761, 1],
+                    }],
+                    "windows": [],
+                    "doors": [],
+                },
                 "room_topology": {
-                    "status": "no_closed_rooms",
-                    "room_count": 0,
-                    "rooms": [],
-                    "total_area_px2": 0.0,
+                    "status": "closed",
+                    "room_count": 1,
+                    "rooms": [{
+                        "id": "room-crop",
+                        "polygon_px": [[40, 50], [760, 50], [760, 550], [40, 550]],
+                        "area_px2": 360000.0,
+                        "area_m2": None,
+                    }],
+                    "total_area_px2": 360000.0,
                     "total_area_m2": None,
                     "load_geometry_ready": False,
                 },
@@ -1052,6 +1118,13 @@ class EnergyRouteClientTests(unittest.TestCase):
             self.server.app.config["UPLOAD_FOLDER"] = upload_root
             report_dir = Path(upload_root) / "energy" / "CROP-INTEGRATION"
             report_dir.mkdir(parents=True)
+            stale_mask_path = report_dir / "pdf_nonstructural_mask.png"
+            self.assertTrue(
+                cv2.imwrite(
+                    str(stale_mask_path),
+                    np.full((7, 9), 255, dtype=np.uint8),
+                )
+            )
             stored_filename = "building_plan_prepared_test.pdf"
             (report_dir / stored_filename).write_bytes(b"%PDF-1.4")
             upload_token = self.server._make_pdf_upload_token(
@@ -1133,6 +1206,27 @@ class EnergyRouteClientTests(unittest.TestCase):
                 cv2.IMREAD_COLOR,
             )
             self.assertEqual(original.shape[:2], (600, 800))
+            overlay = cv2.imdecode(
+                np.frombuffer(
+                    base64.b64decode(body["images"]["overlay"]),
+                    dtype=np.uint8,
+                ),
+                cv2.IMREAD_COLOR,
+            )
+            self.assertIsNotNone(overlay)
+            self.assertEqual(overlay.shape[:2], (600, 800))
+            self.assertTrue(body["geometry"]["walls"])
+            for x, y in body["geometry"]["walls"][0]["pts"]:
+                self.assertGreaterEqual(x, 0)
+                self.assertLessEqual(x, 800)
+                self.assertGreaterEqual(y, 0)
+                self.assertLessEqual(y, 600)
+            self.assertTrue(body["room_topology"]["rooms"])
+            for x, y in body["room_topology"]["rooms"][0]["polygon_px"]:
+                self.assertGreaterEqual(x, 0)
+                self.assertLessEqual(x, 800)
+                self.assertGreaterEqual(y, 0)
+                self.assertLessEqual(y, 600)
             persisted_original = cv2.imread(
                 str(report_dir / "building_plan_ai.png"),
             )
@@ -1144,6 +1238,19 @@ class EnergyRouteClientTests(unittest.TestCase):
             saved = json.loads(
                 (report_dir / "recognition.json").read_text(encoding="utf-8")
             )
+            saved_nonstructural_mask = cv2.imread(
+                str(stale_mask_path),
+                cv2.IMREAD_GRAYSCALE,
+            )
+            self.assertIsNotNone(saved_nonstructural_mask)
+            self.assertEqual(saved_nonstructural_mask.shape, (600, 800))
+            self.assertEqual(int(np.count_nonzero(saved_nonstructural_mask)), 0)
+            self.assertEqual(
+                saved["artifacts"]["pdf_nonstructural_mask"],
+                "pdf_nonstructural_mask.png",
+            )
+            self.assertTrue(saved["geometry"]["walls"])
+            self.assertTrue(saved["room_topology"]["rooms"])
             expected_region_metadata = {
                 "recognition_mode": "crop_region",
                 "crop_bbox_page_px": [200, 100, 1000, 700],

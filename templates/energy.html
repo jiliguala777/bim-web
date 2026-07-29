@@ -1617,6 +1617,7 @@
     </div>
 
     <script src="/energy/crop_region.js"></script>
+    <script src="/energy/pdf_recognition_state.js"></script>
     <script>
         let currentStep = 1;
         let reportNumber = '';
@@ -1625,12 +1626,17 @@
         let pdfRecognitionMode = 'full_page';
         let pdfCropBBox = null;
         let pdfCropStart = null;
+        let pdfCropBeforeDrag = null;
         let pdfCropDragging = false;
         let pdfPreviewSize = null;
         let pdfUploadSessionId = 0;
         let pdfPreviewRequestId = 0;
         let pdfPrepareAbortController = null;
         let pdfPreviewAbortController = null;
+        const pdfRecognitionRequests =
+            EnergyPdfRecognitionState.createRecognitionRequestState();
+        const scaleCalibrationRequests =
+            EnergyPdfRecognitionState.createSelectionBoundRequestState();
         let calibrationPoints = [];
         let energyResultData = null;
         let chartInstance = null;
@@ -2370,35 +2376,79 @@
         }
 
         async function saveManualScaleCalibration() {
+            if (!hasCurrentAiRecognitionResult()) {
+                alert('当前图纸选择尚无可用识别结果，请先重新识别。');
+                return false;
+            }
             if (calibrationPoints.length !== 2) {
                 alert('请先在原图上选择两个端点。');
-                return;
+                return false;
             }
             const actualLength = parseFloat(document.getElementById('manual-scale-length').value);
             if (!Number.isFinite(actualLength) || actualLength <= 0) {
                 alert('请输入有效的实际长度。');
-                return;
+                return false;
             }
-            const response = await fetch('/energy/scale_calibration', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    report_number: reportNumber,
-                    point_a: calibrationPoints[0],
-                    point_b: calibrationPoints[1],
-                    actual_length: actualLength,
-                    unit: document.getElementById('manual-scale-unit').value
-                })
-            });
-            const data = await response.json();
-            if (!response.ok || data.error) {
-                alert('比例尺标定失败：' + (data.error || response.statusText));
-                return;
+            const calibrationSelection = currentPdfRecognitionSelection();
+            const requestController = new AbortController();
+            const calibrationRequest = scaleCalibrationRequests.begin(
+                calibrationSelection,
+                requestController
+            );
+
+            try {
+                const response = await fetch('/energy/scale_calibration', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        report_number: reportNumber,
+                        point_a: calibrationPoints[0],
+                        point_b: calibrationPoints[1],
+                        actual_length: actualLength,
+                        unit: document.getElementById('manual-scale-unit').value
+                    }),
+                    signal: requestController.signal
+                });
+                const data = await response.json();
+                const currentSelection = currentPdfRecognitionSelection();
+                if (
+                    !scaleCalibrationRequests.canCommit(
+                        calibrationRequest,
+                        currentSelection
+                    )
+                    || !pdfRecognitionRequests.hasAccepted(
+                        calibrationRequest.fingerprint
+                    )
+                ) {
+                    return false;
+                }
+                if (!response.ok || data.error) {
+                    throw new Error(data.error || response.statusText);
+                }
+
+                aiResultData.scale_calibration = data.scale_calibration;
+                aiResultData.room_topology = data.room_topology;
+                document.getElementById('scale-calibration-canvas').style.pointerEvents = 'none';
+                applyScaleCalibrationResult(data.scale_calibration, data.room_topology);
+                return true;
+            } catch (error) {
+                if (
+                    error.name === 'AbortError'
+                    || !scaleCalibrationRequests.canCommit(
+                        calibrationRequest,
+                        currentPdfRecognitionSelection()
+                    )
+                ) {
+                    return false;
+                }
+                alert('比例尺标定失败：' + error.message);
+                return false;
+            } finally {
+                scaleCalibrationRequests.finish(
+                    calibrationRequest,
+                    currentPdfRecognitionSelection()
+                );
             }
-            aiResultData.scale_calibration = data.scale_calibration;
-            aiResultData.room_topology = data.room_topology;
-            document.getElementById('scale-calibration-canvas').style.pointerEvents = 'none';
-            applyScaleCalibrationResult(data.scale_calibration, data.room_topology);
         }
 
         // 比例尺变化时，更新实际物理长度
@@ -2462,6 +2512,88 @@
             gotoStep(1);
         }
 
+        function currentPdfRecognitionSelection() {
+            return EnergyPdfRecognitionState.createSelectionFingerprint({
+                uploadSessionId: pdfUploadSessionId,
+                uploadToken: preparedPdf?.uploadToken || null,
+                pageNumber: preparedPdf
+                    ? document.getElementById('pdf-page-select').value
+                    : null,
+                mode: preparedPdf ? pdfRecognitionMode : 'full_page',
+                cropBBox: preparedPdf ? pdfCropBBox : null,
+                previewSize: preparedPdf ? pdfPreviewSize : null
+            });
+        }
+
+        function hasCurrentAiRecognitionResult() {
+            return Boolean(
+                aiResultData
+                && pdfRecognitionRequests.hasAccepted(
+                    currentPdfRecognitionSelection()
+                )
+            );
+        }
+
+        function clearPdfRecognitionDerivedState() {
+            const derivedState = {
+                aiResultData,
+                energyResultData,
+                calibrationPoints
+            };
+            EnergyPdfRecognitionState.invalidateDerivedRecognitionState(
+                derivedState,
+                {
+                    results: document.getElementById('aiRecognitionResults'),
+                    originalImage: document.getElementById('imgOriginal'),
+                    overlayImage: document.getElementById('imgOverlay'),
+                    scaleInput: document.getElementById('param-scale'),
+                    areaInput: document.getElementById('param-floor-area'),
+                    wallLengthInput: document.getElementById('param-wall-length'),
+                    windowLengthInput: document.getElementById('param-window-length'),
+                    calculateButton: document.getElementById('calculate-energy-button'),
+                    calibrationPanel: document.getElementById('scale-calibration-panel'),
+                    calibrationStatus: document.getElementById('scale-calibration-status'),
+                    calibrationCanvas: document.getElementById('scale-calibration-canvas'),
+                    closureSummary: document.getElementById('room-closure-summary')
+                }
+            );
+            aiResultData = derivedState.aiResultData;
+            energyResultData = derivedState.energyResultData;
+            calibrationPoints = derivedState.calibrationPoints;
+        }
+
+        function invalidatePdfRecognitionSelection({ returnToUpload = true } = {}) {
+            const invalidation = pdfRecognitionRequests.invalidate();
+            scaleCalibrationRequests.invalidate();
+            clearPdfRecognitionDerivedState();
+            if (invalidation.hideLoader) {
+                hideLoader();
+            }
+            if (returnToUpload && currentStep > 1) {
+                gotoStep(1);
+            }
+            updatePdfRecognitionControls();
+            return invalidation;
+        }
+
+        function replacePdfCropBBox(nextBBox) {
+            const normalizedBBox = Array.isArray(nextBBox)
+                ? nextBBox.slice()
+                : null;
+            const currentSelection = currentPdfRecognitionSelection();
+            const nextSelection = {
+                ...currentSelection,
+                cropBBox: normalizedBBox
+            };
+            if (!EnergyPdfRecognitionState.fingerprintsEqual(
+                currentSelection,
+                EnergyPdfRecognitionState.createSelectionFingerprint(nextSelection)
+            )) {
+                invalidatePdfRecognitionSelection();
+            }
+            pdfCropBBox = normalizedBBox;
+        }
+
         function toggleOtherDesignParams() {
             const panel = document.getElementById('other-design-params-panel');
             panel.style.display = panel.style.display === 'none' || !panel.style.display ? 'block' : 'none';
@@ -2484,20 +2616,26 @@
             uploadWrapper.addEventListener('drop', (e) => {
                 e.preventDefault();
                 uploadWrapper.style.borderColor = 'rgba(255, 255, 255, 0.15)';
+                if (pdfRecognitionRequests.isInFlight()) return;
                 if (e.dataTransfer.files.length > 0) {
                     handleFile(e.dataTransfer.files[0]);
                 }
             });
 
             fileInput.addEventListener('change', () => {
+                if (pdfRecognitionRequests.isInFlight()) return;
                 if (fileInput.files.length > 0) {
                     handleFile(fileInput.files[0]);
                 }
             });
 
             document.getElementById('recognize-selected-page').addEventListener('click', recognizePreparedPdf);
-            document.getElementById('reload-pdf-preview').addEventListener('click', loadPreparedPdfPreview);
+            document.getElementById('reload-pdf-preview').addEventListener('click', async () => {
+                invalidatePdfRecognitionSelection();
+                await loadPreparedPdfPreview();
+            });
             document.getElementById('pdf-page-select').addEventListener('change', async () => {
+                invalidatePdfRecognitionSelection();
                 clearPreparedPdfPreview();
                 await loadPreparedPdfPreview();
             });
@@ -2514,40 +2652,44 @@
                 if (
                     pdfRecognitionMode !== 'crop_region'
                     || !pdfPreviewSize
+                    || pdfRecognitionRequests.isInFlight()
                     || event.button !== 0
                 ) return;
                 event.preventDefault();
+                pdfCropBeforeDrag =
+                    AnnotationCropRegion.restoreInterruptedCrop(pdfCropBBox);
                 pdfCropDragging = true;
                 pdfCropStart = pdfPreviewPoint(event);
-                pdfCropBBox = AnnotationCropRegion.normalizeCrop(
+                replacePdfCropBBox(AnnotationCropRegion.normalizeCrop(
                     pdfCropStart,
                     pdfCropStart,
                     previewImage.naturalWidth,
                     previewImage.naturalHeight
-                );
+                ));
                 previewImage.setPointerCapture(event.pointerId);
                 updatePdfCropOverlay();
             });
             previewImage.addEventListener('pointermove', (event) => {
                 if (!pdfCropDragging) return;
-                pdfCropBBox = AnnotationCropRegion.normalizeCrop(
+                replacePdfCropBBox(AnnotationCropRegion.normalizeCrop(
                     pdfCropStart,
                     pdfPreviewPoint(event),
                     previewImage.naturalWidth,
                     previewImage.naturalHeight
-                );
+                ));
                 updatePdfCropOverlay();
             });
             previewImage.addEventListener('pointerup', (event) => {
                 if (!pdfCropDragging) return;
-                pdfCropBBox = AnnotationCropRegion.normalizeCrop(
+                replacePdfCropBBox(AnnotationCropRegion.normalizeCrop(
                     pdfCropStart,
                     pdfPreviewPoint(event),
                     previewImage.naturalWidth,
                     previewImage.naturalHeight
-                );
+                ));
                 pdfCropDragging = false;
                 pdfCropStart = null;
+                pdfCropBeforeDrag = null;
                 if (previewImage.hasPointerCapture(event.pointerId)) {
                     previewImage.releasePointerCapture(event.pointerId);
                 }
@@ -2555,8 +2697,12 @@
             });
             previewImage.addEventListener('pointercancel', (event) => {
                 if (!pdfCropDragging) return;
+                const restoredBBox =
+                    AnnotationCropRegion.restoreInterruptedCrop(pdfCropBeforeDrag);
                 pdfCropDragging = false;
                 pdfCropStart = null;
+                pdfCropBeforeDrag = null;
+                replacePdfCropBBox(restoredBBox);
                 if (previewImage.hasPointerCapture(event.pointerId)) {
                     previewImage.releasePointerCapture(event.pointerId);
                 }
@@ -2566,8 +2712,7 @@
         }
 
         async function handleFile(file) {
-            invalidateEnergyResult();
-            advancePdfUploadSession();
+            invalidatePdfRecognitionSelection();
             resetPreparedPdfSelection();
             const isPdf = file.type === 'application/pdf' || file.name.toLowerCase().endsWith('.pdf');
             if (isPdf) {
@@ -2651,20 +2796,46 @@
                     previewImage.naturalHeight
                 )
             );
+            const canRecognize = Boolean(
+                preparedPdf
+                && pdfPreviewSize
+                && (pdfRecognitionMode !== 'crop_region' || cropValid)
+            );
+            const disabled = EnergyPdfRecognitionState.deriveControlDisabledState({
+                inFlight: pdfRecognitionRequests.isInFlight(),
+                selectionBusy: Boolean(
+                    pdfPrepareAbortController || pdfPreviewAbortController
+                ),
+                canRecognize,
+                hasCrop: Boolean(pdfCropBBox)
+            });
             recognizeButton.innerText = pdfRecognitionMode === 'crop_region'
                 ? '开始识别所选区域'
                 : '开始识别整页';
-            recognizeButton.disabled = (
-                !preparedPdf
-                || !pdfPreviewSize
-                || (pdfRecognitionMode === 'crop_region' && !cropValid)
+            recognizeButton.disabled = disabled.recognize;
+            document.getElementById('rasterFileInput').disabled = disabled.upload;
+            document.getElementById('pdf-page-select').disabled =
+                disabled.page || !preparedPdf;
+            document.getElementById('reload-pdf-preview').disabled =
+                disabled.reload || !preparedPdf;
+            document.getElementById('pdf-recognition-mode-full').disabled =
+                disabled.mode || !preparedPdf;
+            document.getElementById('pdf-recognition-mode-crop').disabled =
+                disabled.mode || !preparedPdf;
+            document.getElementById('clear-pdf-crop').disabled =
+                disabled.clearCrop;
+            previewImage.style.pointerEvents = disabled.crop ? 'none' : 'auto';
+            document.getElementById('uploadWrapper').setAttribute(
+                'aria-disabled',
+                disabled.upload ? 'true' : 'false'
             );
-            document.getElementById('clear-pdf-crop').disabled = !pdfCropBBox;
         }
 
         function resetPdfCropSelection() {
+            invalidatePdfRecognitionSelection();
             pdfCropBBox = null;
             pdfCropStart = null;
+            pdfCropBeforeDrag = null;
             pdfCropDragging = false;
             const overlay = document.getElementById('pdf-crop-overlay');
             overlay.classList.add('hidden');
@@ -2685,7 +2856,11 @@
         }
 
         function setPdfRecognitionMode(mode) {
-            pdfRecognitionMode = mode === 'crop_region' ? 'crop_region' : 'full_page';
+            const nextMode = mode === 'crop_region' ? 'crop_region' : 'full_page';
+            if (nextMode !== pdfRecognitionMode) {
+                invalidatePdfRecognitionSelection();
+            }
+            pdfRecognitionMode = nextMode;
             document.getElementById('pdf-recognition-mode-full').checked =
                 pdfRecognitionMode === 'full_page';
             document.getElementById('pdf-recognition-mode-crop').checked =
@@ -2756,6 +2931,7 @@
             };
             const requestController = new AbortController();
             pdfPreviewAbortController = requestController;
+            updatePdfRecognitionControls();
             const fd = new FormData();
             fd.append('report_number', reportNumber);
             fd.append('pdf_upload_token', previewRequest.uploadToken);
@@ -2797,6 +2973,7 @@
                 if (pdfPreviewAbortController === requestController) {
                     pdfPreviewAbortController = null;
                     hideLoader();
+                    updatePdfRecognitionControls();
                 }
             }
         }
@@ -2817,6 +2994,7 @@
             updateReportNumberFromInput();
             const requestController = new AbortController();
             pdfPrepareAbortController = requestController;
+            updatePdfRecognitionControls();
             const fd = new FormData();
             fd.append('raster_file', file);
             fd.append('report_number', reportNumber);
@@ -2874,12 +3052,17 @@
                 if (pdfPrepareAbortController === requestController) {
                     pdfPrepareAbortController = null;
                     hideLoader();
+                    updatePdfRecognitionControls();
                 }
             }
         }
 
         async function recognizePreparedPdf() {
-            if (!preparedPdf) return;
+            if (
+                !preparedPdf
+                || pdfPrepareAbortController
+                || pdfPreviewAbortController
+            ) return false;
             const button = document.getElementById('recognize-selected-page');
             button.disabled = true;
             try {
@@ -2891,6 +3074,11 @@
 
         // 发送图片或已暂存 PDF 的指定页到后台进行 AI 构件分割
         async function submitRecognition(file = null) {
+            if (
+                (!file && !preparedPdf)
+                || pdfPrepareAbortController
+                || pdfPreviewAbortController
+            ) return false;
             const fd = new FormData();
             if (file) {
                 fd.append('raster_file', file);
@@ -2919,17 +3107,43 @@
             fd.append('preprocessing', 'auto');
             updateReportNumberFromInput();
             fd.append('report_number', reportNumber);
-            
+
+            const recognitionSelection = currentPdfRecognitionSelection();
+            invalidatePdfRecognitionSelection({ returnToUpload: false });
+            const requestController = new AbortController();
+            const requestStart = pdfRecognitionRequests.begin(
+                recognitionSelection,
+                requestController
+            );
+            const recognitionRequest = requestStart.request;
+            if (requestStart.hideLoader) {
+                hideLoader();
+            }
             showLoader("ONNX 引擎正在提取空间构件 (红墙/蓝窗/绿门)...");
+            updatePdfRecognitionControls();
 
             try {
                 const response = await fetch('/energy/ai_recognize', {
                     method: 'POST',
-                    body: fd
+                    body: fd,
+                    signal: requestController.signal
                 });
                 const data = await response.json();
-                if (data.error) {
-                    throw new Error(data.error);
+                const currentSelection = currentPdfRecognitionSelection();
+                if (!pdfRecognitionRequests.canCommit(
+                    recognitionRequest,
+                    currentSelection
+                )) {
+                    return false;
+                }
+                if (!response.ok || data.error) {
+                    throw new Error(data.error || response.statusText);
+                }
+                if (!pdfRecognitionRequests.accept(
+                    recognitionRequest,
+                    currentSelection
+                )) {
+                    return false;
                 }
 
                 aiResultData = data;
@@ -2964,11 +3178,29 @@
                 applyScaleCalibrationResult(data.scale_calibration, data.room_topology);
                 gotoStep(2);
                 requestAnimationFrame(() => resizeScaleCalibrationCanvas());
+                return true;
 
             } catch (error) {
+                if (
+                    error.name === 'AbortError'
+                    || !pdfRecognitionRequests.canCommit(
+                        recognitionRequest,
+                        currentPdfRecognitionSelection()
+                    )
+                ) {
+                    return false;
+                }
                 alert("识别图纸失败: " + error.message);
+                return false;
             } finally {
-                hideLoader();
+                const completion = pdfRecognitionRequests.finish(
+                    recognitionRequest,
+                    currentPdfRecognitionSelection()
+                );
+                if (completion.hideLoader) {
+                    hideLoader();
+                }
+                updatePdfRecognitionControls();
             }
         }
 
@@ -3058,7 +3290,7 @@
 
         async function calculateEnergy() {
             invalidateEnergyResult();
-            if (!aiResultData?.room_topology?.load_geometry_ready) {
+            if (!aiResultData?.room_topology?.load_geometry_ready || !hasCurrentAiRecognitionResult()) {
                 alert('房间尚未闭合或比例尺尚未确认，暂时不能进行负荷计算。');
                 return;
             }

@@ -37,6 +37,30 @@ class CropRegionValidationTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             parse_crop_region_request("crop_region", "[100, NaN, 500, 350]", "[800, 600]")
 
+    def test_rejects_boolean_coordinates(self):
+        with self.assertRaises(ValueError):
+            parse_crop_region_request(
+                "crop_region",
+                "[100, false, 500, 350]",
+                "[800, 600]",
+            )
+
+    def test_rejects_unreasonably_large_pixel_values_without_overflow(self):
+        huge_pixel_value = 10 ** 1000
+
+        with self.assertRaises(ValueError):
+            parse_crop_region_request(
+                "crop_region",
+                f"[0, 0, 128, {huge_pixel_value}]",
+                f"[128, {huge_pixel_value}]",
+            )
+        with self.assertRaises(ValueError):
+            map_crop_bbox_to_page(
+                [0, 0, 128, huge_pixel_value],
+                [128, huge_pixel_value],
+                [1600, 1200],
+            )
+
     def test_rejects_crop_coordinates_outside_preview(self):
         with self.assertRaises(ValueError):
             parse_crop_region_request("crop_region", "[100, 50, 801, 350]", "[800, 600]")

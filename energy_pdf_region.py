@@ -5,6 +5,9 @@ import numpy as np
 from pdf2image import convert_from_path
 
 
+MAX_PIXEL_VALUE = 10_000_000
+
+
 def render_pdf_page_preview(pdf_path, page_number, page_count, poppler_path):
     if not 1 <= page_number <= page_count:
         raise ValueError("page_number must be within the document")
@@ -23,15 +26,24 @@ def render_pdf_page_preview(pdf_path, page_number, page_count, poppler_path):
 def _parse_numeric_array(raw, *, length, field_name):
     try:
         value = json.loads(raw)
-    except (TypeError, json.JSONDecodeError) as exc:
+    except (TypeError, ValueError) as exc:
         raise ValueError(f"{field_name} must be a JSON array") from exc
     if not isinstance(value, list) or len(value) != length:
         raise ValueError(f"{field_name} must be a JSON array of {length} values")
-    if any(isinstance(item, bool) or not isinstance(item, (int, float)) for item in value):
-        raise ValueError(f"{field_name} values must be numbers")
-    if not all(math.isfinite(item) for item in value):
-        raise ValueError(f"{field_name} values must be finite")
+    _validate_pixel_values(value, field_name=field_name)
     return value
+
+
+def _validate_pixel_values(values, *, field_name):
+    for value in values:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f"{field_name} values must be numbers")
+        if isinstance(value, float) and not math.isfinite(value):
+            raise ValueError(f"{field_name} values must be finite")
+        if abs(value) > MAX_PIXEL_VALUE:
+            raise ValueError(
+                f"{field_name} values must not exceed {MAX_PIXEL_VALUE} pixels"
+            )
 
 
 def parse_crop_region_request(mode_raw, bbox_raw, preview_size_raw):
@@ -52,7 +64,11 @@ def parse_crop_region_request(mode_raw, bbox_raw, preview_size_raw):
     crop_height = bottom - top
     if crop_width < 128 or crop_height < 128:
         raise ValueError("crop_bbox_px dimensions must be at least 128 pixels")
-    if crop_width * crop_height < preview_width * preview_height * 0.01:
+    crop_area_share = (
+        (crop_width / preview_width)
+        * (crop_height / preview_height)
+    )
+    if crop_area_share < 0.01:
         raise ValueError("crop_bbox_px area must be at least 1% of preview")
     return {
         "mode": "crop_region",
@@ -78,18 +94,21 @@ def map_crop_bbox_to_page(crop_bbox_px, crop_preview_size, page_size):
         page_width,
         page_height,
     ]
-    if any(isinstance(value, bool) or not isinstance(value, (int, float)) for value in values):
-        raise ValueError("crop and image sizes must be numbers")
-    if not all(math.isfinite(value) for value in values):
-        raise ValueError("crop and image sizes must be finite")
+    _validate_pixel_values(values, field_name="crop and image sizes")
     if preview_width <= 0 or preview_height <= 0 or page_width <= 0 or page_height <= 0:
         raise ValueError("image sizes must be positive")
     if not (0 <= left < right <= preview_width and 0 <= top < bottom <= preview_height):
         raise ValueError("crop_bbox_px must be within preview bounds")
-    mapped_left = max(0, math.floor(left * page_width / preview_width))
-    mapped_top = max(0, math.floor(top * page_height / preview_height))
-    mapped_right = min(page_width, math.ceil(right * page_width / preview_width))
-    mapped_bottom = min(page_height, math.ceil(bottom * page_height / preview_height))
+    mapped_left = max(0, math.floor((left / preview_width) * page_width))
+    mapped_top = max(0, math.floor((top / preview_height) * page_height))
+    mapped_right = min(
+        page_width,
+        math.ceil((right / preview_width) * page_width),
+    )
+    mapped_bottom = min(
+        page_height,
+        math.ceil((bottom / preview_height) * page_height),
+    )
     if mapped_left >= mapped_right or mapped_top >= mapped_bottom:
         raise ValueError("mapped crop_bbox_px must have positive dimensions")
     return [mapped_left, mapped_top, mapped_right, mapped_bottom]

@@ -1555,6 +1555,17 @@ def energy_crop_region_helper():
     )
 
 
+@app.route('/energy/pdf_recognition_state.js', methods=['GET'])
+@login_required
+def energy_pdf_recognition_state_helper():
+    """Serve the PDF recognition request-state helper."""
+    return send_from_directory(
+        os.path.join(BASE_DIR, 'annotation_tool', 'static'),
+        'energy_pdf_recognition_state.js',
+        mimetype='application/javascript',
+    )
+
+
 @app.route('/energy/ai_recognize', methods=['POST'])
 @login_required
 def ai_recognize():
@@ -1725,12 +1736,19 @@ def ai_recognize():
             and prepared_page.vector_cleanup.get('has_vector_geometry')
         )
 
+        if (
+            prepared_page is not None
+            and (
+                np.any(combined_cleanup_mask)
+                or vector_cleanup.get('nonstructural_mask', {}).get('enabled')
+            )
+        ):
+            _write_image(
+                Path(target_dir) / 'pdf_nonstructural_mask.png',
+                combined_cleanup_mask,
+            )
+
         if prepared_page is not None and has_vector_geometry:
-            if np.any(combined_cleanup_mask):
-                _write_image(
-                    Path(target_dir) / 'pdf_nonstructural_mask.png',
-                    combined_cleanup_mask,
-                )
             if (
                 structural_support_mask is not None
                 and vector_cleanup.get('structural_mask', {}).get('enabled')

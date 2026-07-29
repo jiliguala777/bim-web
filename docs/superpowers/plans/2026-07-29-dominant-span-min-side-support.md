@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Reject `dominant_span_rectangle` repairs when any one of the four rectangle sides has less than 15% model support, while preserving valid rectangle and short-gap repairs.
+**Goal:** Reject weakly supported `dominant_span_rectangle` repairs and skip all exterior repair when the original model mask already contains a credible major closed area.
 
-**Architecture:** Keep the change local to candidate generation in `floorplan_topology_repair.py`. Compute named per-side support dictionaries from the existing top, bottom, left, and right profiles, apply fixed minimum gates before scoring, and retain the current average fields for backward compatibility.
+**Architecture:** Keep both decisions inside `floorplan_topology_repair.py`. Candidate generation applies fixed per-side support gates; the repair entry point computes an `already_closed` decision from the original topology before starting exterior searches, while preserving internal-fragment handling and existing diagnostic compatibility.
 
 **Tech Stack:** Python 3.12, NumPy, OpenCV, `unittest`, project `.venv`.
 
@@ -12,6 +12,8 @@
 
 - Apply the 15% minimum independently to top, bottom, left, and right model support.
 - Keep the existing 60% independent minimum for PDF vector support.
+- Treat the original mask as `already_closed` only when total closed area is at least 20% of ROI area and the largest room is at least 8% of ROI area.
+- An `already_closed` result must skip both `dominant_span_rectangle` and `multi_gap_solution`.
 - Preserve the existing average `vector_support_ratio` and `model_support_ratio` diagnostic fields.
 - Add named per-side diagnostics without changing callers.
 - Do not change short-gap, internal U-shape, model inference, training data, or energy calculation logic.
@@ -192,7 +194,187 @@ git commit -m "fix: require model support on every rectangle side"
 
 ---
 
-### Task 3: Verify the real cultural-palace sample and regression suite
+### Task 3: Short-circuit exterior repair for a credible original closure
+
+**Files:**
+- Modify: `floorplan_topology_repair.py`
+- Modify: `tests/test_floorplan_topology_repair.py`
+- Test: `tests/test_floorplan_topology_repair.py`
+
+**Interfaces:**
+- Consumes: `_room_topology(mask, min_room_area_px) -> dict` and normalized `roi: list[int]`.
+- Produces: `_initial_topology_is_already_closed(topology: dict, roi: list[int]) -> dict`; the returned dictionary contains `is_already_closed`, `roi_area_px2`, `total_closed_area_px2`, `largest_room_area_px2`, `minimum_total_closed_area_px2`, and `minimum_largest_room_area_px2`.
+
+- [ ] **Step 1: Write the failing already-closed regression**
+
+Add after `test_uses_four_long_span_lines_for_fragmented_room_perimeter`:
+
+```python
+def test_skips_exterior_repair_when_major_area_is_already_closed(self):
+    mask = np.zeros((140, 180), dtype=np.uint8)
+    support = np.zeros_like(mask)
+    cv2.rectangle(mask, (30, 20), (150, 120), 1, 3)
+    cv2.rectangle(support, (15, 15), (165, 125), 255, 1)
+
+    result = repair_vector_floorplan_topology(
+        mask,
+        building_roi=[10, 10, 170, 130],
+        structural_support_mask=support,
+        max_exterior_gap_px=16,
+        max_internal_component_area_px=500,
+        min_room_area_px=500,
+    )
+
+    repair = result["exterior_repair"]
+    self.assertEqual(repair["status"], "not_needed")
+    self.assertEqual(repair["reason"], "already_closed")
+    self.assertEqual(repair["accepted_lines_px"], [])
+    self.assertEqual(result["closure_status"], "complete")
+    self.assertFalse(result["manual_exterior_wall_required"])
+    self.assertTrue(repair["initial_closure"]["is_already_closed"])
+```
+
+- [ ] **Step 2: Run the new regression and confirm it fails**
+
+Run:
+
+```powershell
+.\.venv\Scripts\python.exe -m unittest `
+  tests.test_floorplan_topology_repair.ConservativeTopologyRepairTests.test_skips_exterior_repair_when_major_area_is_already_closed `
+  -v
+```
+
+Expected: `FAIL` because the current implementation reports a repair outcome instead of `reason == "already_closed"`.
+
+- [ ] **Step 3: Define the closure thresholds and helper**
+
+Add near the existing dominant-span constants:
+
+```python
+ALREADY_CLOSED_MIN_TOTAL_ROI_FRACTION = 0.20
+ALREADY_CLOSED_MIN_LARGEST_ROOM_ROI_FRACTION = 0.08
+```
+
+Add:
+
+```python
+def _initial_topology_is_already_closed(
+    topology: dict,
+    roi: list[int],
+) -> dict:
+    roi_area = float((roi[2] - roi[0]) * (roi[3] - roi[1]))
+    room_areas = [
+        float(room.get("area_px2") or 0.0)
+        for room in topology.get("rooms", [])
+    ]
+    total_area = float(sum(room_areas))
+    largest_area = max(room_areas, default=0.0)
+    minimum_total = roi_area * ALREADY_CLOSED_MIN_TOTAL_ROI_FRACTION
+    minimum_largest = (
+        roi_area * ALREADY_CLOSED_MIN_LARGEST_ROOM_ROI_FRACTION
+    )
+    return {
+        "is_already_closed": bool(
+            total_area >= minimum_total
+            and largest_area >= minimum_largest
+        ),
+        "roi_area_px2": round(roi_area, 1),
+        "total_closed_area_px2": round(total_area, 1),
+        "largest_room_area_px2": round(largest_area, 1),
+        "minimum_total_closed_area_px2": round(minimum_total, 1),
+        "minimum_largest_room_area_px2": round(minimum_largest, 1),
+    }
+```
+
+- [ ] **Step 4: Bypass only the exterior search when already closed**
+
+Keep the existing early return for missing ROI or support. Immediately after
+`limits = _multi_gap_limits(...)` is computed, add:
+
+```python
+initial_closure = _initial_topology_is_already_closed(
+    initial_topology,
+    roi,
+)
+already_closed = initial_closure["is_already_closed"]
+```
+
+Initialize `exterior_candidates`, `accepted_candidates`, and `span_rectangle`, then run `_search_dominant_span_rectangle` and `_search_multi_gap_solution` only inside:
+
+```python
+if not already_closed:
+    ...
+```
+
+Before the existing `span_rectangle is not None` diagnostics branch, add:
+
+```python
+if already_closed:
+    diagnostics["exterior_repair"] = {
+        "status": "not_needed",
+        "candidate_count": 0,
+        "accepted_line_px": None,
+        "accepted_lines_px": [],
+        "accepted_candidates": [],
+        "round_count": 0,
+        "limits": limits,
+        "reason": "already_closed",
+        "initial_closure": initial_closure,
+    }
+```
+
+Change the following `if span_rectangle is not None` to `elif`.
+
+- [ ] **Step 5: Preserve complete status at the final gate**
+
+At final closure classification, evaluate `already_closed` first:
+
+```python
+if already_closed:
+    closure_status = "complete"
+elif int(final_topology.get("room_count") or 0) <= 0:
+    closure_status = "failed"
+elif closed_area_gain >= major_closure_threshold:
+    closure_status = "complete"
+else:
+    closure_status = "partial"
+```
+
+The existing `closure_status != "complete"` manual-review block remains unchanged.
+
+- [ ] **Step 6: Verify the positive and existing negative cases**
+
+Run:
+
+```powershell
+.\.venv\Scripts\python.exe -m unittest `
+  tests.test_floorplan_topology_repair.ConservativeTopologyRepairTests.test_skips_exterior_repair_when_major_area_is_already_closed `
+  tests.test_floorplan_topology_repair.ConservativeTopologyRepairTests.test_reports_partial_when_only_existing_small_room_is_closed `
+  -v
+```
+
+Expected: both tests pass.
+
+- [ ] **Step 7: Run the complete topology-repair module**
+
+Run:
+
+```powershell
+.\.venv\Scripts\python.exe -m unittest tests.test_floorplan_topology_repair -v
+```
+
+Expected: all tests pass.
+
+- [ ] **Step 8: Commit**
+
+```powershell
+git add -- floorplan_topology_repair.py tests/test_floorplan_topology_repair.py
+git commit -m "fix: skip exterior repair for already closed plans"
+```
+
+---
+
+### Task 4: Verify the real cultural-palace sample and regression suite
 
 **Files:**
 - Read: `uploads/energy/BIM-20260729-2163/ai_raw_model_mask.png`
@@ -221,13 +403,15 @@ max_internal_component_area_px=1162
 min_room_area_px=1549.3536
 ```
 
-5. Prints `exterior_repair`, `closure_status`, and whether the returned wall mask contains a complete vertical line at `x=390, y=1058:2341`.
+5. Measures elapsed repair time.
+6. Prints `exterior_repair`, `closure_status`, and whether the returned wall mask contains a complete vertical line at `x=390, y=1058:2341`.
 
 Expected:
 
-- `exterior_repair.reason` is not `dominant_span_rectangle` for the false rectangle;
+- `exterior_repair.reason == "already_closed"`;
 - no complete added wall line exists at `x=390, y=1058:2341`;
 - no accepted candidate has `bbox_px == [390, 1058, 314, 1282]`.
+- elapsed repair time is below 10 seconds on the current local machine.
 
 - [ ] **Step 2: Run adjacent room and platform regression tests**
 

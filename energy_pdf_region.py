@@ -62,11 +62,30 @@ def parse_crop_region_request(mode_raw, bbox_raw, preview_size_raw):
 
 
 def map_crop_bbox_to_page(crop_bbox_px, crop_preview_size, page_size):
-    left, top, right, bottom = crop_bbox_px
-    preview_width, preview_height = crop_preview_size
-    page_width, page_height = page_size
+    try:
+        left, top, right, bottom = crop_bbox_px
+        preview_width, preview_height = crop_preview_size
+        page_width, page_height = page_size
+    except (TypeError, ValueError) as exc:
+        raise ValueError("crop and image sizes must have the required values") from exc
+    values = [
+        left,
+        top,
+        right,
+        bottom,
+        preview_width,
+        preview_height,
+        page_width,
+        page_height,
+    ]
+    if any(isinstance(value, bool) or not isinstance(value, (int, float)) for value in values):
+        raise ValueError("crop and image sizes must be numbers")
+    if not all(math.isfinite(value) for value in values):
+        raise ValueError("crop and image sizes must be finite")
     if preview_width <= 0 or preview_height <= 0 or page_width <= 0 or page_height <= 0:
         raise ValueError("image sizes must be positive")
+    if not (0 <= left < right <= preview_width and 0 <= top < bottom <= preview_height):
+        raise ValueError("crop_bbox_px must be within preview bounds")
     mapped_left = max(0, math.floor(left * page_width / preview_width))
     mapped_top = max(0, math.floor(top * page_height / preview_height))
     mapped_right = min(page_width, math.ceil(right * page_width / preview_width))

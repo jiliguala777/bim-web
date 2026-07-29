@@ -45,6 +45,10 @@ class CropRegionValidationTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             parse_crop_region_request("crop_region", "[100, 50, 227, 350]", "[800, 600]")
 
+    def test_rejects_crop_height_below_128_pixels(self):
+        with self.assertRaises(ValueError):
+            parse_crop_region_request("crop_region", "[100, 50, 500, 177]", "[800, 600]")
+
     def test_rejects_crop_area_below_one_percent_of_preview(self):
         with self.assertRaises(ValueError):
             parse_crop_region_request("crop_region", "[100, 50, 228, 178]", "[2000, 1000]")
@@ -52,6 +56,20 @@ class CropRegionValidationTests(unittest.TestCase):
     def test_rejects_unknown_mode(self):
         with self.assertRaises(ValueError):
             parse_crop_region_request("invalid", None, None)
+
+    def test_mapping_rejects_crop_coordinates_outside_preview(self):
+        with self.assertRaises(ValueError):
+            map_crop_bbox_to_page([-1, 50, 500, 350], [800, 600], [1600, 1200])
+        with self.assertRaises(ValueError):
+            map_crop_bbox_to_page([100, 50, 801, 350], [800, 600], [1600, 1200])
+
+    def test_mapping_rejects_reversed_crop_coordinates(self):
+        with self.assertRaises(ValueError):
+            map_crop_bbox_to_page([500, 50, 100, 350], [800, 600], [1600, 1200])
+
+    def test_mapping_rejects_non_finite_crop_coordinates(self):
+        with self.assertRaises(ValueError):
+            map_crop_bbox_to_page([100, float("nan"), 500, 350], [800, 600], [1600, 1200])
 
     def test_full_page_accepts_missing_crop_fields(self):
         request_data = parse_crop_region_request("full_page", None, None)

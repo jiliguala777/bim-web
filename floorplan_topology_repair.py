@@ -12,6 +12,8 @@ from floorplan_rooms import extract_room_topology
 
 DOMINANT_SPAN_MIN_VECTOR_SIDE_SUPPORT = 0.60
 DOMINANT_SPAN_MIN_MODEL_SIDE_SUPPORT = 0.15
+ALREADY_CLOSED_MIN_TOTAL_ROI_FRACTION = 0.20
+ALREADY_CLOSED_MIN_LARGEST_ROOM_ROI_FRACTION = 0.08
 
 
 def _normalize_roi(roi, width: int, height: int) -> list[int] | None:
@@ -35,6 +37,31 @@ def _room_topology(mask: np.ndarray, min_room_area_px: float) -> dict:
 
 def _room_areas(topology: dict) -> list[float]:
     return sorted(float(room["area_px2"]) for room in topology.get("rooms", []))
+
+
+def _initial_topology_is_already_closed(
+    topology: dict,
+    roi: list[int],
+) -> dict:
+    roi_area = float((roi[2] - roi[0]) * (roi[3] - roi[1]))
+    room_areas = _room_areas(topology)
+    total_area = float(sum(room_areas))
+    largest_area = max(room_areas, default=0.0)
+    minimum_total = roi_area * ALREADY_CLOSED_MIN_TOTAL_ROI_FRACTION
+    minimum_largest = (
+        roi_area * ALREADY_CLOSED_MIN_LARGEST_ROOM_ROI_FRACTION
+    )
+    return {
+        "is_already_closed": bool(
+            total_area >= minimum_total
+            and largest_area >= minimum_largest
+        ),
+        "roi_area_px2": round(roi_area, 1),
+        "total_closed_area_px2": round(total_area, 1),
+        "largest_room_area_px2": round(largest_area, 1),
+        "minimum_total_closed_area_px2": round(minimum_total, 1),
+        "minimum_largest_room_area_px2": round(minimum_largest, 1),
+    }
 
 
 def _bbox_iou(first: list[int], second: list[int]) -> float:
@@ -894,25 +921,49 @@ def repair_vector_floorplan_topology(
 
     barrier = (result != 0).astype(np.uint8)
     limits = _multi_gap_limits(barrier, roi, max_exterior_gap_px)
-    result, span_rectangle = _search_dominant_span_rectangle(
-        result,
-        support,
+    initial_closure = _initial_topology_is_already_closed(
+        initial_topology,
         roi,
-        min_room_area_px,
     )
+    already_closed = initial_closure["is_already_closed"]
+    span_rectangle = None
     exterior_candidates = []
     accepted_candidates = []
-    if span_rectangle is None:
-        exterior_candidates = _ranked_gap_candidates(barrier, support, roi, limits)
-        result, accepted_candidates = _search_multi_gap_solution(
+    if not already_closed:
+        result, span_rectangle = _search_dominant_span_rectangle(
             result,
-            exterior_candidates,
+            support,
             roi,
             min_room_area_px,
-            limits,
         )
+        if span_rectangle is None:
+            exterior_candidates = _ranked_gap_candidates(
+                barrier,
+                support,
+                roi,
+                limits,
+            )
+            result, accepted_candidates = _search_multi_gap_solution(
+                result,
+                exterior_candidates,
+                roi,
+                min_room_area_px,
+                limits,
+            )
 
-    if span_rectangle is not None:
+    if already_closed:
+        diagnostics["exterior_repair"] = {
+            "status": "not_needed",
+            "candidate_count": 0,
+            "accepted_line_px": None,
+            "accepted_lines_px": [],
+            "accepted_candidates": [],
+            "round_count": 0,
+            "limits": limits,
+            "reason": "already_closed",
+            "initial_closure": initial_closure,
+        }
+    elif span_rectangle is not None:
         accepted_lines = span_rectangle["lines_px"]
         diagnostics["exterior_repair"] = {
             "status": "repaired",
@@ -1081,7 +1132,9 @@ def repair_vector_floorplan_topology(
     )
     roi_area = float((roi[2] - roi[0]) * (roi[3] - roi[1]))
     major_closure_threshold = max(min_room_area_px * 2.0, roi_area * 0.08)
-    if int(final_topology.get("room_count") or 0) <= 0:
+    if already_closed:
+        closure_status = "complete"
+    elif int(final_topology.get("room_count") or 0) <= 0:
         closure_status = "failed"
     elif closed_area_gain >= major_closure_threshold:
         closure_status = "complete"

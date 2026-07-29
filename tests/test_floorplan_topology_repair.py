@@ -131,6 +131,29 @@ class ConservativeTopologyRepairTests(unittest.TestCase):
         self.assertIn("vector_support_ratio", candidate)
         self.assertIn("model_support_ratio", candidate)
 
+    def test_skips_exterior_repair_when_major_area_is_already_closed(self):
+        mask = np.zeros((140, 180), dtype=np.uint8)
+        support = np.zeros_like(mask)
+        cv2.rectangle(mask, (30, 20), (150, 120), 1, 3)
+        cv2.rectangle(support, (15, 15), (165, 125), 255, 1)
+
+        result = repair_vector_floorplan_topology(
+            mask,
+            building_roi=[10, 10, 170, 130],
+            structural_support_mask=support,
+            max_exterior_gap_px=16,
+            max_internal_component_area_px=500,
+            min_room_area_px=500,
+        )
+
+        repair = result["exterior_repair"]
+        self.assertEqual(repair["status"], "not_needed")
+        self.assertEqual(repair["reason"], "already_closed")
+        self.assertEqual(repair["accepted_lines_px"], [])
+        self.assertEqual(result["closure_status"], "complete")
+        self.assertFalse(result["manual_exterior_wall_required"])
+        self.assertTrue(repair["initial_closure"]["is_already_closed"])
+
     def test_rejects_dominant_rectangle_when_any_side_has_weak_model_support(self):
         mask = np.zeros((140, 180), dtype=np.uint8)
         support = np.zeros_like(mask)

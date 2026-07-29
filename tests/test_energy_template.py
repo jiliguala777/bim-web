@@ -657,6 +657,420 @@ class EnergyRouteClientTests(unittest.TestCase):
             (Path("annotation_tool") / "static" / "crop_region.js").read_bytes(),
         )
 
+    def test_ai_recognize_rejects_invalid_crop_region_requests(self):
+        from floorplan_page_pipeline import PreparedFloorplanPage
+
+        prediction = {
+            "mask": np.zeros((2, 2), dtype=np.uint8),
+            "overlay": np.zeros((2, 2, 3), dtype=np.uint8),
+            "stats": {},
+            "geometry": {"walls": [], "windows": [], "doors": []},
+            "room_topology": {
+                "status": "no_closed_rooms",
+                "room_count": 0,
+                "rooms": [],
+                "total_area_px2": 0.0,
+                "total_area_m2": None,
+                "load_geometry_ready": False,
+            },
+            "image_size": [2, 2],
+        }
+        prepared_page = PreparedFloorplanPage(
+            page_number=1,
+            page_count=1,
+            render_bgr=np.full((2, 2, 3), 255, dtype=np.uint8),
+            cleaned_bgr=np.zeros((2, 2, 3), dtype=np.uint8),
+            model_view_rgb=np.zeros((2, 2, 3), dtype=np.uint8),
+            model_input_512=np.zeros((1, 3, 512, 512), dtype=np.float32),
+            model_input_metadata={},
+            vector_analysis={},
+            scale_calibration={"status": "manual_required", "method": "test"},
+            vector_cleanup={
+                "enabled": False,
+                "has_vector_geometry": False,
+                "has_vector_text": False,
+            },
+            inference_roi=None,
+            cleanup_mask=np.zeros((2, 2), dtype=np.uint8),
+            structural_support_mask=None,
+            artifacts={},
+        )
+
+        with tempfile.TemporaryDirectory() as upload_root:
+            previous_upload = self.server.app.config["UPLOAD_FOLDER"]
+            self.server.app.config["UPLOAD_FOLDER"] = upload_root
+            report_dir = Path(upload_root) / "energy" / "CROP-INVALID"
+            report_dir.mkdir(parents=True)
+            stored_filename = "building_plan_prepared_test.pdf"
+            (report_dir / stored_filename).write_bytes(b"%PDF-1.4")
+            upload_token = self.server._make_pdf_upload_token(
+                "CROP-INVALID",
+                stored_filename,
+                1,
+            )
+            segmenter = MagicMock()
+            segmenter.predict.return_value = prediction
+            cases = [
+                (
+                    "crop mode with a raster upload",
+                    {
+                        "report_number": "CROP-INVALID",
+                        "recognition_mode": "crop_region",
+                        "crop_bbox_px": "[100, 50, 500, 350]",
+                        "crop_preview_size": "[800, 600]",
+                        "raster_file": (io.BytesIO(b"fake image"), "plan.png"),
+                    },
+                ),
+                (
+                    "malformed crop JSON",
+                    {
+                        "report_number": "CROP-INVALID",
+                        "recognition_mode": "crop_region",
+                        "crop_bbox_px": "[100, 50",
+                        "crop_preview_size": "[800, 600]",
+                        "pdf_upload_token": upload_token,
+                        "pdf_page_number": "1",
+                    },
+                ),
+                (
+                    "crop outside declared preview bounds",
+                    {
+                        "report_number": "CROP-INVALID",
+                        "recognition_mode": "crop_region",
+                        "crop_bbox_px": "[100, 50, 801, 350]",
+                        "crop_preview_size": "[800, 600]",
+                        "pdf_upload_token": upload_token,
+                        "pdf_page_number": "1",
+                    },
+                ),
+                (
+                    "crop below minimum dimensions",
+                    {
+                        "report_number": "CROP-INVALID",
+                        "recognition_mode": "crop_region",
+                        "crop_bbox_px": "[100, 50, 227, 350]",
+                        "crop_preview_size": "[800, 600]",
+                        "pdf_upload_token": upload_token,
+                        "pdf_page_number": "1",
+                    },
+                ),
+            ]
+            try:
+                with (
+                    patch.object(self.server, "HAS_FLOORPLAN_AI", True),
+                    patch.object(
+                        self.server,
+                        "_floorplan_segmenter",
+                        segmenter,
+                        create=True,
+                    ),
+                    patch.object(
+                        self.server,
+                        "prepare_pdf_page",
+                        return_value=prepared_page,
+                        create=True,
+                    ) as prepare_page,
+                    patch.object(
+                        self.server.cv2,
+                        "imread",
+                        return_value=np.zeros((2, 2, 3), dtype=np.uint8),
+                    ),
+                ):
+                    for label, data in cases:
+                        with self.subTest(case=label):
+                            response = self.client.post(
+                                "/energy/ai_recognize",
+                                data=data,
+                                content_type="multipart/form-data",
+                            )
+                            self.assertEqual(
+                                response.status_code,
+                                400,
+                                response.get_json(),
+                            )
+                    prepare_page.assert_not_called()
+                    segmenter.predict.assert_not_called()
+            finally:
+                self.server.app.config["UPLOAD_FOLDER"] = previous_upload
+
+    def test_ai_recognize_legacy_pdf_request_defaults_to_full_page(self):
+        from floorplan_page_pipeline import PreparedFloorplanPage
+
+        with tempfile.TemporaryDirectory() as upload_root:
+            previous_upload = self.server.app.config["UPLOAD_FOLDER"]
+            self.server.app.config["UPLOAD_FOLDER"] = upload_root
+            report_dir = Path(upload_root) / "energy" / "LEGACY-PDF"
+            report_dir.mkdir(parents=True)
+            stored_filename = "building_plan_prepared_test.pdf"
+            (report_dir / stored_filename).write_bytes(b"%PDF-1.4")
+            upload_token = self.server._make_pdf_upload_token(
+                "LEGACY-PDF",
+                stored_filename,
+                1,
+            )
+            prepared_page = PreparedFloorplanPage(
+                page_number=1,
+                page_count=1,
+                render_bgr=np.full((2, 2, 3), 255, dtype=np.uint8),
+                cleaned_bgr=np.zeros((2, 2, 3), dtype=np.uint8),
+                model_view_rgb=np.zeros((2, 2, 3), dtype=np.uint8),
+                model_input_512=np.zeros((1, 3, 512, 512), dtype=np.float32),
+                model_input_metadata={},
+                vector_analysis={},
+                scale_calibration={"status": "manual_required", "method": "test"},
+                vector_cleanup={
+                    "enabled": False,
+                    "has_vector_geometry": False,
+                    "has_vector_text": False,
+                },
+                inference_roi=None,
+                cleanup_mask=np.zeros((2, 2), dtype=np.uint8),
+                structural_support_mask=None,
+                artifacts={},
+            )
+            segmenter = MagicMock()
+            segmenter.predict.return_value = {
+                "mask": np.zeros((2, 2), dtype=np.uint8),
+                "overlay": np.zeros((2, 2, 3), dtype=np.uint8),
+                "stats": {},
+                "geometry": {"walls": [], "windows": [], "doors": []},
+                "room_topology": {
+                    "status": "no_closed_rooms",
+                    "room_count": 0,
+                    "rooms": [],
+                    "total_area_px2": 0.0,
+                    "total_area_m2": None,
+                    "load_geometry_ready": False,
+                },
+                "image_size": [2, 2],
+            }
+            try:
+                with (
+                    patch.object(self.server, "HAS_FLOORPLAN_AI", True),
+                    patch.object(
+                        self.server,
+                        "_floorplan_segmenter",
+                        segmenter,
+                        create=True,
+                    ),
+                    patch.object(
+                        self.server,
+                        "prepare_pdf_page",
+                        return_value=prepared_page,
+                        create=True,
+                    ),
+                ):
+                    response = self.client.post(
+                        "/energy/ai_recognize",
+                        data={
+                            "report_number": "LEGACY-PDF",
+                            "pdf_upload_token": upload_token,
+                            "pdf_page_number": "1",
+                        },
+                    )
+            finally:
+                self.server.app.config["UPLOAD_FOLDER"] = previous_upload
+
+            self.assertEqual(response.status_code, 200, response.get_json())
+            body = response.get_json()
+            saved = json.loads(
+                (report_dir / "recognition.json").read_text(encoding="utf-8")
+            )
+            expected_region_metadata = {
+                "recognition_mode": "full_page",
+                "crop_bbox_page_px": None,
+                "crop_bbox_preview_px": None,
+                "crop_preview_size": None,
+            }
+            for field, expected in expected_region_metadata.items():
+                with self.subTest(location="response", field=field):
+                    self.assertIn(field, body)
+                    self.assertEqual(body[field], expected)
+                with self.subTest(location="recognition.json", field=field):
+                    self.assertIn(field, saved)
+                    self.assertEqual(saved[field], expected)
+
+    def test_ai_recognize_crops_aligned_prepared_page_inputs_for_inference(self):
+        from floorplan_page_pipeline import PreparedFloorplanPage
+
+        page_height, page_width = 1200, 1600
+        scale_calibration = {
+            "status": "manual_required",
+            "method": "whole_page_test",
+            "scale_m_per_px": None,
+            "evidence": [{"text": "40600", "source": "whole_page"}],
+        }
+        vector_cleanup = {
+            "enabled": True,
+            "has_vector_geometry": True,
+            "has_vector_text": True,
+            "structural_mask": {"enabled": True},
+            "nonstructural_mask": {"enabled": False},
+            "building_roi": {
+                "enabled": True,
+                "bbox_px": [250, 150, 900, 650],
+                "confidence": 0.95,
+                "reason": "whole_page_test",
+            },
+            "evidence": [{"kind": "whole_page_vector"}],
+        }
+        rows, columns = np.indices((page_height, page_width))
+        render_bgr = np.stack(
+            (
+                columns % 251,
+                rows % 251,
+                (rows + columns) % 251,
+            ),
+            axis=2,
+        ).astype(np.uint8)
+        cleaned_bgr = (255 - render_bgr).astype(np.uint8)
+        structural_support_mask = ((rows + columns) % 256).astype(np.uint8)
+        prepared_page = PreparedFloorplanPage(
+            page_number=1,
+            page_count=1,
+            render_bgr=render_bgr,
+            cleaned_bgr=cleaned_bgr,
+            model_view_rgb=np.zeros((2, 2, 3), dtype=np.uint8),
+            model_input_512=np.zeros((1, 3, 512, 512), dtype=np.float32),
+            model_input_metadata={},
+            vector_analysis={"status": "completed"},
+            scale_calibration=scale_calibration,
+            vector_cleanup=vector_cleanup,
+            inference_roi=[250, 150, 900, 650],
+            cleanup_mask=np.zeros((page_height, page_width), dtype=np.uint8),
+            structural_support_mask=structural_support_mask,
+            artifacts={},
+        )
+
+        def predict(image, **kwargs):
+            height, width = image.shape[:2]
+            return {
+                "mask": np.zeros((height, width), dtype=np.uint8),
+                "overlay": np.zeros((height, width, 3), dtype=np.uint8),
+                "stats": {},
+                "geometry": {"walls": [], "windows": [], "doors": []},
+                "room_topology": {
+                    "status": "no_closed_rooms",
+                    "room_count": 0,
+                    "rooms": [],
+                    "total_area_px2": 0.0,
+                    "total_area_m2": None,
+                    "load_geometry_ready": False,
+                },
+                "image_size": [width, height],
+            }
+
+        with tempfile.TemporaryDirectory() as upload_root:
+            previous_upload = self.server.app.config["UPLOAD_FOLDER"]
+            self.server.app.config["UPLOAD_FOLDER"] = upload_root
+            report_dir = Path(upload_root) / "energy" / "CROP-INTEGRATION"
+            report_dir.mkdir(parents=True)
+            stored_filename = "building_plan_prepared_test.pdf"
+            (report_dir / stored_filename).write_bytes(b"%PDF-1.4")
+            upload_token = self.server._make_pdf_upload_token(
+                "CROP-INTEGRATION",
+                stored_filename,
+                1,
+            )
+            segmenter = MagicMock()
+            segmenter.predict.side_effect = predict
+            try:
+                with (
+                    patch.object(self.server, "HAS_FLOORPLAN_AI", True),
+                    patch.object(
+                        self.server,
+                        "_floorplan_segmenter",
+                        segmenter,
+                        create=True,
+                    ),
+                    patch.object(
+                        self.server,
+                        "prepare_pdf_page",
+                        return_value=prepared_page,
+                        create=True,
+                    ),
+                ):
+                    response = self.client.post(
+                        "/energy/ai_recognize",
+                        data={
+                            "report_number": "CROP-INTEGRATION",
+                            "recognition_mode": "crop_region",
+                            "crop_bbox_px": "[100, 50, 500, 350]",
+                            "crop_preview_size": "[800, 600]",
+                            "pdf_upload_token": upload_token,
+                            "pdf_page_number": "1",
+                        },
+                    )
+            finally:
+                self.server.app.config["UPLOAD_FOLDER"] = previous_upload
+
+            self.assertEqual(response.status_code, 200, response.get_json())
+            predicted_image = segmenter.predict.call_args.args[0]
+            predict_kwargs = segmenter.predict.call_args.kwargs
+            self.assertEqual(predicted_image.shape[:2], (600, 800))
+            self.assertEqual(
+                predicted_image[0, 0].tolist(),
+                cleaned_bgr[100, 200].tolist(),
+            )
+            self.assertEqual(predict_kwargs["inference_roi"], [50, 50, 700, 550])
+            repair_context = predict_kwargs["topology_repair_context"]
+            self.assertEqual(
+                repair_context["structural_support_mask"].shape,
+                (600, 800),
+            )
+            self.assertEqual(
+                int(repair_context["structural_support_mask"][0, 0]),
+                int(structural_support_mask[100, 200]),
+            )
+            self.assertEqual(
+                repair_context["building_roi"],
+                [50, 50, 700, 550],
+            )
+
+            body = response.get_json()
+            self.assertEqual(body["image_size"], [800, 600])
+            self.assertEqual(body["scale_calibration"], scale_calibration)
+            self.assertEqual(
+                body["vector_cleanup"]["building_roi"]["bbox_px"],
+                [50, 50, 700, 550],
+            )
+            self.assertEqual(
+                body["vector_cleanup"]["evidence"],
+                [{"kind": "whole_page_vector"}],
+            )
+            original = cv2.imdecode(
+                np.frombuffer(
+                    base64.b64decode(body["images"]["original"]),
+                    dtype=np.uint8,
+                ),
+                cv2.IMREAD_COLOR,
+            )
+            self.assertEqual(original.shape[:2], (600, 800))
+            persisted_original = cv2.imread(
+                str(report_dir / "building_plan_ai.png"),
+            )
+            self.assertEqual(persisted_original.shape[:2], (600, 800))
+            self.assertEqual(
+                persisted_original[0, 0].tolist(),
+                render_bgr[100, 200].tolist(),
+            )
+            saved = json.loads(
+                (report_dir / "recognition.json").read_text(encoding="utf-8")
+            )
+            expected_region_metadata = {
+                "recognition_mode": "crop_region",
+                "crop_bbox_page_px": [200, 100, 1000, 700],
+                "crop_bbox_preview_px": [100, 50, 500, 350],
+                "crop_preview_size": [800, 600],
+            }
+            for field, expected in expected_region_metadata.items():
+                with self.subTest(location="response", field=field):
+                    self.assertIn(field, body)
+                    self.assertEqual(body[field], expected)
+                with self.subTest(location="recognition.json", field=field):
+                    self.assertIn(field, saved)
+                    self.assertEqual(saved[field], expected)
+
     def test_ai_recognize_uses_prepared_pdf_selected_page_and_persists_metadata(self):
         from PIL import Image
         from floorplan_page_pipeline import VectorAnalysisOutcome

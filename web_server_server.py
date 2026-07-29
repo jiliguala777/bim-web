@@ -1252,7 +1252,12 @@ import base64
 import cv2
 import numpy as np
 import time as _time
-from energy_pdf_region import render_pdf_page_preview
+from energy_pdf_region import (
+    crop_page_inputs,
+    map_crop_bbox_to_page,
+    parse_crop_region_request,
+    render_pdf_page_preview,
+)
 
 # ==========================================
 # 路由 - AI 图纸识别 (语义分割)
@@ -1338,6 +1343,10 @@ def _build_recognition_payload(result, preprocessing, use_preprocessing, raster_
         },
         'pdf_page_number': result.get('pdf_page_number'),
         'pdf_page_count': result.get('pdf_page_count'),
+        'recognition_mode': result.get('recognition_mode', 'full_page'),
+        'crop_bbox_page_px': result.get('crop_bbox_page_px'),
+        'crop_bbox_preview_px': result.get('crop_bbox_preview_px'),
+        'crop_preview_size': result.get('crop_preview_size'),
         'vector_cleanup': result.get('vector_cleanup') or {
             'enabled': False,
             'has_vector_geometry': False,
@@ -1567,7 +1576,20 @@ def ai_recognize():
         preprocessing = request.form.get('preprocessing', 'auto')
         use_preprocessing = preprocessing != 'none'
 
+        try:
+            region_request = parse_crop_region_request(
+                request.form.get('recognition_mode', 'full_page'),
+                request.form.get('crop_bbox_px'),
+                request.form.get('crop_preview_size'),
+            )
+        except ValueError as exc:
+            return jsonify({'error': str(exc)}), 400
+
         pdf_upload_token = request.form.get('pdf_upload_token', '').strip()
+        if region_request['mode'] == 'crop_region' and not pdf_upload_token:
+            return jsonify({
+                'error': 'crop_region requires a prepared PDF upload',
+            }), 400
         pdf_page_number = None
         pdf_page_count = None
 
@@ -1632,9 +1654,8 @@ def ai_recognize():
                 )
                 pdf_page_count = prepared_page.page_count
                 scale_calibration = prepared_page.scale_calibration
-                vector_cleanup = prepared_page.vector_cleanup
+                vector_cleanup = dict(prepared_page.vector_cleanup)
                 png_path = os.path.join(target_dir, 'building_plan_ai.png')
-                _write_image(Path(png_path), prepared_page.render_bgr)
                 raster_path = png_path
             except Exception as e:
                 return jsonify({'error': f'PDF conversion failed: {e}'}), 500
@@ -1668,6 +1689,37 @@ def ai_recognize():
             if prepared_page is not None
             else None
         )
+        crop_bbox_page_px = None
+        if prepared_page is not None and region_request['mode'] == 'crop_region':
+            page_height, page_width = prepared_page.render_bgr.shape[:2]
+            crop_bbox_page_px = map_crop_bbox_to_page(
+                region_request['crop_bbox_px'],
+                region_request['preview_size'],
+                [page_width, page_height],
+            )
+            cropped_inputs = crop_page_inputs(
+                prepared_page.render_bgr,
+                prepared_page.cleaned_bgr,
+                prepared_page.cleanup_mask,
+                prepared_page.structural_support_mask,
+                prepared_page.inference_roi,
+                crop_bbox_page_px,
+            )
+            original_bgr = cropped_inputs['render_bgr']
+            img_bgr = cropped_inputs['cleaned_bgr']
+            combined_cleanup_mask = cropped_inputs['cleanup_mask']
+            structural_support_mask = cropped_inputs['structural_support_mask']
+            inference_roi = cropped_inputs['inference_roi']
+            building_roi = dict(vector_cleanup.get('building_roi') or {})
+            building_roi.update({
+                'enabled': True,
+                'bbox_px': inference_roi,
+            })
+            vector_cleanup['building_roi'] = building_roi
+
+        if prepared_page is not None:
+            _write_image(Path(raster_path), original_bgr)
+
         has_vector_geometry = bool(
             prepared_page is not None
             and prepared_page.vector_cleanup.get('has_vector_geometry')
@@ -1737,6 +1789,10 @@ def ai_recognize():
         result['scale_calibration'] = scale_calibration
         result['pdf_page_number'] = pdf_page_number
         result['pdf_page_count'] = pdf_page_count
+        result['recognition_mode'] = region_request['mode']
+        result['crop_bbox_page_px'] = crop_bbox_page_px
+        result['crop_bbox_preview_px'] = region_request['crop_bbox_px']
+        result['crop_preview_size'] = region_request['preview_size']
         result['vector_cleanup'] = vector_cleanup
 
         mask = result['mask']
@@ -1854,6 +1910,10 @@ def ai_recognize():
             'scale_calibration': scale_calibration,
             'pdf_page_number': pdf_page_number,
             'pdf_page_count': pdf_page_count,
+            'recognition_mode': result['recognition_mode'],
+            'crop_bbox_page_px': result['crop_bbox_page_px'],
+            'crop_bbox_preview_px': result['crop_bbox_preview_px'],
+            'crop_preview_size': result['crop_preview_size'],
             'vector_cleanup': vector_cleanup,
             'topology_repair': result.get('topology_repair') or {},
             'pixel_lengths': {

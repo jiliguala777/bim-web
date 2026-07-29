@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import time
 
 import cv2
 import numpy as np
@@ -14,7 +15,7 @@ DOMINANT_SPAN_MIN_VECTOR_SIDE_SUPPORT = 0.60
 DOMINANT_SPAN_MIN_MODEL_SIDE_SUPPORT = 0.15
 ALREADY_CLOSED_MIN_TOTAL_ROI_FRACTION = 0.20
 ALREADY_CLOSED_MIN_LARGEST_ROOM_ROI_FRACTION = 0.08
-MAX_MULTI_GAP_TOPOLOGY_EVALUATIONS = 16
+MULTI_GAP_SEARCH_TIMEOUT_SECONDS = 60.0
 
 
 def _normalize_roi(roi, width: int, height: int) -> list[int] | None:
@@ -342,6 +343,44 @@ def _line_mask(shape: tuple[int, int], line: list[int], thickness: int = 3) -> n
     mask = np.zeros(shape, dtype=np.uint8)
     cv2.line(mask, tuple(line[:2]), tuple(line[2:]), 255, thickness=thickness)
     return mask
+
+
+def _room_interiors_mask(
+    shape: tuple[int, int],
+    rooms: list[dict],
+    inset_px: int = 3,
+) -> np.ndarray:
+    interiors = np.zeros(shape, dtype=np.uint8)
+    for room in rooms:
+        polygon = np.asarray(room.get("polygon_px") or [], dtype=np.float32)
+        if polygon.shape[0] < 3:
+            continue
+        points = np.rint(polygon).astype(np.int32).reshape((-1, 1, 2))
+        cv2.fillPoly(interiors, [points], 255)
+    if inset_px > 0 and np.any(interiors):
+        interiors = cv2.erode(
+            interiors,
+            np.ones((3, 3), dtype=np.uint8),
+            iterations=inset_px,
+        )
+    return interiors
+
+
+def _line_crosses_room_interiors(
+    shape: tuple[int, int],
+    line: list[int],
+    rooms: list[dict],
+) -> bool:
+    interiors = _room_interiors_mask(shape, rooms)
+    return _line_crosses_room_interior_mask(shape, line, interiors)
+
+
+def _line_crosses_room_interior_mask(
+    shape: tuple[int, int],
+    line: list[int],
+    room_interiors: np.ndarray,
+) -> bool:
+    return bool(np.any((_line_mask(shape, line) > 0) & (room_interiors > 0)))
 
 
 def _support_ratio(support: np.ndarray | None, line: list[int]) -> float:
@@ -714,6 +753,7 @@ def _search_dominant_span_rectangle(
 ) -> tuple[np.ndarray, dict | None]:
     baseline = _room_topology(mask, min_room_area_px)
     baseline_area = float(baseline.get("total_area_px2") or 0.0)
+    room_interiors = _room_interiors_mask(mask.shape, baseline.get("rooms", []))
     solutions = []
     for candidate in _dominant_span_rectangles(
         mask,
@@ -721,17 +761,10 @@ def _search_dominant_span_rectangle(
         roi,
         min_room_area_px,
     ):
-        left, top, width, height = candidate["bbox_px"]
-        right, bottom = left + width, top + height
-        overlaps_existing_room = False
-        for room in baseline.get("rooms", []):
-            room_x, room_y, room_width, room_height = room["bbox_px"]
-            overlap_width = max(0, min(right, room_x + room_width) - max(left, room_x))
-            overlap_height = max(0, min(bottom, room_y + room_height) - max(top, room_y))
-            if overlap_width * overlap_height > max(12.0, float(room["area_px2"]) * 0.02):
-                overlaps_existing_room = True
-                break
-        if overlaps_existing_room:
+        if any(
+            _line_crosses_room_interior_mask(mask.shape, line, room_interiors)
+            for line in candidate["lines_px"]
+        ):
             continue
         simulated = mask.copy()
         for line in candidate["lines_px"]:
@@ -780,21 +813,27 @@ def _search_multi_gap_solution(
     roi: list[int],
     min_room_area_px: float,
     limits: dict,
+    *,
+    monotonic_clock=None,
 ) -> tuple[np.ndarray, list[dict], dict]:
+    clock = monotonic_clock or time.monotonic
+    started_at = clock()
     baseline = _room_topology(mask, min_room_area_px)
     baseline_area = float(baseline.get("total_area_px2") or 0.0)
     states = [(mask, [], 0.0, 0.0)]
     solutions = []
     evaluation_count = 0
-    budget_exhausted = False
+    timed_out = False
+    elapsed_seconds = 0.0
     stop_search = False
     for candidate in candidates:
         expanded = list(states)
         for state_mask, accepted, _gain, evidence_score in states:
             if len(accepted) >= limits["max_lines"]:
                 continue
-            if evaluation_count >= MAX_MULTI_GAP_TOPOLOGY_EVALUATIONS:
-                budget_exhausted = True
+            elapsed_seconds = max(0.0, float(clock() - started_at))
+            if elapsed_seconds >= MULTI_GAP_SEARCH_TIMEOUT_SECONDS:
+                timed_out = True
                 stop_search = True
                 break
             simulated = _apply_wall_line(state_mask, candidate["line_px"])
@@ -833,10 +872,13 @@ def _search_multi_gap_solution(
         )
         states = expanded[:limits["beam_width"]]
 
+    if not timed_out:
+        elapsed_seconds = max(0.0, float(clock() - started_at))
     search_diagnostics = {
         "evaluation_count": evaluation_count,
-        "evaluation_limit": MAX_MULTI_GAP_TOPOLOGY_EVALUATIONS,
-        "budget_exhausted": budget_exhausted,
+        "time_limit_seconds": MULTI_GAP_SEARCH_TIMEOUT_SECONDS,
+        "elapsed_seconds": round(elapsed_seconds, 3),
+        "timed_out": timed_out,
     }
     if not solutions:
         return mask, [], search_diagnostics
@@ -947,8 +989,9 @@ def repair_vector_floorplan_topology(
     accepted_candidates = []
     search_diagnostics = {
         "evaluation_count": 0,
-        "evaluation_limit": MAX_MULTI_GAP_TOPOLOGY_EVALUATIONS,
-        "budget_exhausted": False,
+        "time_limit_seconds": MULTI_GAP_SEARCH_TIMEOUT_SECONDS,
+        "elapsed_seconds": 0.0,
+        "timed_out": False,
     }
     if not already_closed:
         result, span_rectangle = _search_dominant_span_rectangle(

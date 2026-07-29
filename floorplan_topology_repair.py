@@ -10,6 +10,10 @@ import numpy as np
 from floorplan_rooms import extract_room_topology
 
 
+DOMINANT_SPAN_MIN_VECTOR_SIDE_SUPPORT = 0.60
+DOMINANT_SPAN_MIN_MODEL_SIDE_SUPPORT = 0.15
+
+
 def _normalize_roi(roi, width: int, height: int) -> list[int] | None:
     if roi is None or len(roi) != 4:
         return None
@@ -619,7 +623,12 @@ def _dominant_span_rectangles(
                         float(np.mean(vertical_profiles[left][0][top:bottom + 1])),
                         float(np.mean(vertical_profiles[right][0][top:bottom + 1])),
                     ]
-                    if min(vector_ratios) < 0.60:
+                    side_names = ("top", "bottom", "left", "right")
+                    vector_support_by_side = dict(zip(side_names, vector_ratios))
+                    if (
+                        min(vector_support_by_side.values())
+                        < DOMINANT_SPAN_MIN_VECTOR_SIDE_SUPPORT
+                    ):
                         continue
                     model_ratios = [
                         float(np.mean(horizontal_profiles[top][1][left:right + 1])),
@@ -627,7 +636,11 @@ def _dominant_span_rectangles(
                         float(np.mean(vertical_profiles[left][1][top:bottom + 1])),
                         float(np.mean(vertical_profiles[right][1][top:bottom + 1])),
                     ]
-                    if min(model_ratios) < 0.02:
+                    model_support_by_side = dict(zip(side_names, model_ratios))
+                    if (
+                        min(model_support_by_side.values())
+                        < DOMINANT_SPAN_MIN_MODEL_SIDE_SUPPORT
+                    ):
                         continue
                     leak_area = float(
                         integral[bottom, right]
@@ -649,6 +662,14 @@ def _dominant_span_rectangles(
                         "leak_area_px": round(leak_area, 1),
                         "vector_support_ratio": round(float(np.mean(vector_ratios)), 4),
                         "model_support_ratio": round(float(np.mean(model_ratios)), 4),
+                        "vector_support_by_side": {
+                            name: round(float(value), 4)
+                            for name, value in vector_support_by_side.items()
+                        },
+                        "model_support_by_side": {
+                            name: round(float(value), 4)
+                            for name, value in model_support_by_side.items()
+                        },
                         "score": round(score, 4),
                     })
     candidates.sort(

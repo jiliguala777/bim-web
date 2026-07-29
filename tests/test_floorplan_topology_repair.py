@@ -119,6 +119,17 @@ class ConservativeTopologyRepairTests(unittest.TestCase):
             math.hypot(line[2] - line[0], line[3] - line[1]) >= 95
             for line in lines
         ))
+        candidate = result["exterior_repair"]["accepted_candidates"][0]
+        self.assertGreaterEqual(
+            min(candidate["vector_support_by_side"].values()),
+            0.60,
+        )
+        self.assertGreaterEqual(
+            min(candidate["model_support_by_side"].values()),
+            0.15,
+        )
+        self.assertIn("vector_support_ratio", candidate)
+        self.assertIn("model_support_ratio", candidate)
 
     def test_rejects_dominant_rectangle_when_any_side_has_weak_model_support(self):
         mask = np.zeros((140, 180), dtype=np.uint8)

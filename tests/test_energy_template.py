@@ -1,5 +1,6 @@
 import unittest
 from pathlib import Path
+import base64
 import re
 import io
 import json
@@ -545,6 +546,116 @@ class EnergyRouteClientTests(unittest.TestCase):
                 resolved = self.server._resolve_poppler_path([poppler_bin])
 
             self.assertEqual(resolved, str(poppler_bin))
+
+    def test_pdf_page_preview_returns_selected_page_as_jpeg(self):
+        with tempfile.TemporaryDirectory() as upload_root:
+            previous_upload = self.server.app.config["UPLOAD_FOLDER"]
+            self.server.app.config["UPLOAD_FOLDER"] = upload_root
+            try:
+                prepared = self.client.post(
+                    "/energy/pdf_prepare",
+                    data={
+                        "report_number": "REGION-PREVIEW",
+                        "raster_file": (
+                            self.make_pdf_bytes(["PAGE-1", "PAGE-2"]),
+                            "floors.pdf",
+                        ),
+                    },
+                    content_type="multipart/form-data",
+                ).get_json()
+                preview_bgr = np.full((600, 800, 3), 128, dtype=np.uint8)
+                with (
+                    patch.object(
+                        self.server,
+                        "render_pdf_page_preview",
+                        return_value=preview_bgr,
+                        create=True,
+                    ) as render_preview,
+                    patch.object(
+                        self.server,
+                        "_resolve_poppler_path",
+                        return_value="C:\\poppler\\bin",
+                    ),
+                ):
+                    response = self.client.post(
+                        "/energy/pdf_page_preview",
+                        data={
+                            "report_number": "REGION-PREVIEW",
+                            "pdf_upload_token": prepared["upload_token"],
+                            "pdf_page_number": "2",
+                        },
+                    )
+            finally:
+                self.server.app.config["UPLOAD_FOLDER"] = previous_upload
+
+            self.assertEqual(response.status_code, 200, response.get_json())
+            body = response.get_json()
+            self.assertTrue(body["success"])
+            self.assertEqual(body["pdf_page_number"], 2)
+            self.assertEqual(body["pdf_page_count"], 2)
+            self.assertEqual(body["image_size"], [800, 600])
+            jpeg = cv2.imdecode(
+                np.frombuffer(base64.b64decode(body["image"]), dtype=np.uint8),
+                cv2.IMREAD_COLOR,
+            )
+            self.assertIsNotNone(jpeg)
+            self.assertEqual(jpeg.shape[:2], (600, 800))
+            stored_pdf = next(
+                (Path(upload_root) / "energy" / "REGION-PREVIEW").glob(
+                    "building_plan_prepared_*.pdf"
+                )
+            )
+            render_preview.assert_called_once_with(
+                stored_pdf,
+                2,
+                2,
+                "C:\\poppler\\bin",
+            )
+
+    def test_pdf_page_preview_rejects_mismatched_report_or_invalid_page(self):
+        with tempfile.TemporaryDirectory() as upload_root:
+            previous_upload = self.server.app.config["UPLOAD_FOLDER"]
+            self.server.app.config["UPLOAD_FOLDER"] = upload_root
+            try:
+                prepared = self.client.post(
+                    "/energy/pdf_prepare",
+                    data={
+                        "report_number": "REGION-PREVIEW",
+                        "raster_file": (
+                            self.make_pdf_bytes(["PAGE-1", "PAGE-2"]),
+                            "floors.pdf",
+                        ),
+                    },
+                    content_type="multipart/form-data",
+                ).get_json()
+                for report_number, page_number, error_fragment in [
+                    ("OTHER-REPORT", "1", "report"),
+                    ("REGION-PREVIEW", "3", "page"),
+                ]:
+                    with self.subTest(report_number=report_number, page_number=page_number):
+                        response = self.client.post(
+                            "/energy/pdf_page_preview",
+                            data={
+                                "report_number": report_number,
+                                "pdf_upload_token": prepared["upload_token"],
+                                "pdf_page_number": page_number,
+                            },
+                        )
+                        self.assertEqual(response.status_code, 400)
+                        self.assertIn(error_fragment, response.get_json()["error"].lower())
+            finally:
+                self.server.app.config["UPLOAD_FOLDER"] = previous_upload
+
+    def test_crop_region_helper_route_serves_shared_source(self):
+        response = self.client.get("/energy/crop_region.js")
+        self.addCleanup(response.close)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("javascript", response.mimetype)
+        self.assertEqual(
+            response.get_data(),
+            (Path("annotation_tool") / "static" / "crop_region.js").read_bytes(),
+        )
 
     def test_ai_recognize_uses_prepared_pdf_selected_page_and_persists_metadata(self):
         from PIL import Image

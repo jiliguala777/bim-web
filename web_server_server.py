@@ -8,7 +8,7 @@ import zipfile
 import threading
 import uuid
 import time
-from flask import Flask, request, render_template, jsonify, send_file, session, redirect, url_for
+from flask import Flask, request, render_template, jsonify, send_file, send_from_directory, session, redirect, url_for
 from itsdangerous import BadSignature, URLSafeSerializer
 from werkzeug.utils import secure_filename
 from functools import wraps
@@ -1252,6 +1252,7 @@ import base64
 import cv2
 import numpy as np
 import time as _time
+from energy_pdf_region import render_pdf_page_preview
 
 # ==========================================
 # 路由 - AI 图纸识别 (语义分割)
@@ -1430,6 +1431,29 @@ def _load_pdf_upload_token(token):
     return payload
 
 
+def _validated_prepared_pdf(report_number, pdf_upload_token, pdf_page_number):
+    """Return a validated stored PDF path, selected page, and page count."""
+    prepared_pdf = _load_pdf_upload_token(pdf_upload_token)
+    if prepared_pdf.get('report_number') != report_number:
+        raise ValueError('PDF upload token does not match this report')
+
+    stored_filename = str(prepared_pdf.get('stored_filename') or '')
+    if secure_filename(stored_filename) != stored_filename or not stored_filename.endswith('.pdf'):
+        raise ValueError('PDF upload token is invalid')
+    try:
+        page_count = int(prepared_pdf.get('page_count'))
+        page_number = int(pdf_page_number)
+    except (TypeError, ValueError) as exc:
+        raise ValueError('PDF page number must be an integer') from exc
+    if page_number < 1 or page_number > page_count:
+        raise ValueError(f'PDF page number must be between 1 and {page_count}')
+
+    pdf_path = Path(app.config['UPLOAD_FOLDER']) / 'energy' / report_number / stored_filename
+    if not pdf_path.is_file():
+        raise ValueError('Prepared PDF file no longer exists')
+    return pdf_path, page_number, page_count
+
+
 @app.route('/energy/pdf_prepare', methods=['POST'])
 @login_required
 def prepare_energy_pdf():
@@ -1470,6 +1494,58 @@ def prepare_energy_pdf():
     })
 
 
+@app.route('/energy/pdf_page_preview', methods=['POST'])
+@login_required
+def preview_energy_pdf_page():
+    """Render a selected prepared-PDF page for client-side region selection."""
+    report_number = secure_filename(request.form.get('report_number', 'default')) or 'default'
+    try:
+        pdf_path, page_number, page_count = _validated_prepared_pdf(
+            report_number,
+            request.form.get('pdf_upload_token', '').strip(),
+            request.form.get('pdf_page_number', '1'),
+        )
+    except ValueError as exc:
+        return jsonify({'error': str(exc)}), 400
+
+    try:
+        preview_bgr = render_pdf_page_preview(
+            pdf_path,
+            page_number,
+            page_count,
+            _resolve_poppler_path(),
+        )
+        encoded, jpeg = cv2.imencode(
+            '.jpg',
+            preview_bgr,
+            [cv2.IMWRITE_JPEG_QUALITY, 85],
+        )
+        if not encoded:
+            raise ValueError('Cannot encode PDF preview')
+    except Exception as exc:
+        return jsonify({'error': f'PDF preview failed: {exc}'}), 500
+
+    height, width = preview_bgr.shape[:2]
+    return jsonify({
+        'success': True,
+        'pdf_page_number': page_number,
+        'pdf_page_count': page_count,
+        'image_size': [width, height],
+        'image': base64.b64encode(jpeg).decode('utf-8'),
+    })
+
+
+@app.route('/energy/crop_region.js', methods=['GET'])
+@login_required
+def energy_crop_region_helper():
+    """Serve the shared crop-selection helper without duplicating its source."""
+    return send_from_directory(
+        os.path.join(BASE_DIR, 'annotation_tool', 'static'),
+        'crop_region.js',
+        mimetype='application/javascript',
+    )
+
+
 @app.route('/energy/ai_recognize', methods=['POST'])
 @login_required
 def ai_recognize():
@@ -1497,26 +1573,14 @@ def ai_recognize():
 
         if pdf_upload_token:
             try:
-                prepared_pdf = _load_pdf_upload_token(pdf_upload_token)
+                prepared_pdf_path, pdf_page_number, pdf_page_count = _validated_prepared_pdf(
+                    report_number,
+                    pdf_upload_token,
+                    request.form.get('pdf_page_number', '1'),
+                )
             except ValueError as exc:
                 return jsonify({'error': str(exc)}), 400
-            if prepared_pdf.get('report_number') != report_number:
-                return jsonify({'error': 'PDF upload token does not match this report'}), 400
-
-            stored_filename = str(prepared_pdf.get('stored_filename') or '')
-            if secure_filename(stored_filename) != stored_filename or not stored_filename.endswith('.pdf'):
-                return jsonify({'error': 'PDF upload token is invalid'}), 400
-            try:
-                pdf_page_count = int(prepared_pdf.get('page_count'))
-                pdf_page_number = int(request.form.get('pdf_page_number', '1'))
-            except (TypeError, ValueError):
-                return jsonify({'error': 'PDF page number must be an integer'}), 400
-            if pdf_page_number < 1 or pdf_page_number > pdf_page_count:
-                return jsonify({'error': f'PDF page number must be between 1 and {pdf_page_count}'}), 400
-
-            raster_path = os.path.join(target_dir, stored_filename)
-            if not os.path.isfile(raster_path):
-                return jsonify({'error': 'Prepared PDF file no longer exists'}), 400
+            raster_path = os.fspath(prepared_pdf_path)
             ext = 'pdf'
         else:
             if 'raster_file' not in request.files:

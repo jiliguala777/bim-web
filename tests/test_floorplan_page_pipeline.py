@@ -339,6 +339,55 @@ class PdfPagePipelineTests(unittest.TestCase):
             self.assertEqual(len(prepared.artifacts["render"]["sha256"]), 64)
 
     @patch("floorplan_page_pipeline._run_vector_analysis")
+    def test_prepare_pdf_page_allows_30_seconds_for_vector_analysis_by_default(
+        self, run_analysis
+    ):
+        def complete_only_with_30_seconds(source, page_index, dpi, timeout_seconds):
+            if timeout_seconds < 30.0:
+                return VectorAnalysisOutcome(
+                    None,
+                    {
+                        "status": "timed_out",
+                        "mode": "raster_fallback",
+                        "timeout_seconds": timeout_seconds,
+                        "reason": "vector extraction timed out",
+                    },
+                )
+            return VectorAnalysisOutcome(
+                {
+                    "page_size_pt": [400.0, 300.0],
+                    "render_size_px": [556, 417],
+                    "dpi": 100,
+                    "text_spans": [],
+                    "segments": [],
+                    "styled_edges": [],
+                    "vector_text_count": 0,
+                    "vector_segment_count": 0,
+                    "styled_edge_count": 0,
+                    "has_vector_text": False,
+                    "has_vector_geometry": False,
+                    "is_vector_pdf": False,
+                },
+                {
+                    "status": "completed",
+                    "mode": "vector",
+                    "timeout_seconds": timeout_seconds,
+                    "reason": None,
+                },
+            )
+
+        run_analysis.side_effect = complete_only_with_30_seconds
+        with tempfile.TemporaryDirectory() as directory:
+            prepared = prepare_pdf_page(
+                self._make_two_page_pdf(directory),
+                1,
+                poppler_path=os.environ.get("POPPLER_PATH"),
+                segmenter=self._segmenter(),
+            )
+
+        self.assertEqual(prepared.vector_analysis["status"], "completed")
+
+    @patch("floorplan_page_pipeline._run_vector_analysis")
     def test_prepare_pdf_page_writes_raster_fallback_metadata(self, run_analysis):
         run_analysis.return_value = VectorAnalysisOutcome(
             None,

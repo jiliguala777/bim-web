@@ -30,7 +30,7 @@ from vector_pdf_scale import (
 )
 
 
-DEFAULT_VECTOR_TIMEOUT_SECONDS = 15.0
+DEFAULT_VECTOR_TIMEOUT_SECONDS = 30.0
 VECTOR_WORKER_SCRIPT = Path(__file__).with_name("floorplan_vector_worker.py")
 PROCESS_TERMINATE_TIMEOUT_SECONDS = 1.0
 PROCESS_KILL_TIMEOUT_SECONDS = 1.0

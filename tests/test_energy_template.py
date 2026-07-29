@@ -620,7 +620,7 @@ class EnergyRouteClientTests(unittest.TestCase):
                 next((Path(upload_root) / "energy" / "PAGE-TWO").glob("building_plan_prepared_*.pdf")).resolve(),
                 page_index=1,
                 dpi=100,
-                timeout_seconds=15.0,
+                timeout_seconds=30.0,
             )
             self.assertEqual(render_page.call_args.kwargs["dpi"], 200)
             self.assertEqual(render_page.call_args.kwargs["first_page"], 2)
@@ -1006,7 +1006,7 @@ class EnergyRouteClientTests(unittest.TestCase):
 
             self.assertEqual(response.status_code, 200, response.get_json())
             self.assertEqual(run_analysis.call_args.kwargs["dpi"], 100)
-            self.assertEqual(run_analysis.call_args.kwargs["timeout_seconds"], 15.0)
+            self.assertEqual(run_analysis.call_args.kwargs["timeout_seconds"], 30.0)
             self.assertEqual(
                 [call.kwargs["dpi"] for call in render_page.call_args_list],
                 [100],

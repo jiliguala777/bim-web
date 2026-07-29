@@ -1627,6 +1627,10 @@
         let pdfCropStart = null;
         let pdfCropDragging = false;
         let pdfPreviewSize = null;
+        let pdfUploadSessionId = 0;
+        let pdfPreviewRequestId = 0;
+        let pdfPrepareAbortController = null;
+        let pdfPreviewAbortController = null;
         let calibrationPoints = [];
         let energyResultData = null;
         let chartInstance = null;
@@ -2563,6 +2567,7 @@
 
         async function handleFile(file) {
             invalidateEnergyResult();
+            advancePdfUploadSession();
             resetPreparedPdfSelection();
             const isPdf = file.type === 'application/pdf' || file.name.toLowerCase().endsWith('.pdf');
             if (isPdf) {
@@ -2575,6 +2580,63 @@
         function updateReportNumberFromInput() {
             const repNumInput = document.getElementById('current-report-number').value.trim();
             if (repNumInput) reportNumber = repNumInput;
+        }
+
+        function advancePdfPreviewRequest() {
+            pdfPreviewRequestId += 1;
+            if (pdfPreviewAbortController) {
+                pdfPreviewAbortController.abort();
+                pdfPreviewAbortController = null;
+            }
+            return pdfPreviewRequestId;
+        }
+
+        function advancePdfUploadSession() {
+            pdfUploadSessionId += 1;
+            if (pdfPrepareAbortController) {
+                pdfPrepareAbortController.abort();
+                pdfPrepareAbortController = null;
+            }
+            advancePdfPreviewRequest();
+            return pdfUploadSessionId;
+        }
+
+        function pdfPrepareSessionMatchesCurrent(requestSessionId, currentSessionId) {
+            return requestSessionId === currentSessionId;
+        }
+
+        function pdfPreviewRequestMatchesCurrent(
+            request,
+            currentSessionId,
+            currentRequestId,
+            currentUploadToken,
+            currentPageNumber
+        ) {
+            return (
+                request.sessionId === currentSessionId
+                && request.requestId === currentRequestId
+                && request.uploadToken === currentUploadToken
+                && String(request.pageNumber) === String(currentPageNumber)
+            );
+        }
+
+        function isCurrentPdfPreviewRequest(request) {
+            return pdfPreviewRequestMatchesCurrent(
+                request,
+                pdfUploadSessionId,
+                pdfPreviewRequestId,
+                preparedPdf?.uploadToken || null,
+                document.getElementById('pdf-page-select').value
+            );
+        }
+
+        function decodePdfPreviewImage(src) {
+            return new Promise((resolve, reject) => {
+                const image = new Image();
+                image.onload = () => resolve(image);
+                image.onerror = () => reject(new Error('无法显示 PDF 页面预览'));
+                image.src = src;
+            });
         }
 
         function updatePdfRecognitionControls() {
@@ -2615,6 +2677,7 @@
         }
 
         function clearPreparedPdfPreview() {
+            advancePdfPreviewRequest();
             pdfPreviewSize = null;
             const previewImage = document.getElementById('pdf-page-preview-image');
             previewImage.removeAttribute('src');
@@ -2685,44 +2748,61 @@
         async function loadPreparedPdfPreview() {
             if (!preparedPdf) return false;
             updateReportNumberFromInput();
+            const previewRequest = {
+                sessionId: pdfUploadSessionId,
+                requestId: advancePdfPreviewRequest(),
+                uploadToken: preparedPdf.uploadToken,
+                pageNumber: document.getElementById('pdf-page-select').value
+            };
+            const requestController = new AbortController();
+            pdfPreviewAbortController = requestController;
             const fd = new FormData();
             fd.append('report_number', reportNumber);
-            fd.append('pdf_upload_token', preparedPdf.uploadToken);
-            fd.append('pdf_page_number', document.getElementById('pdf-page-select').value);
+            fd.append('pdf_upload_token', previewRequest.uploadToken);
+            fd.append('pdf_page_number', previewRequest.pageNumber);
             showLoader('正在生成 PDF 页面预览...');
 
             try {
                 const response = await fetch('/energy/pdf_page_preview', {
                     method: 'POST',
-                    body: fd
+                    body: fd,
+                    signal: requestController.signal
                 });
                 const data = await response.json();
+                if (!isCurrentPdfPreviewRequest(previewRequest)) return false;
                 if (!response.ok || data.error) throw new Error(data.error || response.statusText);
 
+                const decodedPreview = await decodePdfPreviewImage(
+                    'data:image/jpeg;base64,' + data.image
+                );
+                if (!isCurrentPdfPreviewRequest(previewRequest)) return false;
                 const previewImage = document.getElementById('pdf-page-preview-image');
-                await new Promise((resolve, reject) => {
-                    previewImage.onload = resolve;
-                    previewImage.onerror = () => reject(new Error('无法显示 PDF 页面预览'));
-                    previewImage.src = 'data:image/jpeg;base64,' + data.image;
-                    if (previewImage.complete && previewImage.naturalWidth) resolve();
-                });
-                pdfPreviewSize = [previewImage.naturalWidth, previewImage.naturalHeight];
+                previewImage.src = decodedPreview.src;
+                pdfPreviewSize = [decodedPreview.naturalWidth, decodedPreview.naturalHeight];
                 document.getElementById('pdf-page-summary').innerText =
                     `${preparedPdf.filename} 共 ${preparedPdf.pageCount} 页，当前预览第 ${data.pdf_page_number} 页。`;
                 updatePdfCropOverlay();
                 return true;
             } catch (error) {
+                if (
+                    error.name === 'AbortError'
+                    || !isCurrentPdfPreviewRequest(previewRequest)
+                ) return false;
                 document.getElementById('pdf-page-summary').innerText =
                     `${preparedPdf.filename} 预览加载失败，可点击“重新加载预览”重试。`;
                 alert('加载 PDF 预览失败: ' + error.message);
                 updatePdfRecognitionControls();
                 return false;
             } finally {
-                hideLoader();
+                if (pdfPreviewAbortController === requestController) {
+                    pdfPreviewAbortController = null;
+                    hideLoader();
+                }
             }
         }
 
         function resetPreparedPdfSelection() {
+            advancePdfUploadSession();
             preparedPdf = null;
             document.getElementById('pdf-page-selection').classList.add('hidden');
             document.getElementById('pdf-page-select').innerHTML = '';
@@ -2733,7 +2813,10 @@
         }
 
         async function preparePdf(file) {
+            const uploadSessionId = pdfUploadSessionId;
             updateReportNumberFromInput();
+            const requestController = new AbortController();
+            pdfPrepareAbortController = requestController;
             const fd = new FormData();
             fd.append('raster_file', file);
             fd.append('report_number', reportNumber);
@@ -2742,9 +2825,13 @@
             try {
                 const response = await fetch('/energy/pdf_prepare', {
                     method: 'POST',
-                    body: fd
+                    body: fd,
+                    signal: requestController.signal
                 });
                 const data = await response.json();
+                if (
+                    !pdfPrepareSessionMatchesCurrent(uploadSessionId, pdfUploadSessionId)
+                ) return false;
                 if (!response.ok || data.error) throw new Error(data.error || response.statusText);
 
                 preparedPdf = {
@@ -2765,12 +2852,29 @@
                 document.getElementById('pdf-page-selection').classList.remove('hidden');
                 setPdfRecognitionMode('full_page');
                 clearPreparedPdfPreview();
+                if (pdfPrepareAbortController === requestController) {
+                    pdfPrepareAbortController = null;
+                    hideLoader();
+                }
                 await loadPreparedPdfPreview();
+                return true;
             } catch (error) {
+                if (
+                    error.name === 'AbortError'
+                    || !pdfPrepareSessionMatchesCurrent(
+                        uploadSessionId,
+                        pdfUploadSessionId
+                    )
+                ) return false;
                 resetPreparedPdfSelection();
                 alert('读取 PDF 失败: ' + error.message);
-            } finally {
                 hideLoader();
+                return false;
+            } finally {
+                if (pdfPrepareAbortController === requestController) {
+                    pdfPrepareAbortController = null;
+                    hideLoader();
+                }
             }
         }
 

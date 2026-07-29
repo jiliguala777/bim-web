@@ -149,6 +149,50 @@ class EnergyTemplateTests(unittest.TestCase):
         self.assertIn("fd.append('crop_bbox_px'", html)
         self.assertIn("fd.append('crop_preview_size'", html)
 
+    def test_pdf_async_requests_guard_prepare_and_preview_generations(self):
+        html = Path("templates/energy.html").read_text(encoding="utf-8")
+
+        self.assertIn("let pdfUploadSessionId = 0;", html)
+        self.assertIn("let pdfPreviewRequestId = 0;", html)
+        self.assertIn("function advancePdfUploadSession()", html)
+        self.assertIn("function advancePdfPreviewRequest()", html)
+        self.assertIn("pdfPrepareAbortController.abort()", html)
+        self.assertIn("pdfPreviewAbortController.abort()", html)
+
+        prepare_segment = html[
+            html.index("async function preparePdf(file")
+            :html.index("async function recognizePreparedPdf()")
+        ]
+        self.assertIn(
+            "!pdfPrepareSessionMatchesCurrent(uploadSessionId, pdfUploadSessionId)",
+            prepare_segment,
+        )
+        self.assertLess(
+            prepare_segment.index("!pdfPrepareSessionMatchesCurrent"),
+            prepare_segment.index("preparedPdf = {"),
+        )
+
+        preview_segment = html[
+            html.index("async function loadPreparedPdfPreview()")
+            :html.index("function resetPreparedPdfSelection()")
+        ]
+        self.assertIn("const previewRequest = {", preview_segment)
+        self.assertIn("signal: requestController.signal", preview_segment)
+        self.assertIn("const decodedPreview = await decodePdfPreviewImage", preview_segment)
+        decode_index = preview_segment.index(
+            "const decodedPreview = await decodePdfPreviewImage"
+        )
+        post_decode_guard = preview_segment.index(
+            "if (!isCurrentPdfPreviewRequest(previewRequest)) return false;",
+            decode_index,
+        )
+        visible_commit = preview_segment.index(
+            "previewImage.src = decodedPreview.src",
+            post_decode_guard,
+        )
+        self.assertLess(decode_index, post_decode_guard)
+        self.assertLess(post_decode_guard, visible_commit)
+
     def test_energy_request_and_server_forward_detailed_boundary_values(self):
         html = Path("templates/energy.html").read_text(encoding="utf-8")
         server = Path("web_server_server.py").read_text(encoding="utf-8")

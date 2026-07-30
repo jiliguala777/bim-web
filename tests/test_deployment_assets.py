@@ -140,43 +140,5 @@ class DeploymentAssetTests(unittest.TestCase):
         ):
             self.assertIn(expected, checklist)
 
-    def test_annotation_and_training_operator_assets_are_documented(self):
-        for relative_path in (
-            "annotation_tool/start_annotation_tool.ps1",
-            "training/setup_training_env.ps1",
-            "training/requirements-training.txt",
-            "annotation_tool/README.md",
-        ):
-            self.assertTrue((ROOT / relative_path).is_file(), relative_path)
-
-        annotation_guide = self.read("annotation_tool/README.md")
-        for expected in (
-            "127.0.0.1",
-            r"G:\bim网页\标注数据",
-            r"G:\bim网页\标注工具\data",
-            "构件骨架粗线",
-            "confirmed",
-            "single_page_overfit",
-        ):
-            self.assertIn(expected, annotation_guide)
-
-        project_guide = self.read("README.md")
-        for expected in (
-            r".\annotation_tool\start_annotation_tool.ps1",
-            r".\training\setup_training_env.ps1",
-            "-m training.run_experiment",
-            "ONNX_MODEL_PATH",
-            "single_page_overfit",
-            "不自动部署到生产服务器",
-        ):
-            self.assertIn(expected, project_guide)
-
-        launcher = self.read("annotation_tool/start_annotation_tool.ps1")
-        self.assertIn("--host 127.0.0.1", launcher)
-        requirements = self.read("training/requirements-training.txt")
-        self.assertIn("segmentation-models-pytorch", requirements)
-        self.assertIn("onnxruntime", requirements)
-
-
 if __name__ == "__main__":
     unittest.main()

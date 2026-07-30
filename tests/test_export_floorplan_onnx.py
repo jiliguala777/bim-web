@@ -1,34 +1,17 @@
 import unittest
-import tempfile
-from pathlib import Path
 from subprocess import CompletedProcess
 
 import numpy as np
 
 from tools.export_floorplan_onnx import (
-    ONNX_EXPORT_OPTIONS,
     check_onnx_in_subprocess,
     compare_outputs,
     extract_state_dict,
     require_equivalent,
-    export_onnx,
 )
 
 
 class ExportFloorplanOnnxTests(unittest.TestCase):
-    def test_export_uses_legacy_path_compatible_with_declared_dependencies(self):
-        self.assertIs(ONNX_EXPORT_OPTIONS["dynamo"], False)
-
-    def test_export_refuses_to_overwrite_an_existing_destination(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            destination = Path(temporary) / "existing.onnx"
-            destination.write_bytes(b"production-model")
-
-            with self.assertRaises(FileExistsError):
-                export_onnx(Path(temporary) / "checkpoint.pt", destination)
-
-            self.assertEqual(destination.read_bytes(), b"production-model")
-
     def test_checker_subprocess_reports_native_crash_without_killing_parent(self):
         def fake_run(*args, **kwargs):
             return CompletedProcess(args=args[0], returncode=-1073741819, stdout="", stderr="access violation")

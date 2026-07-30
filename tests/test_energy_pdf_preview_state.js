@@ -4,7 +4,7 @@ const assert = require("assert");
 const fs = require("fs");
 const vm = require("vm");
 const recognitionState = require(
-  "../annotation_tool/static/energy_pdf_recognition_state.js"
+  "../static/energy/pdf_recognition_state.js"
 );
 
 const html = fs.readFileSync("templates/energy.html", "utf8");

@@ -342,13 +342,13 @@ http://127.0.0.1:5000
 
 正常的矢量 PDF 会继续使用矢量线段和文字提取来增强预处理。对于极其复杂的
 页面，矢量提取最多运行 15 秒；到达时限后，系统会自动改用 100 DPI 栅格渲染
-准备该页。界面事件日志会显示“复杂 PDF 已使用栅格模式准备，可正常标注墙、
-窗、门。”；内部预处理元数据则把 `vector_analysis.mode` 记录为
-`raster_fallback`。这不是失败：栅格后备页仍可用于墙、窗、门的人工标注和训练。
+准备该页。界面事件日志会提示复杂 PDF 已切换到栅格模式；内部预处理元数据则把
+`vector_analysis.mode` 记录为 `raster_fallback`。这不是失败：栅格后备页仍可
+继续进行墙、窗、门识别并进入后续能耗分析流程。
 
 栅格后备不包含可靠的矢量比例尺证据，因此比例尺必须在后续能耗工作流中通过
 人工标定或其他可靠资料处理。页面处于准备状态时，请勿重复点击“准备所选页面”
-或反复切换页面；等待状态恢复后再继续预标注和人工编辑。
+或反复切换页面；等待状态恢复后再继续识别。
 
 ## 10. 材料库
 
@@ -840,29 +840,6 @@ HTML、CSS、JavaScript 修改也需要确认服务器已经拉取新提交；�
 - [文化宫年度能耗与运行环境交接](docs/新对话交接_文化宫年度能耗与运行环境_2026-07-15.md)
 - [文化宫负荷与模型接入交接](docs/新对话交接_文化宫负荷与模型接入_2026-07-14.md)
 - [当前负荷与年度能耗计算审计报告](docs/文化宫四层_当前负荷与年度能耗计算审计报告_2026-07-15.md)
-
-## PDF 标注与单页模型微调
-
-新版标注工具复用网站的多页 PDF 预处理和 512 模型输入流程，标注数据与实验模型默认保存到 Git 仓库之外的 `G:\bim网页\标注数据`。
-
-```powershell
-.\annotation_tool\start_annotation_tool.ps1
-.\training\setup_training_env.ps1
-.\.venv-train\Scripts\python.exe -m training.run_experiment `
-  --dataset "G:\bim网页\标注数据\exports\你的导出目录" `
-  --checkpoint "G:\bim-web\models\M2_pub_plus_user.pt" `
-  --output "G:\bim网页\标注数据\models\一层单页实验" `
-  --device cpu
-```
-
-在本地网站中复测实验 ONNX：
-
-```powershell
-$env:ONNX_MODEL_PATH="G:\bim网页\标注数据\models\一层单页实验\best.onnx"
-.\start_local.ps1
-```
-
-同一 PDF 页训练后再识别同一页属于 `single_page_overfit`，只验证拟合能力和训练链路，不代表对其他图纸的泛化效果。实验模型不自动部署到生产服务器，生产切换需要独立验证和单独决定。完整步骤见 [标注与训练指南](annotation_tool/README.md)。
 
 ## 22. 当前生产基线
 

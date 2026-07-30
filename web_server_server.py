@@ -1547,9 +1547,9 @@ def preview_energy_pdf_page():
 @app.route('/energy/crop_region.js', methods=['GET'])
 @login_required
 def energy_crop_region_helper():
-    """Serve the shared crop-selection helper without duplicating its source."""
+    """Serve the energy crop-selection helper."""
     return send_from_directory(
-        os.path.join(BASE_DIR, 'annotation_tool', 'static'),
+        os.path.join(BASE_DIR, 'static', 'energy'),
         'crop_region.js',
         mimetype='application/javascript',
     )
@@ -1560,8 +1560,8 @@ def energy_crop_region_helper():
 def energy_pdf_recognition_state_helper():
     """Serve the PDF recognition request-state helper."""
     return send_from_directory(
-        os.path.join(BASE_DIR, 'annotation_tool', 'static'),
-        'energy_pdf_recognition_state.js',
+        os.path.join(BASE_DIR, 'static', 'energy'),
+        'pdf_recognition_state.js',
         mimetype='application/javascript',
     )
 

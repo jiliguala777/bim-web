@@ -1,7 +1,7 @@
 "use strict";
 
 const assert = require("assert");
-const crop = require("../annotation_tool/static/crop_region.js");
+const crop = require("../static/energy/crop_region.js");
 
 assert.deepStrictEqual(
   crop.normalizeCrop(

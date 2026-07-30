@@ -16,7 +16,6 @@ MODEL_INPUT_SHAPE = (1, 3, 512, 512)
 MODEL_OUTPUT_SHAPE = (1, 4, 512, 512)
 DEFAULT_MAX_ABS_ERROR = 1e-4
 DEFAULT_MIN_ARGMAX_AGREEMENT = 0.99999
-ONNX_EXPORT_OPTIONS = {"dynamo": False}
 
 
 def check_onnx_in_subprocess(
@@ -145,11 +144,6 @@ def export_onnx(
     allow_checker_failure: bool = False,
 ) -> dict[str, Any]:
     """Export, check, execute, and compare the real floorplan model."""
-    destination = Path(output_path).resolve()
-    if destination.exists():
-        raise FileExistsError(f"refusing to overwrite ONNX output: {destination}")
-    if Path(checkpoint_path).resolve() == destination:
-        raise ValueError("checkpoint and ONNX output paths must differ")
     try:
         import onnxruntime as ort
         import torch
@@ -159,6 +153,7 @@ def export_onnx(
         ) from exc
 
     model = load_checkpoint_model(checkpoint_path)
+    destination = Path(output_path)
     destination.parent.mkdir(parents=True, exist_ok=True)
 
     generator = torch.Generator(device="cpu").manual_seed(20260714)
@@ -180,7 +175,6 @@ def export_onnx(
         input_names=["input"],
         output_names=["logits"],
         dynamic_axes=None,
-        **ONNX_EXPORT_OPTIONS,
     )
 
     checker = check_onnx_in_subprocess(destination)

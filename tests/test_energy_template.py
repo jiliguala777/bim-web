@@ -745,7 +745,7 @@ class EnergyRouteClientTests(unittest.TestCase):
         self.assertIn("javascript", response.mimetype)
         self.assertEqual(
             response.get_data(),
-            (Path("annotation_tool") / "static" / "crop_region.js").read_bytes(),
+            Path("static/energy/crop_region.js").read_bytes(),
         )
 
     def test_pdf_recognition_state_helper_is_served_to_the_energy_ui(self):
@@ -756,12 +756,12 @@ class EnergyRouteClientTests(unittest.TestCase):
         self.assertIn("javascript", response.mimetype)
         self.assertEqual(
             response.get_data(),
-            (
-                Path("annotation_tool")
-                / "static"
-                / "energy_pdf_recognition_state.js"
-            ).read_bytes(),
+            Path("static/energy/pdf_recognition_state.js").read_bytes(),
         )
+
+    def test_energy_assets_do_not_depend_on_annotation_tool_directory(self):
+        source = Path("web_server_server.py").read_text(encoding="utf-8")
+        self.assertNotIn("annotation_tool', 'static", source)
 
     def test_ai_recognize_rejects_invalid_crop_region_requests(self):
         from floorplan_page_pipeline import PreparedFloorplanPage

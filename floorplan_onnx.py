@@ -92,11 +92,10 @@ class FloorplanSegmenterONNX:
 
     # ============ 推理 ============
 
-    def _run_inference(self, img_rgb):
-        """ONNX推理核心"""
+    def prepare_model_input(self, img_rgb):
+        """Create the exact normalized 512px letterbox consumed by ONNX."""
         h_orig, w_orig = img_rgb.shape[:2]
 
-        # Match the annotation/training tool: preserve aspect ratio and letterbox.
         resize_scale = self.img_size / max(w_orig, h_orig)
         resized_w = max(1, round(w_orig * resize_scale))
         resized_h = max(1, round(h_orig * resize_scale))
@@ -114,6 +113,25 @@ class FloorplanSegmenterONNX:
 
         # NCHW
         tensor = normalized.transpose(2, 0, 1)[np.newaxis, ...].astype(np.float32)
+        metadata = {
+            "original_size": [w_orig, h_orig],
+            "resized_size": [resized_w, resized_h],
+            "padding": [
+                top,
+                left,
+                self.img_size - resized_h - top,
+                self.img_size - resized_w - left,
+            ],
+            "resize_scale": float(resize_scale),
+        }
+        return img_rgb, tensor, metadata
+
+    def _run_inference(self, img_rgb):
+        """ONNX推理核心"""
+        h_orig, w_orig = img_rgb.shape[:2]
+        _, tensor, metadata = self.prepare_model_input(img_rgb)
+        resized_w, resized_h = metadata["resized_size"]
+        top, left, _, _ = metadata["padding"]
 
         # Run
         output = self.session.run(None, {self.input_name: tensor})[0]  # (1, 4, 512, 512)

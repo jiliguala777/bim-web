@@ -1,4 +1,5 @@
 import os
+from pathlib import Path
 import secrets
 import json
 import math
@@ -7,7 +8,7 @@ import zipfile
 import threading
 import uuid
 import time
-from flask import Flask, request, render_template, jsonify, send_file, session, redirect, url_for
+from flask import Flask, request, render_template, jsonify, send_file, send_from_directory, session, redirect, url_for
 from itsdangerous import BadSignature, URLSafeSerializer
 from werkzeug.utils import secure_filename
 from functools import wraps
@@ -41,6 +42,7 @@ except ImportError as e:
 # --- AI 图纸识别模块 ---
 try:
     from floorplan_onnx import get_segmenter
+    from floorplan_page_pipeline import _write_image, prepare_pdf_page
     from floorplan_rooms import apply_scale_to_room_topology
     _floorplan_segmenter = get_segmenter(ONNX_MODEL_PATH)
     HAS_FLOORPLAN_AI = True
@@ -1250,6 +1252,12 @@ import base64
 import cv2
 import numpy as np
 import time as _time
+from energy_pdf_region import (
+    crop_page_inputs,
+    map_crop_bbox_to_page,
+    parse_crop_region_request,
+    render_pdf_page_preview,
+)
 
 # ==========================================
 # 路由 - AI 图纸识别 (语义分割)
@@ -1335,6 +1343,10 @@ def _build_recognition_payload(result, preprocessing, use_preprocessing, raster_
         },
         'pdf_page_number': result.get('pdf_page_number'),
         'pdf_page_count': result.get('pdf_page_count'),
+        'recognition_mode': result.get('recognition_mode', 'full_page'),
+        'crop_bbox_page_px': result.get('crop_bbox_page_px'),
+        'crop_bbox_preview_px': result.get('crop_bbox_preview_px'),
+        'crop_preview_size': result.get('crop_preview_size'),
         'vector_cleanup': result.get('vector_cleanup') or {
             'enabled': False,
             'has_vector_geometry': False,
@@ -1428,6 +1440,29 @@ def _load_pdf_upload_token(token):
     return payload
 
 
+def _validated_prepared_pdf(report_number, pdf_upload_token, pdf_page_number):
+    """Return a validated stored PDF path, selected page, and page count."""
+    prepared_pdf = _load_pdf_upload_token(pdf_upload_token)
+    if prepared_pdf.get('report_number') != report_number:
+        raise ValueError('PDF upload token does not match this report')
+
+    stored_filename = str(prepared_pdf.get('stored_filename') or '')
+    if secure_filename(stored_filename) != stored_filename or not stored_filename.endswith('.pdf'):
+        raise ValueError('PDF upload token is invalid')
+    try:
+        page_count = int(prepared_pdf.get('page_count'))
+        page_number = int(pdf_page_number)
+    except (TypeError, ValueError) as exc:
+        raise ValueError('PDF page number must be an integer') from exc
+    if page_number < 1 or page_number > page_count:
+        raise ValueError(f'PDF page number must be between 1 and {page_count}')
+
+    pdf_path = Path(app.config['UPLOAD_FOLDER']) / 'energy' / report_number / stored_filename
+    if not pdf_path.is_file():
+        raise ValueError('Prepared PDF file no longer exists')
+    return pdf_path, page_number, page_count
+
+
 @app.route('/energy/pdf_prepare', methods=['POST'])
 @login_required
 def prepare_energy_pdf():
@@ -1468,6 +1503,69 @@ def prepare_energy_pdf():
     })
 
 
+@app.route('/energy/pdf_page_preview', methods=['POST'])
+@login_required
+def preview_energy_pdf_page():
+    """Render a selected prepared-PDF page for client-side region selection."""
+    report_number = secure_filename(request.form.get('report_number', 'default')) or 'default'
+    try:
+        pdf_path, page_number, page_count = _validated_prepared_pdf(
+            report_number,
+            request.form.get('pdf_upload_token', '').strip(),
+            request.form.get('pdf_page_number', '1'),
+        )
+    except ValueError as exc:
+        return jsonify({'error': str(exc)}), 400
+
+    try:
+        preview_bgr = render_pdf_page_preview(
+            pdf_path,
+            page_number,
+            page_count,
+            _resolve_poppler_path(),
+        )
+        encoded, jpeg = cv2.imencode(
+            '.jpg',
+            preview_bgr,
+            [cv2.IMWRITE_JPEG_QUALITY, 85],
+        )
+        if not encoded:
+            raise ValueError('Cannot encode PDF preview')
+    except Exception as exc:
+        return jsonify({'error': f'PDF preview failed: {exc}'}), 500
+
+    height, width = preview_bgr.shape[:2]
+    return jsonify({
+        'success': True,
+        'pdf_page_number': page_number,
+        'pdf_page_count': page_count,
+        'image_size': [width, height],
+        'image': base64.b64encode(jpeg).decode('utf-8'),
+    })
+
+
+@app.route('/energy/crop_region.js', methods=['GET'])
+@login_required
+def energy_crop_region_helper():
+    """Serve the energy crop-selection helper."""
+    return send_from_directory(
+        os.path.join(BASE_DIR, 'static', 'energy'),
+        'crop_region.js',
+        mimetype='application/javascript',
+    )
+
+
+@app.route('/energy/pdf_recognition_state.js', methods=['GET'])
+@login_required
+def energy_pdf_recognition_state_helper():
+    """Serve the PDF recognition request-state helper."""
+    return send_from_directory(
+        os.path.join(BASE_DIR, 'static', 'energy'),
+        'pdf_recognition_state.js',
+        mimetype='application/javascript',
+    )
+
+
 @app.route('/energy/ai_recognize', methods=['POST'])
 @login_required
 def ai_recognize():
@@ -1489,32 +1587,33 @@ def ai_recognize():
         preprocessing = request.form.get('preprocessing', 'auto')
         use_preprocessing = preprocessing != 'none'
 
+        try:
+            region_request = parse_crop_region_request(
+                request.form.get('recognition_mode', 'full_page'),
+                request.form.get('crop_bbox_px'),
+                request.form.get('crop_preview_size'),
+            )
+        except ValueError as exc:
+            return jsonify({'error': str(exc)}), 400
+
         pdf_upload_token = request.form.get('pdf_upload_token', '').strip()
+        if region_request['mode'] == 'crop_region' and not pdf_upload_token:
+            return jsonify({
+                'error': 'crop_region requires a prepared PDF upload',
+            }), 400
         pdf_page_number = None
         pdf_page_count = None
 
         if pdf_upload_token:
             try:
-                prepared_pdf = _load_pdf_upload_token(pdf_upload_token)
+                prepared_pdf_path, pdf_page_number, pdf_page_count = _validated_prepared_pdf(
+                    report_number,
+                    pdf_upload_token,
+                    request.form.get('pdf_page_number', '1'),
+                )
             except ValueError as exc:
                 return jsonify({'error': str(exc)}), 400
-            if prepared_pdf.get('report_number') != report_number:
-                return jsonify({'error': 'PDF upload token does not match this report'}), 400
-
-            stored_filename = str(prepared_pdf.get('stored_filename') or '')
-            if secure_filename(stored_filename) != stored_filename or not stored_filename.endswith('.pdf'):
-                return jsonify({'error': 'PDF upload token is invalid'}), 400
-            try:
-                pdf_page_count = int(prepared_pdf.get('page_count'))
-                pdf_page_number = int(request.form.get('pdf_page_number', '1'))
-            except (TypeError, ValueError):
-                return jsonify({'error': 'PDF page number must be an integer'}), 400
-            if pdf_page_number < 1 or pdf_page_number > pdf_page_count:
-                return jsonify({'error': f'PDF page number must be between 1 and {pdf_page_count}'}), 400
-
-            raster_path = os.path.join(target_dir, stored_filename)
-            if not os.path.isfile(raster_path):
-                return jsonify({'error': 'Prepared PDF file no longer exists'}), 400
+            raster_path = os.fspath(prepared_pdf_path)
             ext = 'pdf'
         else:
             if 'raster_file' not in request.files:
@@ -1554,148 +1653,123 @@ def ai_recognize():
         }
 
         # PDF → PNG 转换，并优先从矢量文字和线段中自动标定比例尺。
+        prepared_page = None
         if ext == 'pdf':
             try:
-                from pdf2image import convert_from_path
-                pdf_dpi = 200
-                ocr_evidence = {
-                    'status': 'not_needed',
-                    'candidate_count': 0,
-                    'accepted_count': 0,
-                }
-                if HAS_VECTOR_PDF_SCALE:
-                    vector_pdf_dpi = 100
-                    dimension_page_data = extract_vector_page(
-                        raster_path,
-                        page_index=pdf_page_number - 1,
-                        dpi=vector_pdf_dpi,
-                    )
-                    if pdf_page_count is None:
-                        pdf_page_count = dimension_page_data.get('page_count')
-                    if dimension_page_data['is_vector_pdf']:
-                        pdf_dpi = vector_pdf_dpi
-                    else:
-                        scale_calibration['method'] = 'scanned_pdf_manual'
-                images = convert_from_path(
+                prepared_page = prepare_pdf_page(
                     raster_path,
-                    dpi=pdf_dpi,
-                    first_page=pdf_page_number,
-                    last_page=pdf_page_number,
+                    page_number=pdf_page_number,
                     poppler_path=_resolve_poppler_path(),
+                    segmenter=_floorplan_segmenter,
+                    output_dir=target_dir,
                 )
-                if images:
-                    if (
-                        dimension_page_data is not None
-                        and dimension_page_data.get('is_vector_pdf')
-                        and not dimension_page_data.get('has_vector_text')
-                    ):
-                        try:
-                            ocr_images = convert_from_path(
-                                raster_path,
-                                dpi=200,
-                                first_page=pdf_page_number,
-                                last_page=pdf_page_number,
-                                poppler_path=_resolve_poppler_path(),
-                            )
-                            if ocr_images:
-                                ocr_bgr = cv2.cvtColor(
-                                    np.asarray(ocr_images[0]),
-                                    cv2.COLOR_RGB2BGR,
-                                )
-                                ocr_spans, ocr_evidence = extract_numeric_text_spans(
-                                    ocr_bgr,
-                                    dimension_page_data['page_size_pt'],
-                                )
-                                dimension_page_data['text_spans'] = ocr_spans
-                        except Exception as ocr_error:
-                            ocr_evidence = {
-                                'status': 'failed',
-                                'candidate_count': 0,
-                                'accepted_count': 0,
-                                'reason': str(ocr_error),
-                            }
-                    if dimension_page_data is not None and dimension_page_data.get('is_vector_pdf'):
-                        dimension_candidates = detect_dimension_candidates(dimension_page_data)
-                        scale_calibration = calibrate_from_overall_dimensions(dimension_page_data)
-                        if dimension_page_data.get('has_vector_text'):
-                            dimension_cleanup_candidates = dimension_candidates
-                            scale_calibration['text_source'] = 'pdf_text'
-                        elif ocr_evidence.get('accepted_count'):
-                            scale_calibration['text_source'] = 'rapidocr'
-                        else:
-                            scale_calibration['text_source'] = 'none'
-                    png_path = os.path.join(target_dir, 'building_plan_ai.png')
-                    images[0].save(png_path, 'PNG')
-                    raster_path = png_path
+                pdf_page_count = prepared_page.page_count
+                scale_calibration = prepared_page.scale_calibration
+                vector_cleanup = dict(prepared_page.vector_cleanup)
+                png_path = os.path.join(target_dir, 'building_plan_ai.png')
+                raster_path = png_path
             except Exception as e:
                 return jsonify({'error': f'PDF conversion failed: {e}'}), 500
 
         # AI 推理
-        img_bgr = cv2.imread(raster_path)
+        img_bgr = (
+            prepared_page.cleaned_bgr.copy()
+            if prepared_page is not None
+            else cv2.imread(raster_path)
+        )
         if img_bgr is None:
             return jsonify({'error': 'Cannot decode image'}), 400
 
-        original_bgr = img_bgr.copy()
-        combined_cleanup_mask = np.zeros(img_bgr.shape[:2], dtype=np.uint8)
-        structural_support_mask = None
-        inference_roi = None
-        if dimension_page_data is not None:
-            dimension_page_data['render_size_px'] = [img_bgr.shape[1], img_bgr.shape[0]]
-        if dimension_page_data is not None and dimension_cleanup_candidates:
-            annotation_mask = build_dimension_annotation_mask(
-                dimension_page_data,
-                dimension_cleanup_candidates,
+        original_bgr = (
+            prepared_page.render_bgr.copy()
+            if prepared_page is not None
+            else img_bgr.copy()
+        )
+        combined_cleanup_mask = (
+            prepared_page.cleanup_mask.copy()
+            if prepared_page is not None
+            else np.zeros(img_bgr.shape[:2], dtype=np.uint8)
+        )
+        structural_support_mask = (
+            prepared_page.structural_support_mask
+            if prepared_page is not None
+            else None
+        )
+        inference_roi = (
+            prepared_page.inference_roi
+            if prepared_page is not None
+            else None
+        )
+        crop_bbox_page_px = None
+        if prepared_page is not None and region_request['mode'] == 'crop_region':
+            page_height, page_width = prepared_page.render_bgr.shape[:2]
+            crop_bbox_page_px = map_crop_bbox_to_page(
+                region_request['crop_bbox_px'],
+                region_request['preview_size'],
+                [page_width, page_height],
             )
-            annotation_mask_path = os.path.join(target_dir, 'pdf_dimension_mask.png')
-            cv2.imwrite(annotation_mask_path, annotation_mask)
-            combined_cleanup_mask = cv2.bitwise_or(combined_cleanup_mask, annotation_mask)
+            cropped_inputs = crop_page_inputs(
+                prepared_page.render_bgr,
+                prepared_page.cleaned_bgr,
+                prepared_page.cleanup_mask,
+                prepared_page.structural_support_mask,
+                prepared_page.inference_roi,
+                crop_bbox_page_px,
+            )
+            original_bgr = cropped_inputs['render_bgr']
+            img_bgr = cropped_inputs['cleaned_bgr']
+            combined_cleanup_mask = cropped_inputs['cleanup_mask']
+            structural_support_mask = cropped_inputs['structural_support_mask']
+            inference_roi = cropped_inputs['inference_roi']
+            building_roi = dict(vector_cleanup.get('building_roi') or {})
+            building_roi.update({
+                'enabled': True,
+                'bbox_px': inference_roi,
+            })
+            vector_cleanup['building_roi'] = building_roi
 
-        if dimension_page_data is not None and dimension_page_data.get('has_vector_geometry'):
-            nonstructural_mask, nonstructural_evidence = build_nonstructural_vector_mask(
-                dimension_page_data,
+        if prepared_page is not None:
+            _write_image(Path(raster_path), original_bgr)
+
+        has_vector_geometry = bool(
+            prepared_page is not None
+            and prepared_page.vector_cleanup.get('has_vector_geometry')
+        )
+
+        if (
+            prepared_page is not None
+            and (
+                np.any(combined_cleanup_mask)
+                or vector_cleanup.get('nonstructural_mask', {}).get('enabled')
             )
-            structural_support_mask, structural_evidence = build_structural_vector_mask(
-                dimension_page_data,
+        ):
+            _write_image(
+                Path(target_dir) / 'pdf_nonstructural_mask.png',
+                combined_cleanup_mask,
             )
-            building_roi = detect_building_roi(dimension_page_data)
-            vector_cleanup = {
-                'enabled': bool(
-                    nonstructural_evidence.get('enabled')
-                    or structural_evidence.get('enabled')
-                    or building_roi.get('enabled')
-                ),
-                'has_vector_geometry': True,
-                'has_vector_text': bool(dimension_page_data.get('has_vector_text')),
-                'ocr': ocr_evidence,
-                'nonstructural_mask': nonstructural_evidence,
-                'structural_mask': structural_evidence,
-                'building_roi': building_roi,
-            }
-            if nonstructural_evidence.get('enabled'):
-                nonstructural_path = os.path.join(target_dir, 'pdf_nonstructural_mask.png')
-                cv2.imwrite(nonstructural_path, nonstructural_mask)
-                combined_cleanup_mask = cv2.bitwise_or(
-                    combined_cleanup_mask,
-                    nonstructural_mask,
-                )
-            if structural_evidence.get('enabled'):
-                cv2.imwrite(
-                    os.path.join(target_dir, 'pdf_structural_mask.png'),
+
+        if prepared_page is not None and has_vector_geometry:
+            if (
+                structural_support_mask is not None
+                and vector_cleanup.get('structural_mask', {}).get('enabled')
+            ):
+                _write_image(
+                    Path(target_dir) / 'pdf_structural_mask.png',
                     structural_support_mask,
                 )
-            if building_roi.get('enabled'):
-                inference_roi = building_roi.get('bbox_px')
+            building_roi = vector_cleanup.get('building_roi') or {
+                'enabled': False,
+                'bbox_px': None,
+            }
             roi_path = os.path.join(target_dir, 'pdf_building_roi.json')
             with open(roi_path, 'w', encoding='utf-8') as roi_file:
                 json.dump(building_roi, roi_file, ensure_ascii=False, indent=2)
 
-        if np.any(combined_cleanup_mask):
-            img_bgr = remove_dimension_annotations(img_bgr, combined_cleanup_mask)
-        if dimension_page_data is not None and dimension_page_data.get('has_vector_geometry'):
-            cv2.imwrite(os.path.join(target_dir, 'pdf_model_input.png'), img_bgr)
+        if prepared_page is not None and has_vector_geometry:
+            _write_image(Path(target_dir) / 'pdf_model_input.png', img_bgr)
 
         predict_kwargs = {}
-        if dimension_page_data is not None and dimension_page_data.get('has_vector_geometry'):
+        if has_vector_geometry:
             topology_min_room_area_px = min(
                 5000.0,
                 max(500.0, img_bgr.shape[0] * img_bgr.shape[1] * 0.0002),
@@ -1733,6 +1807,10 @@ def ai_recognize():
         result['scale_calibration'] = scale_calibration
         result['pdf_page_number'] = pdf_page_number
         result['pdf_page_count'] = pdf_page_count
+        result['recognition_mode'] = region_request['mode']
+        result['crop_bbox_page_px'] = crop_bbox_page_px
+        result['crop_bbox_preview_px'] = region_request['crop_bbox_px']
+        result['crop_preview_size'] = region_request['preview_size']
         result['vector_cleanup'] = vector_cleanup
 
         mask = result['mask']
@@ -1762,7 +1840,11 @@ def ai_recognize():
         # 保存结果
         overlay_path = os.path.join(target_dir, 'ai_overlay.jpg')
         mask_path = os.path.join(target_dir, 'ai_mask.png')
-        cv2.imwrite(overlay_path, overlay, [cv2.IMWRITE_JPEG_QUALITY, 90])
+        _write_image(
+            Path(overlay_path),
+            overlay,
+            [cv2.IMWRITE_JPEG_QUALITY, 90],
+        )
 
         raw_model_mask = result.get('raw_model_mask')
         if raw_model_mask is not None:
@@ -1770,14 +1852,14 @@ def ai_recognize():
             raw_mask_color[raw_model_mask == 1] = (60, 76, 231)
             raw_mask_color[raw_model_mask == 2] = (219, 152, 52)
             raw_mask_color[raw_model_mask == 3] = (113, 204, 46)
-            cv2.imwrite(os.path.join(target_dir, 'ai_raw_model_mask.png'), raw_mask_color)
+            _write_image(Path(target_dir) / 'ai_raw_model_mask.png', raw_mask_color)
 
         # mask 转彩色保存
         mask_color = np.zeros((h, w, 3), dtype=np.uint8)
         mask_color[mask == 1] = (60, 76, 231)   # wall - red
         mask_color[mask == 2] = (219, 152, 52)   # window - blue
         mask_color[mask == 3] = (113, 204, 46)   # door - green
-        cv2.imwrite(mask_path, mask_color)
+        _write_image(Path(mask_path), mask_color)
 
         # 编码为base64用于前端展示
         _, overlay_buf = cv2.imencode('.jpg', overlay, [cv2.IMWRITE_JPEG_QUALITY, 85])
@@ -1846,6 +1928,10 @@ def ai_recognize():
             'scale_calibration': scale_calibration,
             'pdf_page_number': pdf_page_number,
             'pdf_page_count': pdf_page_count,
+            'recognition_mode': result['recognition_mode'],
+            'crop_bbox_page_px': result['crop_bbox_page_px'],
+            'crop_bbox_preview_px': result['crop_bbox_preview_px'],
+            'crop_preview_size': result['crop_preview_size'],
             'vector_cleanup': vector_cleanup,
             'topology_repair': result.get('topology_repair') or {},
             'pixel_lengths': {

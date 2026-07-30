@@ -290,6 +290,54 @@
             cursor: pointer;
         }
 
+        .pdf-preview-frame {
+            margin-top: 16px;
+            padding: 12px;
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            background: rgba(0, 0, 0, 0.18);
+            text-align: center;
+            overflow: auto;
+        }
+
+        .pdf-preview-image-wrap {
+            position: relative;
+            display: inline-block;
+            max-width: 100%;
+            line-height: 0;
+            touch-action: none;
+        }
+
+        #pdf-page-preview-image {
+            display: block;
+            max-width: 100%;
+            max-height: 70vh;
+            user-select: none;
+        }
+
+        #pdf-crop-overlay {
+            position: absolute;
+            border: 2px solid var(--warning);
+            background: rgba(241, 196, 15, 0.18);
+            pointer-events: none;
+        }
+
+        .pdf-mode-controls {
+            display: flex;
+            gap: 16px;
+            align-items: center;
+            flex-wrap: wrap;
+            margin-top: 14px;
+        }
+
+        .pdf-mode-controls label {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            color: var(--text);
+            cursor: pointer;
+        }
+
         /* 输入控件 */
         .form-group {
             margin-bottom: 20px;
@@ -846,7 +894,28 @@
                         <label class="form-label" for="pdf-page-select">需要识别的页码</label>
                         <select id="pdf-page-select" class="form-control"></select>
                     </div>
-                    <button type="button" id="recognize-selected-page" class="btn btn-primary">开始识别所选页</button>
+                    <button type="button" id="reload-pdf-preview" class="btn btn-secondary">重新加载预览</button>
+                </div>
+                <div class="pdf-preview-frame">
+                    <div class="pdf-preview-image-wrap">
+                        <img id="pdf-page-preview-image" src="" alt="所选 PDF 页面预览" draggable="false">
+                        <div id="pdf-crop-overlay" class="hidden"></div>
+                    </div>
+                </div>
+                <div class="pdf-mode-controls">
+                    <label>
+                        <input type="radio" id="pdf-recognition-mode-full" name="pdf-recognition-mode" value="full_page" checked>
+                        识别整页
+                    </label>
+                    <label>
+                        <input type="radio" id="pdf-recognition-mode-crop" name="pdf-recognition-mode" value="crop_region">
+                        框选区域
+                    </label>
+                    <button type="button" id="clear-pdf-crop" class="btn btn-secondary" disabled>清除框选</button>
+                    <span id="pdf-crop-summary" style="color:var(--text-muted); font-size:13px;">整页识别模式</span>
+                </div>
+                <div style="margin-top:14px;">
+                    <button type="button" id="recognize-selected-page" class="btn btn-primary" disabled>开始识别整页</button>
                 </div>
             </div>
 
@@ -1547,11 +1616,27 @@
         </div>
     </div>
 
+    <script src="/energy/crop_region.js"></script>
+    <script src="/energy/pdf_recognition_state.js"></script>
     <script>
         let currentStep = 1;
         let reportNumber = '';
         let aiResultData = null;
         let preparedPdf = null;
+        let pdfRecognitionMode = 'full_page';
+        let pdfCropBBox = null;
+        let pdfCropStart = null;
+        let pdfCropBeforeDrag = null;
+        let pdfCropDragging = false;
+        let pdfPreviewSize = null;
+        let pdfUploadSessionId = 0;
+        let pdfPreviewRequestId = 0;
+        let pdfPrepareAbortController = null;
+        let pdfPreviewAbortController = null;
+        const pdfRecognitionRequests =
+            EnergyPdfRecognitionState.createRecognitionRequestState();
+        const scaleCalibrationRequests =
+            EnergyPdfRecognitionState.createSelectionBoundRequestState();
         let calibrationPoints = [];
         let energyResultData = null;
         let chartInstance = null;
@@ -2291,35 +2376,79 @@
         }
 
         async function saveManualScaleCalibration() {
+            if (!hasCurrentAiRecognitionResult()) {
+                alert('当前图纸选择尚无可用识别结果，请先重新识别。');
+                return false;
+            }
             if (calibrationPoints.length !== 2) {
                 alert('请先在原图上选择两个端点。');
-                return;
+                return false;
             }
             const actualLength = parseFloat(document.getElementById('manual-scale-length').value);
             if (!Number.isFinite(actualLength) || actualLength <= 0) {
                 alert('请输入有效的实际长度。');
-                return;
+                return false;
             }
-            const response = await fetch('/energy/scale_calibration', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    report_number: reportNumber,
-                    point_a: calibrationPoints[0],
-                    point_b: calibrationPoints[1],
-                    actual_length: actualLength,
-                    unit: document.getElementById('manual-scale-unit').value
-                })
-            });
-            const data = await response.json();
-            if (!response.ok || data.error) {
-                alert('比例尺标定失败：' + (data.error || response.statusText));
-                return;
+            const calibrationSelection = currentPdfRecognitionSelection();
+            const requestController = new AbortController();
+            const calibrationRequest = scaleCalibrationRequests.begin(
+                calibrationSelection,
+                requestController
+            );
+
+            try {
+                const response = await fetch('/energy/scale_calibration', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        report_number: reportNumber,
+                        point_a: calibrationPoints[0],
+                        point_b: calibrationPoints[1],
+                        actual_length: actualLength,
+                        unit: document.getElementById('manual-scale-unit').value
+                    }),
+                    signal: requestController.signal
+                });
+                const data = await response.json();
+                const currentSelection = currentPdfRecognitionSelection();
+                if (
+                    !scaleCalibrationRequests.canCommit(
+                        calibrationRequest,
+                        currentSelection
+                    )
+                    || !pdfRecognitionRequests.hasAccepted(
+                        calibrationRequest.fingerprint
+                    )
+                ) {
+                    return false;
+                }
+                if (!response.ok || data.error) {
+                    throw new Error(data.error || response.statusText);
+                }
+
+                aiResultData.scale_calibration = data.scale_calibration;
+                aiResultData.room_topology = data.room_topology;
+                document.getElementById('scale-calibration-canvas').style.pointerEvents = 'none';
+                applyScaleCalibrationResult(data.scale_calibration, data.room_topology);
+                return true;
+            } catch (error) {
+                if (
+                    error.name === 'AbortError'
+                    || !scaleCalibrationRequests.canCommit(
+                        calibrationRequest,
+                        currentPdfRecognitionSelection()
+                    )
+                ) {
+                    return false;
+                }
+                alert('比例尺标定失败：' + error.message);
+                return false;
+            } finally {
+                scaleCalibrationRequests.finish(
+                    calibrationRequest,
+                    currentPdfRecognitionSelection()
+                );
             }
-            aiResultData.scale_calibration = data.scale_calibration;
-            aiResultData.room_topology = data.room_topology;
-            document.getElementById('scale-calibration-canvas').style.pointerEvents = 'none';
-            applyScaleCalibrationResult(data.scale_calibration, data.room_topology);
         }
 
         // 比例尺变化时，更新实际物理长度
@@ -2383,6 +2512,88 @@
             gotoStep(1);
         }
 
+        function currentPdfRecognitionSelection() {
+            return EnergyPdfRecognitionState.createSelectionFingerprint({
+                uploadSessionId: pdfUploadSessionId,
+                uploadToken: preparedPdf?.uploadToken || null,
+                pageNumber: preparedPdf
+                    ? document.getElementById('pdf-page-select').value
+                    : null,
+                mode: preparedPdf ? pdfRecognitionMode : 'full_page',
+                cropBBox: preparedPdf ? pdfCropBBox : null,
+                previewSize: preparedPdf ? pdfPreviewSize : null
+            });
+        }
+
+        function hasCurrentAiRecognitionResult() {
+            return Boolean(
+                aiResultData
+                && pdfRecognitionRequests.hasAccepted(
+                    currentPdfRecognitionSelection()
+                )
+            );
+        }
+
+        function clearPdfRecognitionDerivedState() {
+            const derivedState = {
+                aiResultData,
+                energyResultData,
+                calibrationPoints
+            };
+            EnergyPdfRecognitionState.invalidateDerivedRecognitionState(
+                derivedState,
+                {
+                    results: document.getElementById('aiRecognitionResults'),
+                    originalImage: document.getElementById('imgOriginal'),
+                    overlayImage: document.getElementById('imgOverlay'),
+                    scaleInput: document.getElementById('param-scale'),
+                    areaInput: document.getElementById('param-floor-area'),
+                    wallLengthInput: document.getElementById('param-wall-length'),
+                    windowLengthInput: document.getElementById('param-window-length'),
+                    calculateButton: document.getElementById('calculate-energy-button'),
+                    calibrationPanel: document.getElementById('scale-calibration-panel'),
+                    calibrationStatus: document.getElementById('scale-calibration-status'),
+                    calibrationCanvas: document.getElementById('scale-calibration-canvas'),
+                    closureSummary: document.getElementById('room-closure-summary')
+                }
+            );
+            aiResultData = derivedState.aiResultData;
+            energyResultData = derivedState.energyResultData;
+            calibrationPoints = derivedState.calibrationPoints;
+        }
+
+        function invalidatePdfRecognitionSelection({ returnToUpload = true } = {}) {
+            const invalidation = pdfRecognitionRequests.invalidate();
+            scaleCalibrationRequests.invalidate();
+            clearPdfRecognitionDerivedState();
+            if (invalidation.hideLoader) {
+                hideLoader();
+            }
+            if (returnToUpload && currentStep > 1) {
+                gotoStep(1);
+            }
+            updatePdfRecognitionControls();
+            return invalidation;
+        }
+
+        function replacePdfCropBBox(nextBBox) {
+            const normalizedBBox = Array.isArray(nextBBox)
+                ? nextBBox.slice()
+                : null;
+            const currentSelection = currentPdfRecognitionSelection();
+            const nextSelection = {
+                ...currentSelection,
+                cropBBox: normalizedBBox
+            };
+            if (!EnergyPdfRecognitionState.fingerprintsEqual(
+                currentSelection,
+                EnergyPdfRecognitionState.createSelectionFingerprint(nextSelection)
+            )) {
+                invalidatePdfRecognitionSelection();
+            }
+            pdfCropBBox = normalizedBBox;
+        }
+
         function toggleOtherDesignParams() {
             const panel = document.getElementById('other-design-params-panel');
             panel.style.display = panel.style.display === 'none' || !panel.style.display ? 'block' : 'none';
@@ -2405,22 +2616,103 @@
             uploadWrapper.addEventListener('drop', (e) => {
                 e.preventDefault();
                 uploadWrapper.style.borderColor = 'rgba(255, 255, 255, 0.15)';
+                if (pdfRecognitionRequests.isInFlight()) return;
                 if (e.dataTransfer.files.length > 0) {
                     handleFile(e.dataTransfer.files[0]);
                 }
             });
 
             fileInput.addEventListener('change', () => {
+                if (pdfRecognitionRequests.isInFlight()) return;
                 if (fileInput.files.length > 0) {
                     handleFile(fileInput.files[0]);
                 }
             });
 
             document.getElementById('recognize-selected-page').addEventListener('click', recognizePreparedPdf);
+            document.getElementById('reload-pdf-preview').addEventListener('click', async () => {
+                invalidatePdfRecognitionSelection();
+                await loadPreparedPdfPreview();
+            });
+            document.getElementById('pdf-page-select').addEventListener('change', async () => {
+                invalidatePdfRecognitionSelection();
+                clearPreparedPdfPreview();
+                await loadPreparedPdfPreview();
+            });
+            document.getElementById('pdf-recognition-mode-full').addEventListener('change', (event) => {
+                if (event.target.checked) setPdfRecognitionMode('full_page');
+            });
+            document.getElementById('pdf-recognition-mode-crop').addEventListener('change', (event) => {
+                if (event.target.checked) setPdfRecognitionMode('crop_region');
+            });
+            document.getElementById('clear-pdf-crop').addEventListener('click', resetPdfCropSelection);
+
+            const previewImage = document.getElementById('pdf-page-preview-image');
+            previewImage.addEventListener('pointerdown', (event) => {
+                if (
+                    pdfRecognitionMode !== 'crop_region'
+                    || !pdfPreviewSize
+                    || pdfRecognitionRequests.isInFlight()
+                    || event.button !== 0
+                ) return;
+                event.preventDefault();
+                pdfCropBeforeDrag =
+                    AnnotationCropRegion.restoreInterruptedCrop(pdfCropBBox);
+                pdfCropDragging = true;
+                pdfCropStart = pdfPreviewPoint(event);
+                replacePdfCropBBox(AnnotationCropRegion.normalizeCrop(
+                    pdfCropStart,
+                    pdfCropStart,
+                    previewImage.naturalWidth,
+                    previewImage.naturalHeight
+                ));
+                previewImage.setPointerCapture(event.pointerId);
+                updatePdfCropOverlay();
+            });
+            previewImage.addEventListener('pointermove', (event) => {
+                if (!pdfCropDragging) return;
+                replacePdfCropBBox(AnnotationCropRegion.normalizeCrop(
+                    pdfCropStart,
+                    pdfPreviewPoint(event),
+                    previewImage.naturalWidth,
+                    previewImage.naturalHeight
+                ));
+                updatePdfCropOverlay();
+            });
+            previewImage.addEventListener('pointerup', (event) => {
+                if (!pdfCropDragging) return;
+                replacePdfCropBBox(AnnotationCropRegion.normalizeCrop(
+                    pdfCropStart,
+                    pdfPreviewPoint(event),
+                    previewImage.naturalWidth,
+                    previewImage.naturalHeight
+                ));
+                pdfCropDragging = false;
+                pdfCropStart = null;
+                pdfCropBeforeDrag = null;
+                if (previewImage.hasPointerCapture(event.pointerId)) {
+                    previewImage.releasePointerCapture(event.pointerId);
+                }
+                updatePdfCropOverlay();
+            });
+            previewImage.addEventListener('pointercancel', (event) => {
+                if (!pdfCropDragging) return;
+                const restoredBBox =
+                    AnnotationCropRegion.restoreInterruptedCrop(pdfCropBeforeDrag);
+                pdfCropDragging = false;
+                pdfCropStart = null;
+                pdfCropBeforeDrag = null;
+                replacePdfCropBBox(restoredBBox);
+                if (previewImage.hasPointerCapture(event.pointerId)) {
+                    previewImage.releasePointerCapture(event.pointerId);
+                }
+                updatePdfCropOverlay();
+            });
+            window.addEventListener('resize', updatePdfCropOverlay);
         }
 
         async function handleFile(file) {
-            invalidateEnergyResult();
+            invalidatePdfRecognitionSelection();
             resetPreparedPdfSelection();
             const isPdf = file.type === 'application/pdf' || file.name.toLowerCase().endsWith('.pdf');
             if (isPdf) {
@@ -2435,15 +2727,274 @@
             if (repNumInput) reportNumber = repNumInput;
         }
 
+        function advancePdfPreviewRequest() {
+            pdfPreviewRequestId += 1;
+            if (pdfPreviewAbortController) {
+                pdfPreviewAbortController.abort();
+                pdfPreviewAbortController = null;
+            }
+            return pdfPreviewRequestId;
+        }
+
+        function advancePdfUploadSession() {
+            pdfUploadSessionId += 1;
+            if (pdfPrepareAbortController) {
+                pdfPrepareAbortController.abort();
+                pdfPrepareAbortController = null;
+            }
+            advancePdfPreviewRequest();
+            return pdfUploadSessionId;
+        }
+
+        function pdfPrepareSessionMatchesCurrent(requestSessionId, currentSessionId) {
+            return requestSessionId === currentSessionId;
+        }
+
+        function pdfPreviewRequestMatchesCurrent(
+            request,
+            currentSessionId,
+            currentRequestId,
+            currentUploadToken,
+            currentPageNumber
+        ) {
+            return (
+                request.sessionId === currentSessionId
+                && request.requestId === currentRequestId
+                && request.uploadToken === currentUploadToken
+                && String(request.pageNumber) === String(currentPageNumber)
+            );
+        }
+
+        function isCurrentPdfPreviewRequest(request) {
+            return pdfPreviewRequestMatchesCurrent(
+                request,
+                pdfUploadSessionId,
+                pdfPreviewRequestId,
+                preparedPdf?.uploadToken || null,
+                document.getElementById('pdf-page-select').value
+            );
+        }
+
+        function decodePdfPreviewImage(src) {
+            return new Promise((resolve, reject) => {
+                const image = new Image();
+                image.onload = () => resolve(image);
+                image.onerror = () => reject(new Error('无法显示 PDF 页面预览'));
+                image.src = src;
+            });
+        }
+
+        function updatePdfRecognitionControls() {
+            const previewImage = document.getElementById('pdf-page-preview-image');
+            const recognizeButton = document.getElementById('recognize-selected-page');
+            const cropValid = (
+                pdfRecognitionMode === 'crop_region'
+                && pdfPreviewSize
+                && AnnotationCropRegion.validateCrop(
+                    pdfCropBBox,
+                    previewImage.naturalWidth,
+                    previewImage.naturalHeight
+                )
+            );
+            const canRecognize = Boolean(
+                preparedPdf
+                && pdfPreviewSize
+                && (pdfRecognitionMode !== 'crop_region' || cropValid)
+            );
+            const disabled = EnergyPdfRecognitionState.deriveControlDisabledState({
+                inFlight: pdfRecognitionRequests.isInFlight(),
+                selectionBusy: Boolean(
+                    pdfPrepareAbortController || pdfPreviewAbortController
+                ),
+                canRecognize,
+                hasCrop: Boolean(pdfCropBBox)
+            });
+            recognizeButton.innerText = pdfRecognitionMode === 'crop_region'
+                ? '开始识别所选区域'
+                : '开始识别整页';
+            recognizeButton.disabled = disabled.recognize;
+            document.getElementById('rasterFileInput').disabled = disabled.upload;
+            document.getElementById('pdf-page-select').disabled =
+                disabled.page || !preparedPdf;
+            document.getElementById('reload-pdf-preview').disabled =
+                disabled.reload || !preparedPdf;
+            document.getElementById('pdf-recognition-mode-full').disabled =
+                disabled.mode || !preparedPdf;
+            document.getElementById('pdf-recognition-mode-crop').disabled =
+                disabled.mode || !preparedPdf;
+            document.getElementById('clear-pdf-crop').disabled =
+                disabled.clearCrop;
+            previewImage.style.pointerEvents = disabled.crop ? 'none' : 'auto';
+            document.getElementById('uploadWrapper').setAttribute(
+                'aria-disabled',
+                disabled.upload ? 'true' : 'false'
+            );
+        }
+
+        function resetPdfCropSelection() {
+            invalidatePdfRecognitionSelection();
+            pdfCropBBox = null;
+            pdfCropStart = null;
+            pdfCropBeforeDrag = null;
+            pdfCropDragging = false;
+            const overlay = document.getElementById('pdf-crop-overlay');
+            overlay.classList.add('hidden');
+            overlay.style.cssText = '';
+            document.getElementById('pdf-crop-summary').innerText =
+                pdfRecognitionMode === 'crop_region'
+                    ? '请在预览图上拖动框选识别区域'
+                    : '整页识别模式';
+            updatePdfRecognitionControls();
+        }
+
+        function clearPreparedPdfPreview() {
+            advancePdfPreviewRequest();
+            pdfPreviewSize = null;
+            const previewImage = document.getElementById('pdf-page-preview-image');
+            previewImage.removeAttribute('src');
+            resetPdfCropSelection();
+        }
+
+        function setPdfRecognitionMode(mode) {
+            const nextMode = mode === 'crop_region' ? 'crop_region' : 'full_page';
+            if (nextMode !== pdfRecognitionMode) {
+                invalidatePdfRecognitionSelection();
+            }
+            pdfRecognitionMode = nextMode;
+            document.getElementById('pdf-recognition-mode-full').checked =
+                pdfRecognitionMode === 'full_page';
+            document.getElementById('pdf-recognition-mode-crop').checked =
+                pdfRecognitionMode === 'crop_region';
+            document.getElementById('pdf-page-preview-image').style.cursor =
+                pdfRecognitionMode === 'crop_region' ? 'crosshair' : 'default';
+            if (pdfRecognitionMode === 'full_page') {
+                resetPdfCropSelection();
+            } else {
+                document.getElementById('pdf-crop-summary').innerText =
+                    '请在预览图上拖动框选识别区域';
+                updatePdfCropOverlay();
+            }
+        }
+
+        function pdfPreviewPoint(event) {
+            const previewImage = document.getElementById('pdf-page-preview-image');
+            const rect = previewImage.getBoundingClientRect();
+            return AnnotationCropRegion.canvasPointToImage(
+                { x: event.clientX, y: event.clientY },
+                {
+                    offsetX: rect.left,
+                    offsetY: rect.top,
+                    scale: rect.width / previewImage.naturalWidth,
+                    width: previewImage.naturalWidth,
+                    height: previewImage.naturalHeight
+                }
+            );
+        }
+
+        function updatePdfCropOverlay() {
+            const previewImage = document.getElementById('pdf-page-preview-image');
+            const overlay = document.getElementById('pdf-crop-overlay');
+            if (!pdfCropBBox || !pdfPreviewSize || !previewImage.naturalWidth) {
+                overlay.classList.add('hidden');
+                updatePdfRecognitionControls();
+                return;
+            }
+
+            const [x0, y0, x1, y1] = pdfCropBBox;
+            const scaleX = previewImage.clientWidth / previewImage.naturalWidth;
+            const scaleY = previewImage.clientHeight / previewImage.naturalHeight;
+            overlay.style.left = `${x0 * scaleX}px`;
+            overlay.style.top = `${y0 * scaleY}px`;
+            overlay.style.width = `${(x1 - x0) * scaleX}px`;
+            overlay.style.height = `${(y1 - y0) * scaleY}px`;
+            overlay.classList.remove('hidden');
+
+            const valid = AnnotationCropRegion.validateCrop(
+                pdfCropBBox,
+                previewImage.naturalWidth,
+                previewImage.naturalHeight
+            );
+            document.getElementById('pdf-crop-summary').innerText = valid
+                ? `已选择 ${x1 - x0} × ${y1 - y0} 像素`
+                : `所选区域 ${x1 - x0} × ${y1 - y0} 像素，区域过小`;
+            updatePdfRecognitionControls();
+        }
+
+        async function loadPreparedPdfPreview() {
+            if (!preparedPdf) return false;
+            updateReportNumberFromInput();
+            const previewRequest = {
+                sessionId: pdfUploadSessionId,
+                requestId: advancePdfPreviewRequest(),
+                uploadToken: preparedPdf.uploadToken,
+                pageNumber: document.getElementById('pdf-page-select').value
+            };
+            const requestController = new AbortController();
+            pdfPreviewAbortController = requestController;
+            updatePdfRecognitionControls();
+            const fd = new FormData();
+            fd.append('report_number', reportNumber);
+            fd.append('pdf_upload_token', previewRequest.uploadToken);
+            fd.append('pdf_page_number', previewRequest.pageNumber);
+            showLoader('正在生成 PDF 页面预览...');
+
+            try {
+                const response = await fetch('/energy/pdf_page_preview', {
+                    method: 'POST',
+                    body: fd,
+                    signal: requestController.signal
+                });
+                const data = await response.json();
+                if (!isCurrentPdfPreviewRequest(previewRequest)) return false;
+                if (!response.ok || data.error) throw new Error(data.error || response.statusText);
+
+                const decodedPreview = await decodePdfPreviewImage(
+                    'data:image/jpeg;base64,' + data.image
+                );
+                if (!isCurrentPdfPreviewRequest(previewRequest)) return false;
+                const previewImage = document.getElementById('pdf-page-preview-image');
+                previewImage.src = decodedPreview.src;
+                pdfPreviewSize = [decodedPreview.naturalWidth, decodedPreview.naturalHeight];
+                document.getElementById('pdf-page-summary').innerText =
+                    `${preparedPdf.filename} 共 ${preparedPdf.pageCount} 页，当前预览第 ${data.pdf_page_number} 页。`;
+                updatePdfCropOverlay();
+                return true;
+            } catch (error) {
+                if (
+                    error.name === 'AbortError'
+                    || !isCurrentPdfPreviewRequest(previewRequest)
+                ) return false;
+                document.getElementById('pdf-page-summary').innerText =
+                    `${preparedPdf.filename} 预览加载失败，可点击“重新加载预览”重试。`;
+                alert('加载 PDF 预览失败: ' + error.message);
+                updatePdfRecognitionControls();
+                return false;
+            } finally {
+                if (pdfPreviewAbortController === requestController) {
+                    pdfPreviewAbortController = null;
+                    hideLoader();
+                    updatePdfRecognitionControls();
+                }
+            }
+        }
+
         function resetPreparedPdfSelection() {
+            advancePdfUploadSession();
             preparedPdf = null;
             document.getElementById('pdf-page-selection').classList.add('hidden');
             document.getElementById('pdf-page-select').innerHTML = '';
-            document.getElementById('recognize-selected-page').disabled = false;
+            pdfRecognitionMode = 'full_page';
+            document.getElementById('pdf-recognition-mode-full').checked = true;
+            document.getElementById('pdf-recognition-mode-crop').checked = false;
+            clearPreparedPdfPreview();
         }
 
         async function preparePdf(file) {
+            const uploadSessionId = pdfUploadSessionId;
             updateReportNumberFromInput();
+            const requestController = new AbortController();
+            pdfPrepareAbortController = requestController;
+            updatePdfRecognitionControls();
             const fd = new FormData();
             fd.append('raster_file', file);
             fd.append('report_number', reportNumber);
@@ -2452,9 +3003,13 @@
             try {
                 const response = await fetch('/energy/pdf_prepare', {
                     method: 'POST',
-                    body: fd
+                    body: fd,
+                    signal: requestController.signal
                 });
                 const data = await response.json();
+                if (
+                    !pdfPrepareSessionMatchesCurrent(uploadSessionId, pdfUploadSessionId)
+                ) return false;
                 if (!response.ok || data.error) throw new Error(data.error || response.statusText);
 
                 preparedPdf = {
@@ -2470,34 +3025,60 @@
                     pageSelect.appendChild(option);
                 }
 
-                if (preparedPdf.pageCount === 1) {
-                    await recognizePreparedPdf();
-                } else {
-                    document.getElementById('pdf-page-summary').innerText =
-                        `${preparedPdf.filename} 共 ${preparedPdf.pageCount} 页，请选择需要计算的楼层页。`;
-                    document.getElementById('pdf-page-selection').classList.remove('hidden');
+                document.getElementById('pdf-page-summary').innerText =
+                    `${preparedPdf.filename} 共 ${preparedPdf.pageCount} 页，正在加载第 1 页预览。`;
+                document.getElementById('pdf-page-selection').classList.remove('hidden');
+                setPdfRecognitionMode('full_page');
+                clearPreparedPdfPreview();
+                if (pdfPrepareAbortController === requestController) {
+                    pdfPrepareAbortController = null;
+                    hideLoader();
                 }
+                await loadPreparedPdfPreview();
+                return true;
             } catch (error) {
+                if (
+                    error.name === 'AbortError'
+                    || !pdfPrepareSessionMatchesCurrent(
+                        uploadSessionId,
+                        pdfUploadSessionId
+                    )
+                ) return false;
                 resetPreparedPdfSelection();
                 alert('读取 PDF 失败: ' + error.message);
-            } finally {
                 hideLoader();
+                return false;
+            } finally {
+                if (pdfPrepareAbortController === requestController) {
+                    pdfPrepareAbortController = null;
+                    hideLoader();
+                    updatePdfRecognitionControls();
+                }
             }
         }
 
         async function recognizePreparedPdf() {
-            if (!preparedPdf) return;
+            if (
+                !preparedPdf
+                || pdfPrepareAbortController
+                || pdfPreviewAbortController
+            ) return false;
             const button = document.getElementById('recognize-selected-page');
             button.disabled = true;
             try {
                 await submitRecognition();
             } finally {
-                button.disabled = false;
+                updatePdfRecognitionControls();
             }
         }
 
         // 发送图片或已暂存 PDF 的指定页到后台进行 AI 构件分割
         async function submitRecognition(file = null) {
+            if (
+                (!file && !preparedPdf)
+                || pdfPrepareAbortController
+                || pdfPreviewAbortController
+            ) return false;
             const fd = new FormData();
             if (file) {
                 fd.append('raster_file', file);
@@ -2505,20 +3086,64 @@
                 fd.append('pdf_upload_token', preparedPdf.uploadToken);
                 fd.append('pdf_page_number', document.getElementById('pdf-page-select').value);
             }
+            const recognitionMode = file ? 'full_page' : pdfRecognitionMode;
+            fd.append('recognition_mode', recognitionMode);
+            if (recognitionMode === 'crop_region') {
+                const previewImage = document.getElementById('pdf-page-preview-image');
+                if (!AnnotationCropRegion.validateCrop(
+                    pdfCropBBox,
+                    previewImage.naturalWidth,
+                    previewImage.naturalHeight
+                )) {
+                    alert('请先框选有效的 PDF 识别区域。');
+                    return;
+                }
+                fd.append('crop_bbox_px', JSON.stringify(pdfCropBBox));
+                fd.append('crop_preview_size', JSON.stringify([
+                    previewImage.naturalWidth,
+                    previewImage.naturalHeight
+                ]));
+            }
             fd.append('preprocessing', 'auto');
             updateReportNumberFromInput();
             fd.append('report_number', reportNumber);
-            
+
+            const recognitionSelection = currentPdfRecognitionSelection();
+            invalidatePdfRecognitionSelection({ returnToUpload: false });
+            const requestController = new AbortController();
+            const requestStart = pdfRecognitionRequests.begin(
+                recognitionSelection,
+                requestController
+            );
+            const recognitionRequest = requestStart.request;
+            if (requestStart.hideLoader) {
+                hideLoader();
+            }
             showLoader("ONNX 引擎正在提取空间构件 (红墙/蓝窗/绿门)...");
+            updatePdfRecognitionControls();
 
             try {
                 const response = await fetch('/energy/ai_recognize', {
                     method: 'POST',
-                    body: fd
+                    body: fd,
+                    signal: requestController.signal
                 });
                 const data = await response.json();
-                if (data.error) {
-                    throw new Error(data.error);
+                const currentSelection = currentPdfRecognitionSelection();
+                if (!pdfRecognitionRequests.canCommit(
+                    recognitionRequest,
+                    currentSelection
+                )) {
+                    return false;
+                }
+                if (!response.ok || data.error) {
+                    throw new Error(data.error || response.statusText);
+                }
+                if (!pdfRecognitionRequests.accept(
+                    recognitionRequest,
+                    currentSelection
+                )) {
+                    return false;
                 }
 
                 aiResultData = data;
@@ -2553,11 +3178,29 @@
                 applyScaleCalibrationResult(data.scale_calibration, data.room_topology);
                 gotoStep(2);
                 requestAnimationFrame(() => resizeScaleCalibrationCanvas());
+                return true;
 
             } catch (error) {
+                if (
+                    error.name === 'AbortError'
+                    || !pdfRecognitionRequests.canCommit(
+                        recognitionRequest,
+                        currentPdfRecognitionSelection()
+                    )
+                ) {
+                    return false;
+                }
                 alert("识别图纸失败: " + error.message);
+                return false;
             } finally {
-                hideLoader();
+                const completion = pdfRecognitionRequests.finish(
+                    recognitionRequest,
+                    currentPdfRecognitionSelection()
+                );
+                if (completion.hideLoader) {
+                    hideLoader();
+                }
+                updatePdfRecognitionControls();
             }
         }
 
@@ -2647,7 +3290,7 @@
 
         async function calculateEnergy() {
             invalidateEnergyResult();
-            if (!aiResultData?.room_topology?.load_geometry_ready) {
+            if (!aiResultData?.room_topology?.load_geometry_ready || !hasCurrentAiRecognitionResult()) {
                 alert('房间尚未闭合或比例尺尚未确认，暂时不能进行负荷计算。');
                 return;
             }

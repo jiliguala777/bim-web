@@ -1,11 +1,18 @@
+import inspect
 import math
 import unittest
+from unittest.mock import patch
 
 import cv2
 import numpy as np
 
+import floorplan_topology_repair as topology_repair
 from floorplan_rooms import extract_room_topology
-from floorplan_topology_repair import repair_vector_floorplan_topology
+from floorplan_topology_repair import (
+    _dominant_span_rectangles,
+    _search_multi_gap_solution,
+    repair_vector_floorplan_topology,
+)
 
 
 class ConservativeTopologyRepairTests(unittest.TestCase):
@@ -86,6 +93,123 @@ class ConservativeTopologyRepairTests(unittest.TestCase):
         self.assertEqual(topology["room_count"], 1)
         self.assertFalse(result["manual_exterior_wall_required"])
 
+    @patch("floorplan_topology_repair._room_topology")
+    def test_multi_gap_search_can_exceed_sixteen_evaluations_before_timeout(
+        self, room_topology
+    ):
+        empty = {"room_count": 0, "rooms": [], "total_area_px2": 0.0}
+        room_topology.return_value = empty
+        mask = np.zeros((30, 30), dtype=np.uint8)
+        candidates = [
+            {
+                "line_px": [index, 2, index, 8],
+                "score": 1.0,
+                "length_px": 6.0,
+            }
+            for index in range(1, 25)
+        ]
+
+        outcome = _search_multi_gap_solution(
+            mask,
+            candidates,
+            [0, 0, 30, 30],
+            20.0,
+            {"beam_width": 16, "max_lines": 16},
+        )
+
+        self.assertEqual(len(outcome), 3)
+        result, accepted, search = outcome
+        self.assertTrue(np.array_equal(result, mask))
+        self.assertEqual(accepted, [])
+        self.assertGreater(search["evaluation_count"], 16)
+        self.assertFalse(search["timed_out"])
+        self.assertEqual(search["time_limit_seconds"], 60.0)
+
+    @patch("floorplan_topology_repair._room_topology")
+    def test_multi_gap_search_stops_at_sixty_seconds(self, room_topology):
+        self.assertIn(
+            "monotonic_clock",
+            inspect.signature(_search_multi_gap_solution).parameters,
+        )
+        empty = {"room_count": 0, "rooms": [], "total_area_px2": 0.0}
+        room_topology.return_value = empty
+        mask = np.zeros((30, 30), dtype=np.uint8)
+        candidates = [
+            {
+                "line_px": [index, 2, index, 8],
+                "score": 1.0,
+                "length_px": 6.0,
+            }
+            for index in range(1, 25)
+        ]
+        clock_values = iter((0.0, 1.0, 60.0))
+
+        result, accepted, search = _search_multi_gap_solution(
+            mask,
+            candidates,
+            [0, 0, 30, 30],
+            20.0,
+            {"beam_width": 16, "max_lines": 16},
+            monotonic_clock=lambda: next(clock_values, 60.0),
+        )
+
+        self.assertTrue(np.array_equal(result, mask))
+        self.assertEqual(accepted, [])
+        self.assertEqual(search["evaluation_count"], 1)
+        self.assertEqual(search["time_limit_seconds"], 60.0)
+        self.assertEqual(search["elapsed_seconds"], 60.0)
+        self.assertTrue(search["timed_out"])
+
+    @patch("floorplan_topology_repair._room_topology")
+    def test_multi_gap_search_keeps_reliable_solution_found_before_timeout(
+        self, room_topology
+    ):
+        self.assertIn(
+            "monotonic_clock",
+            inspect.signature(_search_multi_gap_solution).parameters,
+        )
+        empty = {"room_count": 0, "rooms": [], "total_area_px2": 0.0}
+        plausible = {
+            "room_count": 1,
+            "rooms": [{"area_px2": 100.0, "bbox_px": [5, 5, 10, 10]}],
+            "total_area_px2": 100.0,
+        }
+        evaluation_index = 0
+
+        def topology_for_search(mask, min_room_area_px):
+            nonlocal evaluation_index
+            result = empty if evaluation_index == 0 else plausible
+            evaluation_index += 1
+            return result
+
+        room_topology.side_effect = topology_for_search
+        mask = np.zeros((30, 30), dtype=np.uint8)
+        candidates = [
+            {
+                "line_px": [index, 2, index, 8],
+                "score": 1.0,
+                "length_px": 6.0,
+            }
+            for index in range(1, 25)
+        ]
+        clock_values = iter((0.0, 1.0, 60.0))
+
+        outcome = _search_multi_gap_solution(
+            mask,
+            candidates,
+            [0, 0, 30, 30],
+            20.0,
+            {"beam_width": 16, "max_lines": 16},
+            monotonic_clock=lambda: next(clock_values, 60.0),
+        )
+
+        self.assertEqual(len(outcome), 3)
+        result, accepted, search = outcome
+        self.assertFalse(np.array_equal(result, mask))
+        self.assertEqual(len(accepted), 1)
+        self.assertEqual(search["evaluation_count"], 1)
+        self.assertTrue(search["timed_out"])
+
     def test_uses_four_long_span_lines_for_fragmented_room_perimeter(self):
         mask = np.zeros((140, 180), dtype=np.uint8)
         support = np.zeros_like(mask)
@@ -116,6 +240,100 @@ class ConservativeTopologyRepairTests(unittest.TestCase):
             math.hypot(line[2] - line[0], line[3] - line[1]) >= 95
             for line in lines
         ))
+        candidate = result["exterior_repair"]["accepted_candidates"][0]
+        self.assertGreaterEqual(
+            min(candidate["vector_support_by_side"].values()),
+            0.60,
+        )
+        self.assertGreaterEqual(
+            min(candidate["model_support_by_side"].values()),
+            0.15,
+        )
+        self.assertIn("vector_support_ratio", candidate)
+        self.assertIn("model_support_ratio", candidate)
+
+    def test_long_line_crossing_room_interior_is_rejected(self):
+        rooms = [{
+            "polygon_px": [[8.0, 8.0], [22.0, 8.0], [22.0, 22.0], [8.0, 22.0]],
+        }]
+
+        self.assertTrue(
+            hasattr(topology_repair, "_line_crosses_room_interiors"),
+            "room-interior crossing helper is required",
+        )
+        crosses = topology_repair._line_crosses_room_interiors
+        self.assertTrue(crosses((30, 30), [0, 15, 29, 15], rooms))
+        self.assertFalse(crosses((30, 30), [0, 3, 29, 3], rooms))
+
+    def test_long_span_can_enclose_existing_room_without_crossing_it(self):
+        mask = np.zeros((140, 180), dtype=np.uint8)
+        support = np.zeros_like(mask)
+        cv2.rectangle(support, (30, 20), (150, 120), 255, 3)
+        for start, end in ((30, 55), (67, 92), (104, 130), (142, 150)):
+            cv2.line(mask, (start, 20), (end, 20), 1, 3)
+            cv2.line(mask, (start, 120), (end, 120), 1, 3)
+        for start, end in ((20, 42), (54, 76), (88, 108), (116, 120)):
+            cv2.line(mask, (30, start), (30, end), 1, 3)
+            cv2.line(mask, (150, start), (150, end), 1, 3)
+        cv2.rectangle(mask, (75, 55), (105, 85), 1, 3)
+
+        result = repair_vector_floorplan_topology(
+            mask,
+            building_roi=[10, 10, 170, 130],
+            structural_support_mask=support,
+            max_exterior_gap_px=16,
+            max_internal_component_area_px=500,
+            min_room_area_px=500,
+        )
+
+        self.assertEqual(
+            result["exterior_repair"]["reason"],
+            "dominant_span_rectangle",
+        )
+        self.assertEqual(result["room_count_before"], 1)
+        self.assertGreater(result["room_count_after"], 1)
+
+    def test_skips_exterior_repair_when_major_area_is_already_closed(self):
+        mask = np.zeros((140, 180), dtype=np.uint8)
+        support = np.zeros_like(mask)
+        cv2.rectangle(mask, (30, 20), (150, 120), 1, 3)
+        cv2.rectangle(support, (15, 15), (165, 125), 255, 1)
+
+        result = repair_vector_floorplan_topology(
+            mask,
+            building_roi=[10, 10, 170, 130],
+            structural_support_mask=support,
+            max_exterior_gap_px=16,
+            max_internal_component_area_px=500,
+            min_room_area_px=500,
+        )
+
+        repair = result["exterior_repair"]
+        self.assertEqual(repair["status"], "not_needed")
+        self.assertEqual(repair["reason"], "already_closed")
+        self.assertEqual(repair["accepted_lines_px"], [])
+        self.assertEqual(result["closure_status"], "complete")
+        self.assertFalse(result["manual_exterior_wall_required"])
+        self.assertTrue(repair["initial_closure"]["is_already_closed"])
+
+    def test_rejects_dominant_rectangle_when_any_side_has_weak_model_support(self):
+        mask = np.zeros((140, 180), dtype=np.uint8)
+        support = np.zeros_like(mask)
+        cv2.rectangle(support, (30, 20), (150, 120), 255, 3)
+
+        cv2.line(mask, (30, 20), (150, 20), 1, 3)
+        cv2.line(mask, (150, 20), (150, 120), 1, 3)
+        cv2.line(mask, (140, 120), (150, 120), 1, 3)
+        cv2.line(mask, (30, 20), (30, 22), 1, 3)
+
+        candidates = _dominant_span_rectangles(
+            mask,
+            support,
+            [10, 10, 170, 130],
+            min_room_area_px=1000,
+        )
+
+        self.assertEqual(candidates, [])
 
     def test_reports_partial_when_only_existing_small_room_is_closed(self):
         mask = np.zeros((140, 180), dtype=np.uint8)

@@ -66,6 +66,11 @@ class DeploymentAssetTests(unittest.TestCase):
             r'(?m)^pywin32(?:[<=>].*)?;\s*sys_platform\s*==\s*["\']win32["\']$',
         )
 
+    def test_operator_readme_documents_30_second_vector_timeout(self):
+        readme = self.read("README.md")
+        self.assertIn("矢量提取最多运行 30 秒", readme)
+        self.assertNotIn("矢量提取最多运行 15 秒", readme)
+
     def test_systemd_service_uses_external_state_and_local_bind(self):
         service = self.read("deploy/bim-web.service")
         for expected in (
@@ -139,7 +144,6 @@ class DeploymentAssetTests(unittest.TestCase):
             "git diff --check",
         ):
             self.assertIn(expected, checklist)
-
 
 if __name__ == "__main__":
     unittest.main()

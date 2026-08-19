@@ -25,6 +25,8 @@ ONNX_MODEL_PATH = os.environ.get('ONNX_MODEL_PATH', os.path.join(MODELS_DIR, 'M2
 FLOORPLAN_MODEL_VERSION = os.path.basename(ONNX_MODEL_PATH)
 FLOORPLAN_MODEL_MIOU = 0.787
 RECOGNITION_SCHEMA_VERSION = 1
+LEGACY_ONNX_BACKEND = 'legacy_onnx'
+VECTOR_PYTORCH_BACKEND = 'vector_pytorch'
 
 # --- IFC / Benchmark 模块 ---
 try:
@@ -49,6 +51,21 @@ try:
 except Exception as e:
     HAS_FLOORPLAN_AI = False
     print(f"FloorPlan AI not available: {e}")
+
+try:
+    from vector_platform import VECTOR_BACKEND, VectorPlatformAdapter, VectorPlatformConfig
+    _vector_platform_config = VectorPlatformConfig.from_environment()
+    if _vector_platform_config is None:
+        _vector_platform_adapter = None
+        HAS_VECTOR_FLOORPLAN_AI = False
+    else:
+        _vector_platform_config.require_available()
+        _vector_platform_adapter = VectorPlatformAdapter(_vector_platform_config)
+        HAS_VECTOR_FLOORPLAN_AI = True
+except Exception as e:
+    _vector_platform_adapter = None
+    HAS_VECTOR_FLOORPLAN_AI = False
+    print(f"Vector FloorPlan AI not available: {e}")
 
 try:
     from vector_pdf_scale import (
@@ -1308,16 +1325,18 @@ def _build_recognition_payload(result, preprocessing, use_preprocessing, raster_
     if not image_size:
         image_size = [0, 0]
 
+    model = result.get('model') or {
+        'backend': LEGACY_ONNX_BACKEND,
+        'name': FLOORPLAN_MODEL_NAME,
+        'version': FLOORPLAN_MODEL_VERSION,
+        'path': ONNX_MODEL_PATH,
+        'mIoU': FLOORPLAN_MODEL_MIOU,
+        'classes': ['background', 'wall', 'window', 'door'],
+    }
     return {
         'schema_version': RECOGNITION_SCHEMA_VERSION,
         'created_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
-        'model': {
-            'name': FLOORPLAN_MODEL_NAME,
-            'version': FLOORPLAN_MODEL_VERSION,
-            'path': ONNX_MODEL_PATH,
-            'mIoU': FLOORPLAN_MODEL_MIOU,
-            'classes': ['background', 'wall', 'window', 'door'],
-        },
+        'model': model,
         'preprocessing': {
             'requested': preprocessing,
             'use_preprocessing': use_preprocessing,
@@ -1353,6 +1372,9 @@ def _build_recognition_payload(result, preprocessing, use_preprocessing, raster_
             'has_vector_text': False,
         },
         'topology_repair': result.get('topology_repair') or {},
+        'vector_geometry': result.get('vector_geometry'),
+        'vector_measurements': result.get('vector_measurements'),
+        'vector_inference': result.get('vector_inference'),
         'pixel_lengths': {
             'wall_px': round(_polyline_total_length(geometry.get('walls', [])), 1),
             'window_px': round(_polyline_total_length(geometry.get('windows', [])), 1),
@@ -1410,12 +1432,78 @@ def _load_recognition_payload(target_dir):
     if payload.get('schema_version') != RECOGNITION_SCHEMA_VERSION:
         return None
     model = payload.get('model') or {}
-    if model.get('version') != FLOORPLAN_MODEL_VERSION:
+    if model.get('backend', LEGACY_ONNX_BACKEND) not in {LEGACY_ONNX_BACKEND, VECTOR_PYTORCH_BACKEND}:
+        return None
+    if not isinstance(model.get('version'), str) or not model.get('version'):
         return None
     geometry = payload.get('geometry') or {}
     if not all(key in geometry for key in ('walls', 'windows', 'doors')):
         return None
     return payload
+
+
+def _persist_vector_recognition(target_dir, raster_path, result, elapsed_sec):
+    """Persist the opt-in vector backend in the existing recognition contract."""
+    original_bgr = result['source']
+    overlay = result['overlay']
+    mask = result['mask']
+    h, w = mask.shape
+    overlay_path = os.path.join(target_dir, 'ai_overlay.jpg')
+    mask_path = os.path.join(target_dir, 'ai_mask.png')
+    _write_image(Path(overlay_path), overlay, [cv2.IMWRITE_JPEG_QUALITY, 90])
+    mask_color = np.zeros((h, w, 3), dtype=np.uint8)
+    mask_color[mask == 1] = (60, 76, 231)
+    mask_color[mask == 2] = (219, 152, 52)
+    mask_color[mask == 3] = (113, 204, 46)
+    _write_image(Path(mask_path), mask_color)
+    result.update({
+        'recognition_mode': 'full_page',
+        'vector_cleanup': {'enabled': False, 'has_vector_geometry': False, 'has_vector_text': False},
+        'topology_repair': {},
+        'pdf_page_number': None,
+        'pdf_page_count': None,
+        'crop_bbox_page_px': None,
+        'crop_bbox_preview_px': None,
+        'crop_preview_size': None,
+    })
+    recognition_payload = _build_recognition_payload(
+        result, 'none', False, raster_path, overlay_path, mask_path, elapsed_sec,
+    )
+    recognition_path = _save_recognition_payload(target_dir, recognition_payload)
+    _, overlay_buf = cv2.imencode('.jpg', overlay, [cv2.IMWRITE_JPEG_QUALITY, 85])
+    _, mask_buf = cv2.imencode('.png', mask_color)
+    _, orig_buf = cv2.imencode('.jpg', original_bgr, [cv2.IMWRITE_JPEG_QUALITY, 85])
+    geometry = result['geometry']
+    return jsonify({
+        'success': True,
+        'status': 'success',
+        'source': 'AI',
+        'model': result['model']['name'],
+        'model_info': result['model'],
+        'elapsed_sec': elapsed_sec,
+        'image_size': [w, h],
+        'stats': result['stats'],
+        'geometry_summary': {
+            'walls': len(geometry['walls']), 'windows': len(geometry['windows']), 'doors': len(geometry['doors']),
+        },
+        'geometry': geometry,
+        'room_topology': result['room_topology'],
+        'scale_calibration': result['scale_calibration'],
+        'recognition_mode': 'full_page',
+        'vector_geometry': result['vector_geometry'],
+        'vector_measurements': result['vector_measurements'],
+        'recognition': {
+            'schema_version': recognition_payload['schema_version'],
+            'path': os.path.basename(recognition_path),
+            'model_version': result['model']['version'],
+            'preprocessing': recognition_payload['preprocessing'],
+        },
+        'images': {
+            'original': base64.b64encode(orig_buf).decode('utf-8'),
+            'overlay': base64.b64encode(overlay_buf).decode('utf-8'),
+            'mask': base64.b64encode(mask_buf).decode('utf-8'),
+        },
+    })
 
 
 def _pdf_upload_serializer():
@@ -1574,11 +1662,15 @@ def ai_recognize():
     支持 raster_file (PNG/JPG) 上传
     与 DXF 上传同步：用户可选择 DXF 矢量 或 图片AI识别
     """
-    if not HAS_FLOORPLAN_AI:
-        return jsonify({'error': 'AI recognition module not available. Install: pip install onnxruntime opencv-python-headless'}), 501
-
     try:
         t0 = _time.time()
+        model_backend = request.form.get('model_backend', LEGACY_ONNX_BACKEND)
+        if model_backend not in {LEGACY_ONNX_BACKEND, VECTOR_PYTORCH_BACKEND}:
+            return jsonify({'error': 'Unsupported model backend'}), 400
+        if model_backend == LEGACY_ONNX_BACKEND and not HAS_FLOORPLAN_AI:
+            return jsonify({'error': 'Legacy ONNX recognition module is not available'}), 501
+        if model_backend == VECTOR_PYTORCH_BACKEND and not HAS_VECTOR_FLOORPLAN_AI:
+            return jsonify({'error': 'Vector recognition module is not configured'}), 501
         report_number = request.form.get('report_number', 'default')
         report_number = secure_filename(report_number) or 'default'
         target_dir = os.path.join(app.config['UPLOAD_FOLDER'], 'energy', report_number)
@@ -1628,6 +1720,14 @@ def ai_recognize():
             f.save(raster_path)
             if ext == 'pdf':
                 pdf_page_number = 1
+
+        if model_backend == VECTOR_PYTORCH_BACKEND:
+            if ext == 'pdf':
+                return jsonify({'error': 'Vector recognition currently accepts PNG or JPG; render the target PDF page first.'}), 400
+            result = _vector_platform_adapter.predict(Path(raster_path), Path(target_dir))
+            return _persist_vector_recognition(
+                target_dir, raster_path, result, round(_time.time() - t0, 3),
+            )
 
         scale_calibration = {
             'status': 'manual_required',
@@ -1960,11 +2060,32 @@ def ai_recognize():
 def ai_status():
     """检查 AI 识别模块状态"""
     return jsonify({
-        'available': HAS_FLOORPLAN_AI,
-        'model': FLOORPLAN_MODEL_NAME if HAS_FLOORPLAN_AI else None,
-        'model_version': FLOORPLAN_MODEL_VERSION if HAS_FLOORPLAN_AI else None,
+        'available': HAS_FLOORPLAN_AI or HAS_VECTOR_FLOORPLAN_AI,
+        'model': (
+            FLOORPLAN_MODEL_NAME if HAS_FLOORPLAN_AI
+            else ('vector-resnet34-unet' if HAS_VECTOR_FLOORPLAN_AI else None)
+        ),
+        'model_version': (
+            FLOORPLAN_MODEL_VERSION if HAS_FLOORPLAN_AI
+            else (_vector_platform_config.checkpoint_path.name if HAS_VECTOR_FLOORPLAN_AI else None)
+        ),
         'mIoU': FLOORPLAN_MODEL_MIOU if HAS_FLOORPLAN_AI else None,
         'classes': ['background', 'wall', 'window', 'door'] if HAS_FLOORPLAN_AI else [],
+        'backends': {
+            LEGACY_ONNX_BACKEND: {
+                'available': HAS_FLOORPLAN_AI,
+                'model': FLOORPLAN_MODEL_NAME if HAS_FLOORPLAN_AI else None,
+                'model_version': FLOORPLAN_MODEL_VERSION if HAS_FLOORPLAN_AI else None,
+            },
+            VECTOR_PYTORCH_BACKEND: {
+                'available': HAS_VECTOR_FLOORPLAN_AI,
+                'model': 'vector-resnet34-unet' if HAS_VECTOR_FLOORPLAN_AI else None,
+                'model_version': (
+                    _vector_platform_config.checkpoint_path.name
+                    if HAS_VECTOR_FLOORPLAN_AI else None
+                ),
+            },
+        },
     })
 
 
@@ -2053,7 +2174,7 @@ def ai_simulate():
     """
     使用 AI 识别结果结合详细参数进行能耗计算
     """
-    if not HAS_FLOORPLAN_AI:
+    if not (HAS_FLOORPLAN_AI or HAS_VECTOR_FLOORPLAN_AI):
         return jsonify({'error': 'AI module not available'}), 501
 
     try:

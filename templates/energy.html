@@ -878,6 +878,14 @@
                 上传您的建筑平面图纸（支持 PNG、JPG、BMP 及 PDF 格式）。AI 自动识别墙体、门和窗户的几何轮廓并自动提取空间物理属性。
             </p>
 
+            <div class="form-group" style="max-width:360px; margin-bottom:16px;">
+                <label class="form-label" for="model-backend">识别模型</label>
+                <select id="model-backend" class="form-control">
+                    <option value="legacy_onnx">旧 ONNX 四分类模型</option>
+                    <option value="vector_pytorch">新矢量模型（试验版，仅 PNG/JPG）</option>
+                </select>
+            </div>
+
             <div class="upload-wrapper" id="uploadWrapper">
                 <div class="upload-icon-large">☁️</div>
                 <div class="upload-text">点击或拖拽文件到这里上传</div>
@@ -3105,6 +3113,7 @@
                 ]));
             }
             fd.append('preprocessing', 'auto');
+            fd.append('model_backend', document.getElementById('model-backend').value);
             updateReportNumberFromInput();
             fd.append('report_number', reportNumber);
 
@@ -3119,7 +3128,10 @@
             if (requestStart.hideLoader) {
                 hideLoader();
             }
-            showLoader("ONNX 引擎正在提取空间构件 (红墙/蓝窗/绿门)...");
+            const vectorBackend = document.getElementById('model-backend').value === 'vector_pytorch';
+            showLoader(vectorBackend
+                ? "矢量模型正在识别房间、墙、门窗（试验版）..."
+                : "ONNX 引擎正在提取空间构件 (红墙/蓝窗/绿门)...");
             updatePdfRecognitionControls();
 
             try {

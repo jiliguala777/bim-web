@@ -122,6 +122,23 @@ class EnergyTemplateTests(unittest.TestCase):
                 self.assertIn(f'id="{element_id}"', html)
         self.assertIn('<script src="/energy/crop_region.js">', html)
 
+    def test_vector_raster_ui_exposes_an_independent_crop_preview(self):
+        html = Path("templates/energy.html").read_text(encoding="utf-8")
+
+        for element_id in [
+            "vector-raster-selection",
+            "vector-raster-preview-image",
+            "vector-raster-crop-overlay",
+            "vector-raster-mode-full",
+            "vector-raster-mode-crop",
+            "clear-vector-raster-crop",
+            "recognize-vector-raster",
+        ]:
+            with self.subTest(element_id=element_id):
+                self.assertIn(f'id="{element_id}"', html)
+        self.assertIn("async function prepareVectorRasterCrop(file)", html)
+        self.assertIn("vectorRasterRecognitionMode", html)
+
     def test_pdf_region_recognition_ui_loads_preview_and_manages_crop_state(self):
         html = Path("templates/energy.html").read_text(encoding="utf-8")
 

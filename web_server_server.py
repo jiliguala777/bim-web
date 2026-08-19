@@ -1457,14 +1457,14 @@ def _persist_vector_recognition(target_dir, raster_path, result, elapsed_sec):
     mask_color[mask == 3] = (113, 204, 46)
     _write_image(Path(mask_path), mask_color)
     result.update({
-        'recognition_mode': 'full_page',
+        'recognition_mode': result.get('recognition_mode', 'full_page'),
         'vector_cleanup': {'enabled': False, 'has_vector_geometry': False, 'has_vector_text': False},
         'topology_repair': {},
         'pdf_page_number': None,
         'pdf_page_count': None,
-        'crop_bbox_page_px': None,
-        'crop_bbox_preview_px': None,
-        'crop_preview_size': None,
+        'crop_bbox_page_px': result.get('crop_bbox_page_px'),
+        'crop_bbox_preview_px': result.get('crop_bbox_preview_px'),
+        'crop_preview_size': result.get('crop_preview_size'),
     })
     recognition_payload = _build_recognition_payload(
         result, 'none', False, raster_path, overlay_path, mask_path, elapsed_sec,
@@ -1489,7 +1489,7 @@ def _persist_vector_recognition(target_dir, raster_path, result, elapsed_sec):
         'geometry': geometry,
         'room_topology': result['room_topology'],
         'scale_calibration': result['scale_calibration'],
-        'recognition_mode': 'full_page',
+        'recognition_mode': result['recognition_mode'],
         'vector_geometry': result['vector_geometry'],
         'vector_measurements': result['vector_measurements'],
         'recognition': {
@@ -1689,9 +1689,13 @@ def ai_recognize():
             return jsonify({'error': str(exc)}), 400
 
         pdf_upload_token = request.form.get('pdf_upload_token', '').strip()
-        if region_request['mode'] == 'crop_region' and not pdf_upload_token:
+        if (
+            region_request['mode'] == 'crop_region'
+            and not pdf_upload_token
+            and model_backend != VECTOR_PYTORCH_BACKEND
+        ):
             return jsonify({
-                'error': 'crop_region requires a prepared PDF upload',
+                'error': 'crop_region requires a prepared PDF upload or the vector model',
             }), 400
         pdf_page_number = None
         pdf_page_count = None
@@ -1724,7 +1728,27 @@ def ai_recognize():
         if model_backend == VECTOR_PYTORCH_BACKEND:
             if ext == 'pdf':
                 return jsonify({'error': 'Vector recognition currently accepts PNG or JPG; render the target PDF page first.'}), 400
+            crop_bbox_image_px = None
+            if region_request['mode'] == 'crop_region':
+                source_bgr = cv2.imread(raster_path)
+                if source_bgr is None:
+                    return jsonify({'error': 'Cannot decode image'}), 400
+                image_height, image_width = source_bgr.shape[:2]
+                crop_bbox_image_px = map_crop_bbox_to_page(
+                    region_request['crop_bbox_px'],
+                    region_request['preview_size'],
+                    [image_width, image_height],
+                )
+                left, top, right, bottom = crop_bbox_image_px
+                raster_path = os.path.join(target_dir, 'building_plan_ai_crop.png')
+                _write_image(Path(raster_path), source_bgr[top:bottom, left:right].copy())
             result = _vector_platform_adapter.predict(Path(raster_path), Path(target_dir))
+            result.update({
+                'recognition_mode': region_request['mode'],
+                'crop_bbox_page_px': crop_bbox_image_px,
+                'crop_bbox_preview_px': region_request['crop_bbox_px'],
+                'crop_preview_size': region_request['preview_size'],
+            })
             return _persist_vector_recognition(
                 target_dir, raster_path, result, round(_time.time() - t0, 3),
             )

@@ -134,6 +134,43 @@ class VectorPlatformRouteTests(unittest.TestCase):
             self.assertEqual(recognition["model"]["backend"], VECTOR_BACKEND)
             self.assertIsNotNone(self.server._load_recognition_payload(Path(temporary) / "energy" / "VECTOR-1"))
 
+    def test_vector_backend_crops_a_raster_upload_before_prediction(self):
+        image = np.zeros((400, 400, 3), dtype=np.uint8)
+        ok, encoded = cv2.imencode(".png", image)
+        self.assertTrue(ok)
+        adapter = mock.Mock()
+        adapter.predict.return_value = adapt_vector_prediction(
+            {"target": {"width": 200, "height": 200}, "footprints": [], "rooms": [], "walls": [], "openings": []},
+            {"scale_m_per_px": None, "candidates": []},
+            {"checkpoint_sha256": "d" * 64},
+            np.zeros((200, 200, 3), dtype=np.uint8),
+            np.zeros((200, 200, 3), dtype=np.uint8), Path("ignored"),
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            previous_upload = self.server.app.config["UPLOAD_FOLDER"]
+            self.server.app.config["UPLOAD_FOLDER"] = temporary
+            try:
+                with (
+                    mock.patch.object(self.server, "HAS_VECTOR_FLOORPLAN_AI", True),
+                    mock.patch.object(self.server, "_vector_platform_adapter", adapter),
+                ):
+                    response = self.client.post(
+                        "/energy/ai_recognize",
+                        data={
+                            "report_number": "VECTOR-CROP", "model_backend": VECTOR_BACKEND,
+                            "recognition_mode": "crop_region",
+                            "crop_bbox_px": "[100, 100, 300, 300]",
+                            "crop_preview_size": "[400, 400]",
+                            "raster_file": (io.BytesIO(encoded.tobytes()), "plan.png"),
+                        }, content_type="multipart/form-data",
+                    )
+            finally:
+                self.server.app.config["UPLOAD_FOLDER"] = previous_upload
+            self.assertEqual(response.status_code, 200, response.get_json())
+            input_path = adapter.predict.call_args.args[0]
+            self.assertEqual(cv2.imread(str(input_path)).shape[:2], (200, 200))
+            self.assertEqual(response.get_json()["recognition_mode"], "crop_region")
+
     def test_ai_status_reports_vector_availability_when_legacy_onnx_is_absent(self):
         config = mock.Mock()
         config.checkpoint_path = Path("vector-best.pt")

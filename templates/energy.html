@@ -308,14 +308,16 @@
             touch-action: none;
         }
 
-        #pdf-page-preview-image {
+        #pdf-page-preview-image,
+        #vector-raster-preview-image {
             display: block;
             max-width: 100%;
             max-height: 70vh;
             user-select: none;
         }
 
-        #pdf-crop-overlay {
+        #pdf-crop-overlay,
+        #vector-raster-crop-overlay {
             position: absolute;
             border: 2px solid var(--warning);
             background: rgba(241, 196, 15, 0.18);
@@ -892,6 +894,24 @@
                 <div class="upload-sub">支持常见建筑图纸格式，包含黑底CAD、白色底稿或扫描图</div>
                 <div class="upload-sub" style="margin-top: 6px; color: var(--warning);">多页 PDF 可在上传后选择需要识别的楼层页。</div>
                 <input type="file" id="rasterFileInput" class="file-input" accept="image/*,application/pdf">
+            </div>
+
+            <div id="vector-raster-selection" class="param-group-card hidden" style="margin-top:16px;">
+                <div class="param-group-title">新矢量模型识别区域</div>
+                <p style="color:var(--text-muted); margin-bottom:14px;">一张图片包含多张图纸时，请拖动框选其中一张；框选后仅识别该区域。</p>
+                <div class="pdf-preview-frame">
+                    <div class="pdf-preview-image-wrap">
+                        <img id="vector-raster-preview-image" src="" alt="矢量模型图片预览" draggable="false">
+                        <div id="vector-raster-crop-overlay" class="hidden"></div>
+                    </div>
+                </div>
+                <div class="pdf-mode-controls">
+                    <label><input type="radio" id="vector-raster-mode-full" name="vector-raster-mode" value="full_page" checked>识别整张图片</label>
+                    <label><input type="radio" id="vector-raster-mode-crop" name="vector-raster-mode" value="crop_region">框选区域</label>
+                    <button type="button" id="clear-vector-raster-crop" class="btn btn-secondary" disabled>清除框选</button>
+                    <span id="vector-raster-crop-summary" style="color:var(--text-muted); font-size:13px;">整图识别模式</span>
+                </div>
+                <div style="margin-top:14px;"><button type="button" id="recognize-vector-raster" class="btn btn-primary" disabled>开始识别整张图片</button></div>
             </div>
 
             <div id="pdf-page-selection" class="param-group-card hidden" style="margin-top:16px;">
@@ -1637,6 +1657,11 @@
         let pdfCropBeforeDrag = null;
         let pdfCropDragging = false;
         let pdfPreviewSize = null;
+        let vectorRasterFile = null;
+        let vectorRasterRecognitionMode = 'full_page';
+        let vectorRasterCropBBox = null;
+        let vectorRasterCropStart = null;
+        let vectorRasterCropDragging = false;
         let pdfUploadSessionId = 0;
         let pdfPreviewRequestId = 0;
         let pdfPrepareAbortController = null;
@@ -2607,6 +2632,77 @@
             panel.style.display = panel.style.display === 'none' || !panel.style.display ? 'block' : 'none';
         }
 
+        function resetVectorRasterSelection() {
+            vectorRasterFile = null;
+            vectorRasterRecognitionMode = 'full_page';
+            vectorRasterCropBBox = null;
+            vectorRasterCropStart = null;
+            vectorRasterCropDragging = false;
+            const preview = document.getElementById('vector-raster-preview-image');
+            preview.removeAttribute('src');
+            document.getElementById('vector-raster-mode-full').checked = true;
+            document.getElementById('vector-raster-mode-crop').checked = false;
+            document.getElementById('vector-raster-selection').classList.add('hidden');
+            document.getElementById('vector-raster-crop-overlay').classList.add('hidden');
+        }
+
+        function vectorRasterPoint(event) {
+            const image = document.getElementById('vector-raster-preview-image');
+            const rect = image.getBoundingClientRect();
+            return AnnotationCropRegion.canvasPointToImage(
+                { x: event.clientX, y: event.clientY },
+                { offsetX: rect.left, offsetY: rect.top, scale: rect.width / image.naturalWidth,
+                    width: image.naturalWidth, height: image.naturalHeight }
+            );
+        }
+
+        function updateVectorRasterCropControls() {
+            const image = document.getElementById('vector-raster-preview-image');
+            const cropValid = vectorRasterRecognitionMode === 'crop_region'
+                && AnnotationCropRegion.validateCrop(vectorRasterCropBBox, image.naturalWidth, image.naturalHeight);
+            document.getElementById('recognize-vector-raster').disabled = !vectorRasterFile
+                || (vectorRasterRecognitionMode === 'crop_region' && !cropValid);
+            document.getElementById('recognize-vector-raster').innerText = vectorRasterRecognitionMode === 'crop_region'
+                ? '开始识别所选区域' : '开始识别整张图片';
+            document.getElementById('clear-vector-raster-crop').disabled = !vectorRasterCropBBox;
+            image.style.cursor = vectorRasterRecognitionMode === 'crop_region' ? 'crosshair' : 'default';
+            const summary = document.getElementById('vector-raster-crop-summary');
+            if (vectorRasterRecognitionMode !== 'crop_region') summary.innerText = '整图识别模式';
+            else if (!vectorRasterCropBBox) summary.innerText = '请在预览图上拖动框选识别区域';
+            else {
+                const [x0, y0, x1, y1] = vectorRasterCropBBox;
+                summary.innerText = cropValid ? `已选择 ${x1 - x0} × ${y1 - y0} 像素`
+                    : `所选区域 ${x1 - x0} × ${y1 - y0} 像素，区域过小`;
+            }
+        }
+
+        function updateVectorRasterCropOverlay() {
+            const image = document.getElementById('vector-raster-preview-image');
+            const overlay = document.getElementById('vector-raster-crop-overlay');
+            if (!vectorRasterCropBBox || !image.naturalWidth) {
+                overlay.classList.add('hidden');
+                updateVectorRasterCropControls();
+                return;
+            }
+            const [x0, y0, x1, y1] = vectorRasterCropBBox;
+            overlay.style.left = `${x0 * image.clientWidth / image.naturalWidth}px`;
+            overlay.style.top = `${y0 * image.clientHeight / image.naturalHeight}px`;
+            overlay.style.width = `${(x1 - x0) * image.clientWidth / image.naturalWidth}px`;
+            overlay.style.height = `${(y1 - y0) * image.clientHeight / image.naturalHeight}px`;
+            overlay.classList.remove('hidden');
+            updateVectorRasterCropControls();
+        }
+
+        async function prepareVectorRasterCrop(file) {
+            resetVectorRasterSelection();
+            const image = document.getElementById('vector-raster-preview-image');
+            image.src = URL.createObjectURL(file);
+            await new Promise((resolve, reject) => { image.onload = resolve; image.onerror = reject; });
+            vectorRasterFile = file;
+            document.getElementById('vector-raster-selection').classList.remove('hidden');
+            updateVectorRasterCropControls();
+        }
+
         // 上传与识别逻辑
         function setupUpload() {
             const uploadWrapper = document.getElementById('uploadWrapper');
@@ -2654,6 +2750,17 @@
                 if (event.target.checked) setPdfRecognitionMode('crop_region');
             });
             document.getElementById('clear-pdf-crop').addEventListener('click', resetPdfCropSelection);
+            document.getElementById('model-backend').addEventListener('change', resetVectorRasterSelection);
+            document.getElementById('vector-raster-mode-full').addEventListener('change', () => {
+                vectorRasterRecognitionMode = 'full_page'; vectorRasterCropBBox = null; updateVectorRasterCropOverlay();
+            });
+            document.getElementById('vector-raster-mode-crop').addEventListener('change', () => {
+                vectorRasterRecognitionMode = 'crop_region'; updateVectorRasterCropOverlay();
+            });
+            document.getElementById('clear-vector-raster-crop').addEventListener('click', () => {
+                vectorRasterCropBBox = null; updateVectorRasterCropOverlay();
+            });
+            document.getElementById('recognize-vector-raster').addEventListener('click', () => submitRecognition(vectorRasterFile));
 
             const previewImage = document.getElementById('pdf-page-preview-image');
             previewImage.addEventListener('pointerdown', (event) => {
@@ -2716,7 +2823,30 @@
                 }
                 updatePdfCropOverlay();
             });
+            const vectorPreview = document.getElementById('vector-raster-preview-image');
+            vectorPreview.addEventListener('pointerdown', (event) => {
+                if (vectorRasterRecognitionMode !== 'crop_region' || !vectorRasterFile || event.button !== 0) return;
+                event.preventDefault(); vectorRasterCropDragging = true; vectorRasterCropStart = vectorRasterPoint(event);
+                vectorRasterCropBBox = AnnotationCropRegion.normalizeCrop(vectorRasterCropStart, vectorRasterCropStart, vectorPreview.naturalWidth, vectorPreview.naturalHeight);
+                vectorPreview.setPointerCapture(event.pointerId); updateVectorRasterCropOverlay();
+            });
+            vectorPreview.addEventListener('pointermove', (event) => {
+                if (!vectorRasterCropDragging) return;
+                vectorRasterCropBBox = AnnotationCropRegion.normalizeCrop(vectorRasterCropStart, vectorRasterPoint(event), vectorPreview.naturalWidth, vectorPreview.naturalHeight); updateVectorRasterCropOverlay();
+            });
+            vectorPreview.addEventListener('pointerup', (event) => {
+                if (!vectorRasterCropDragging) return;
+                vectorRasterCropDragging = false; vectorRasterCropStart = null;
+                if (vectorPreview.hasPointerCapture(event.pointerId)) vectorPreview.releasePointerCapture(event.pointerId);
+                updateVectorRasterCropOverlay();
+            });
+            vectorPreview.addEventListener('pointercancel', (event) => {
+                vectorRasterCropDragging = false; vectorRasterCropStart = null;
+                if (vectorPreview.hasPointerCapture(event.pointerId)) vectorPreview.releasePointerCapture(event.pointerId);
+                updateVectorRasterCropOverlay();
+            });
             window.addEventListener('resize', updatePdfCropOverlay);
+            window.addEventListener('resize', updateVectorRasterCropOverlay);
         }
 
         async function handleFile(file) {
@@ -2725,6 +2855,8 @@
             const isPdf = file.type === 'application/pdf' || file.name.toLowerCase().endsWith('.pdf');
             if (isPdf) {
                 await preparePdf(file);
+            } else if (document.getElementById('model-backend').value === 'vector_pytorch') {
+                await prepareVectorRasterCrop(file);
             } else {
                 await submitRecognition(file);
             }
@@ -3094,19 +3226,29 @@
                 fd.append('pdf_upload_token', preparedPdf.uploadToken);
                 fd.append('pdf_page_number', document.getElementById('pdf-page-select').value);
             }
-            const recognitionMode = file ? 'full_page' : pdfRecognitionMode;
+            const vectorRasterCrop = Boolean(
+                file
+                && file === vectorRasterFile
+                && document.getElementById('model-backend').value === 'vector_pytorch'
+            );
+            const recognitionMode = file
+                ? (vectorRasterCrop ? vectorRasterRecognitionMode : 'full_page')
+                : pdfRecognitionMode;
             fd.append('recognition_mode', recognitionMode);
             if (recognitionMode === 'crop_region') {
-                const previewImage = document.getElementById('pdf-page-preview-image');
+                const previewImage = vectorRasterCrop
+                    ? document.getElementById('vector-raster-preview-image')
+                    : document.getElementById('pdf-page-preview-image');
+                const cropBBox = vectorRasterCrop ? vectorRasterCropBBox : pdfCropBBox;
                 if (!AnnotationCropRegion.validateCrop(
-                    pdfCropBBox,
+                    cropBBox,
                     previewImage.naturalWidth,
                     previewImage.naturalHeight
                 )) {
-                    alert('请先框选有效的 PDF 识别区域。');
+                    alert('请先框选有效的识别区域。');
                     return;
                 }
-                fd.append('crop_bbox_px', JSON.stringify(pdfCropBBox));
+                fd.append('crop_bbox_px', JSON.stringify(cropBBox));
                 fd.append('crop_preview_size', JSON.stringify([
                     previewImage.naturalWidth,
                     previewImage.naturalHeight

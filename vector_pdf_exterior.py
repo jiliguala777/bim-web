@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections import defaultdict
 import copy
 from dataclasses import dataclass
+import math
 
 import cv2
 import numpy as np
@@ -329,3 +330,450 @@ def enumerate_exterior_gaps(
     for index, record in enumerate(records, 1):
         record["gap_id"] = f"gap-{index:04d}"
     return records
+
+
+def _repair_limit_px(
+    image_size: tuple[int, int],
+    scale_m_per_px: float | None,
+) -> float:
+    if scale_m_per_px is not None:
+        scale = float(scale_m_per_px)
+        if not math.isfinite(scale) or scale <= 0:
+            raise ValueError("scale_m_per_px must be finite and positive")
+        return 0.6 / scale
+    return float(max(4, min(32, round(min(image_size) * 0.01))))
+
+
+def _strict_axis_segment(item: dict) -> dict:
+    orientation = item.get("orientation")
+    start = tuple(float(value) for value in item["start_px"])
+    end = tuple(float(value) for value in item["end_px"])
+    if orientation == "horizontal" and start[1] == end[1] and start[0] != end[0]:
+        first, second = sorted((start, end), key=lambda point: point[0])
+        return {
+            "orientation": orientation,
+            "fixed": first[1],
+            "axis_start": first[0],
+            "axis_end": second[0],
+        }
+    if orientation == "vertical" and start[0] == end[0] and start[1] != end[1]:
+        first, second = sorted((start, end), key=lambda point: point[1])
+        return {
+            "orientation": orientation,
+            "fixed": first[0],
+            "axis_start": first[1],
+            "axis_end": second[1],
+        }
+    raise ValueError("segment must use strict horizontal or vertical endpoints")
+
+
+def _segment_points(segment: dict) -> tuple[tuple[float, float], tuple[float, float]]:
+    if segment["orientation"] == "horizontal":
+        return (
+            (segment["axis_start"], segment["fixed"]),
+            (segment["axis_end"], segment["fixed"]),
+        )
+    return (
+        (segment["fixed"], segment["axis_start"]),
+        (segment["fixed"], segment["axis_end"]),
+    )
+
+
+def _canonical_endpoints(item: dict) -> tuple[tuple[float, float], tuple[float, float]]:
+    segment = _strict_axis_segment(item)
+    return _segment_points(segment)
+
+
+def _opening_matches_gap(opening: dict, gap: dict) -> bool:
+    try:
+        return (
+            opening.get("exterior") is True
+            and opening.get("kind") in {"door", "window"}
+            and opening.get("orientation") == gap.get("orientation")
+            and _canonical_endpoints(opening) == _canonical_endpoints(gap)
+            and sorted(str(value) for value in opening.get("host_wall_ids", []))
+            == sorted(str(value) for value in gap.get("host_wall_ids", []))
+        )
+    except (KeyError, TypeError, ValueError):
+        return False
+
+
+def _unresolved_gap(gap: dict, reason: str | None = None) -> dict:
+    unresolved = copy.deepcopy(gap)
+    if reason is not None:
+        unresolved["reason_codes"] = [reason]
+    return unresolved
+
+
+def _bridge_segment(bridge: dict) -> dict:
+    segment = _strict_axis_segment(bridge)
+    segment.update({
+        "source_wall_ids": set(),
+        "bridge_ids": {bridge["bridge_id"]},
+        "opening_ids": (
+            {bridge["opening_id"]} if bridge.get("opening_id") is not None else set()
+        ),
+    })
+    return segment
+
+
+def _wall_segment(wall: dict) -> dict:
+    segment = _strict_axis_segment(wall)
+    segment.update({
+        "source_wall_ids": {str(wall["candidate_id"])},
+        "bridge_ids": set(),
+        "opening_ids": set(),
+    })
+    return segment
+
+
+def _merge_topology_segments(segments: list[dict]) -> list[dict]:
+    groups = defaultdict(list)
+    for segment in segments:
+        groups[(segment["orientation"], segment["fixed"])].append(segment)
+    merged = []
+    for (orientation, fixed), members in sorted(groups.items()):
+        members.sort(key=lambda item: (item["axis_start"], item["axis_end"]))
+        current = copy.deepcopy(members[0])
+        for member in members[1:]:
+            if member["axis_start"] <= current["axis_end"]:
+                current["axis_end"] = max(current["axis_end"], member["axis_end"])
+                for field in ("source_wall_ids", "bridge_ids", "opening_ids"):
+                    current[field].update(member[field])
+                continue
+            merged.append(current)
+            current = copy.deepcopy(member)
+        merged.append(current)
+    return merged
+
+
+def _edge_key(
+    start: tuple[float, float],
+    end: tuple[float, float],
+) -> tuple[tuple[float, float], tuple[float, float]]:
+    return (start, end) if start <= end else (end, start)
+
+
+def _split_at_intersections(
+    segments: list[dict],
+) -> tuple[dict[tuple[float, float], set[tuple[float, float]]], dict]:
+    cuts = [{segment["axis_start"], segment["axis_end"]} for segment in segments]
+    horizontal = [
+        (index, segment) for index, segment in enumerate(segments)
+        if segment["orientation"] == "horizontal"
+    ]
+    vertical = [
+        (index, segment) for index, segment in enumerate(segments)
+        if segment["orientation"] == "vertical"
+    ]
+    for horizontal_index, horizontal_segment in horizontal:
+        for vertical_index, vertical_segment in vertical:
+            x = vertical_segment["fixed"]
+            y = horizontal_segment["fixed"]
+            if (
+                horizontal_segment["axis_start"] <= x <= horizontal_segment["axis_end"]
+                and vertical_segment["axis_start"] <= y <= vertical_segment["axis_end"]
+            ):
+                cuts[horizontal_index].add(x)
+                cuts[vertical_index].add(y)
+
+    adjacency = defaultdict(set)
+    edge_evidence = {}
+    for segment, positions in zip(segments, cuts):
+        ordered = sorted(positions)
+        for axis_start, axis_end in zip(ordered, ordered[1:]):
+            if axis_start == axis_end:
+                continue
+            piece = dict(segment, axis_start=axis_start, axis_end=axis_end)
+            start, end = _segment_points(piece)
+            adjacency[start].add(end)
+            adjacency[end].add(start)
+            key = _edge_key(start, end)
+            evidence = edge_evidence.setdefault(key, {
+                "source_wall_ids": set(),
+                "bridge_ids": set(),
+                "opening_ids": set(),
+            })
+            for field in evidence:
+                evidence[field].update(segment[field])
+    return dict(adjacency), edge_evidence
+
+
+_CLOCKWISE_DIRECTIONS = ((1, 0), (0, 1), (-1, 0), (0, -1))
+
+
+def _direction_index(
+    start: tuple[float, float],
+    end: tuple[float, float],
+) -> int:
+    dx, dy = end[0] - start[0], end[1] - start[1]
+    direction = (
+        (1 if dx > 0 else -1, 0)
+        if dx else (0, 1 if dy > 0 else -1)
+    )
+    return _CLOCKWISE_DIRECTIONS.index(direction)
+
+
+def _next_face_edge(
+    previous: tuple[float, float],
+    current: tuple[float, float],
+    adjacency: dict[tuple[float, float], set[tuple[float, float]]],
+) -> tuple[float, float]:
+    incoming = _direction_index(previous, current)
+    by_direction = {
+        _direction_index(current, neighbour): neighbour
+        for neighbour in adjacency[current]
+    }
+    for direction in (
+        (incoming + 1) % 4,
+        incoming,
+        (incoming - 1) % 4,
+        (incoming + 2) % 4,
+    ):
+        if direction in by_direction:
+            return by_direction[direction]
+    raise ValueError("graph vertex has no outgoing edge")
+
+
+def _signed_area(polygon: list[tuple[float, float]]) -> float:
+    return 0.5 * sum(
+        start[0] * end[1] - end[0] * start[1]
+        for start, end in zip(polygon, polygon[1:] + polygon[:1])
+    )
+
+
+def _simplify_polygon(
+    polygon: list[tuple[float, float]],
+) -> list[tuple[float, float]]:
+    simplified = []
+    for index, point in enumerate(polygon):
+        previous = polygon[index - 1]
+        following = polygon[(index + 1) % len(polygon)]
+        if (
+            (previous[0] == point[0] == following[0])
+            or (previous[1] == point[1] == following[1])
+        ):
+            continue
+        simplified.append(point)
+    return simplified
+
+
+def _enumerate_bounded_faces(adjacency: dict, edge_evidence: dict) -> list[dict]:
+    visited = set()
+    faces = []
+    directed_edges = sorted(
+        (start, end) for start, neighbours in adjacency.items() for end in neighbours
+    )
+    for initial in directed_edges:
+        if initial in visited:
+            continue
+        polygon = []
+        face_edges = []
+        edge = initial
+        while edge not in visited:
+            visited.add(edge)
+            previous, current = edge
+            polygon.append(previous)
+            face_edges.append(_edge_key(previous, current))
+            edge = (current, _next_face_edge(previous, current, adjacency))
+        if edge != initial or len(polygon) < 4:
+            continue
+        area = _signed_area(polygon)
+        if area <= 0:
+            continue
+        polygon = _simplify_polygon(polygon)
+        evidence = {
+            "source_wall_ids": set(),
+            "bridge_ids": set(),
+            "opening_ids": set(),
+        }
+        for face_edge in face_edges:
+            for field in evidence:
+                evidence[field].update(edge_evidence[face_edge][field])
+        faces.append({
+            "polygon": polygon,
+            "area": float(area),
+            "perimeter": float(sum(
+                abs(start[0] - end[0]) + abs(start[1] - end[1])
+                for start, end in zip(polygon, polygon[1:] + polygon[:1])
+            )),
+            **evidence,
+        })
+    return faces
+
+
+def _face_inside_roi(face: dict, roi: list[int]) -> bool:
+    left, top, right, bottom = (float(value) for value in roi)
+    return all(
+        left <= x <= right and top <= y <= bottom
+        for x, y in face["polygon"]
+    )
+
+
+def _face_footprint_mean(face: dict, footprint: np.ndarray) -> float:
+    mask = np.zeros(footprint.shape, dtype=np.uint8)
+    polygon = np.rint(np.asarray(face["polygon"], dtype=np.float64)).astype(np.int32)
+    cv2.fillPoly(mask, [polygon], 1)
+    return _mean(footprint, mask > 0)
+
+
+def _empty_exterior_topology(status: str, unresolved_gaps: list[dict], bridges: list[dict]) -> dict:
+    return {
+        "format": "pdf-exterior-topology/1",
+        "status": status,
+        "confirmed": False,
+        "polygon_px": [],
+        "area_px2": 0.0,
+        "perimeter_px": 0.0,
+        "area_m2": None,
+        "perimeter_m": None,
+        "source_wall_ids": [],
+        "bridge_ids": [],
+        "opening_ids": [],
+        "bridges": bridges,
+        "unresolved_gaps": unresolved_gaps,
+        "load_geometry_ready": False,
+    }
+
+
+def _discard_unused_small_gap_repairs(
+    bridges: list[dict],
+    unresolved_gaps: list[dict],
+    gaps: list[dict],
+    used_bridge_ids: set[str],
+) -> tuple[list[dict], list[dict]]:
+    gaps_by_id = {str(gap.get("gap_id")): gap for gap in gaps}
+    kept = []
+    for bridge in bridges:
+        if (
+            bridge["bridge_type"] == "small_gap_repair"
+            and bridge["bridge_id"] not in used_bridge_ids
+        ):
+            gap = gaps_by_id.get(bridge["gap_id"])
+            if gap is not None:
+                unresolved_gaps.append(_unresolved_gap(
+                    gap, "gap_does_not_close_supported_exterior",
+                ))
+            continue
+        kept.append(bridge)
+    unresolved_gaps.sort(key=lambda item: str(item.get("gap_id", "")))
+    return kept, unresolved_gaps
+
+
+def build_exterior_topology(
+    exterior_walls: list[dict],
+    gaps: list[dict],
+    openings: list[dict],
+    probabilities: np.ndarray,
+    image_size: tuple[int, int],
+    building_roi: list[int] | None,
+    *,
+    scale_m_per_px: float | None = None,
+) -> dict:
+    """Build traceable bridges and select the largest supported orthogonal footprint."""
+    width, height = (int(value) for value in image_size)
+    values = np.asarray(probabilities)
+    if values.shape != (10, height, width):
+        raise ValueError("probabilities must have shape (10, height, width)")
+    roi = [0, 0, width, height] if building_roi is None else [int(value) for value in building_roi]
+    repair_limit = _repair_limit_px((width, height), scale_m_per_px)
+
+    wall_segments = []
+    for wall in exterior_walls:
+        try:
+            wall_segments.append(_wall_segment(wall))
+        except (KeyError, TypeError, ValueError):
+            continue
+
+    bridges = []
+    unresolved_gaps = []
+    for gap in gaps:
+        if gap.get("decision") != "accepted_gap":
+            unresolved_gaps.append(_unresolved_gap(gap))
+            continue
+        try:
+            gap_segment = _strict_axis_segment(gap)
+        except (KeyError, TypeError, ValueError):
+            unresolved_gaps.append(_unresolved_gap(gap, "corner_gap_requires_turn"))
+            continue
+        matching_openings = [opening for opening in openings if _opening_matches_gap(opening, gap)]
+        if len(matching_openings) > 1:
+            unresolved_gaps.append(_unresolved_gap(gap, "multiple_matching_openings"))
+            continue
+        width_px = float(gap_segment["axis_end"] - gap_segment["axis_start"])
+        if matching_openings:
+            opening = matching_openings[0]
+            bridge_type = "opening_bridge"
+            opening_id = str(opening["opening_id"])
+            confidence = float(opening.get("confidence", 0.0))
+            reason_codes = ["accepted_opening_exact_gap_match"]
+        elif width_px <= repair_limit:
+            bridge_type = "small_gap_repair"
+            opening_id = None
+            confidence = 1.0
+            reason_codes = ["gap_within_repair_limit"]
+        else:
+            unresolved_gaps.append(_unresolved_gap(gap, "gap_exceeds_repair_limit"))
+            continue
+        start, end = _segment_points(gap_segment)
+        bridge = {
+            "bridge_id": f"bridge-{len(bridges) + 1:04d}",
+            "bridge_type": bridge_type,
+            "orientation": gap_segment["orientation"],
+            "start_px": list(start),
+            "end_px": list(end),
+            "source_endpoints_px": [list(start), list(end)],
+            "width_px": width_px,
+            "gap_id": str(gap["gap_id"]),
+            "host_wall_ids": sorted(str(value) for value in gap.get("host_wall_ids", [])),
+            "opening_id": opening_id,
+            "confidence": confidence,
+            "reason_codes": reason_codes,
+        }
+        bridges.append(bridge)
+
+    if not wall_segments:
+        bridges, unresolved_gaps = _discard_unused_small_gap_repairs(
+            bridges, unresolved_gaps, gaps, set(),
+        )
+        return _empty_exterior_topology("no_exterior_wall_evidence", unresolved_gaps, bridges)
+
+    graph_segments = [*wall_segments, *(_bridge_segment(bridge) for bridge in bridges)]
+    merged = _merge_topology_segments(graph_segments)
+    adjacency, edge_evidence = _split_at_intersections(merged)
+    faces = [
+        face for face in _enumerate_bounded_faces(adjacency, edge_evidence)
+        if _face_inside_roi(face, roi)
+        and _face_footprint_mean(face, values[0]) >= ExteriorThresholds().footprint_inside_mean_min
+    ]
+    used_bridge_ids = {
+        bridge_id for face in faces for bridge_id in face["bridge_ids"]
+    }
+    bridges, unresolved_gaps = _discard_unused_small_gap_repairs(
+        bridges, unresolved_gaps, gaps, used_bridge_ids,
+    )
+    if not faces:
+        return _empty_exterior_topology("exterior_not_closed", unresolved_gaps, bridges)
+
+    faces.sort(key=lambda face: (-face["area"], face["polygon"]))
+    largest = faces[0]
+    if len(faces) > 1 and faces[1]["area"] >= largest["area"] * 0.90:
+        return _empty_exterior_topology("ambiguous_exterior", unresolved_gaps, bridges)
+
+    scale = float(scale_m_per_px) if scale_m_per_px is not None else None
+    return {
+        "format": "pdf-exterior-topology/1",
+        "status": "review_required",
+        "confirmed": False,
+        "polygon_px": [list(point) for point in largest["polygon"]],
+        "area_px2": largest["area"],
+        "perimeter_px": largest["perimeter"],
+        "area_m2": largest["area"] * scale ** 2 if scale is not None else None,
+        "perimeter_m": largest["perimeter"] * scale if scale is not None else None,
+        "source_wall_ids": sorted(largest["source_wall_ids"]),
+        "bridge_ids": sorted(largest["bridge_ids"]),
+        "opening_ids": sorted(largest["opening_ids"]),
+        "bridges": bridges,
+        "unresolved_gaps": unresolved_gaps,
+        "load_geometry_ready": False,
+    }

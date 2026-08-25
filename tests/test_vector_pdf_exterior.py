@@ -42,6 +42,84 @@ def exterior_wall(line_id, start, end, orientation, inside_direction):
     return wall
 
 
+def topology_gap(
+    start_x, start_y, end_x, end_y, *, gap_id="gap-0001",
+    host_wall_ids=("bottom-left", "bottom-right"), decision="accepted_gap",
+):
+    orientation = (
+        "horizontal" if start_y == end_y
+        else "vertical" if start_x == end_x
+        else "horizontal"
+    )
+    return {
+        "gap_id": gap_id,
+        "orientation": orientation,
+        "start_px": [start_x, start_y],
+        "end_px": [end_x, end_y],
+        "width_px": float(abs(end_x - start_x) + abs(end_y - start_y)),
+        "host_wall_ids": list(host_wall_ids),
+        "inside_direction": "up" if orientation == "horizontal" else "left",
+        "decision": decision,
+        "reason_codes": (
+            ["unambiguous_collinear_exterior_gap"]
+            if decision == "accepted_gap" else ["not_strictly_collinear"]
+        ),
+    }
+
+
+def door_opening(start_x, start_y, end_x, end_y):
+    return {
+        "opening_id": "opening-0001",
+        "kind": "door",
+        "orientation": "horizontal",
+        "start_px": [start_x, start_y],
+        "end_px": [end_x, end_y],
+        "width_px": float(abs(end_x - start_x)),
+        "width_m": None,
+        "host_wall_ids": ["bottom-left", "bottom-right"],
+        "exterior": True,
+        "confidence": 0.9,
+        "reason_codes": ["door_line_and_endpoints_supported"],
+    }
+
+
+def rectangle_with_bottom_gap(door_gap=(40, 60)):
+    gap_start, gap_end = door_gap
+    return [
+        exterior_wall("top", (20, 20), (80, 20), "horizontal", "down"),
+        exterior_wall("right", (80, 20), (80, 80), "vertical", "left"),
+        exterior_wall("bottom-right", (gap_end, 80), (80, 80), "horizontal", "up"),
+        exterior_wall("bottom-left", (20, 80), (gap_start, 80), "horizontal", "up"),
+        exterior_wall("left", (20, 20), (20, 80), "vertical", "right"),
+    ]
+
+
+def walls_from_polygon(points, prefix="wall"):
+    walls = []
+    clockwise_inside = {
+        (1, 0): ("horizontal", "down"),
+        (0, 1): ("vertical", "left"),
+        (-1, 0): ("horizontal", "up"),
+        (0, -1): ("vertical", "right"),
+    }
+    for index, (start, end) in enumerate(zip(points, points[1:] + points[:1]), 1):
+        dx = 0 if end[0] == start[0] else (1 if end[0] > start[0] else -1)
+        dy = 0 if end[1] == start[1] else (1 if end[1] > start[1] else -1)
+        orientation, inside = clockwise_inside[(dx, dy)]
+        walls.append(exterior_wall(f"{prefix}-{index}", start, end, orientation, inside))
+    return walls
+
+
+def supported_footprint(*polygons, image_size=(100, 100)):
+    width, height = image_size
+    probabilities = np.zeros((10, height, width), dtype=np.float32)
+    for polygon in polygons:
+        points = np.asarray(polygon, dtype=np.int32)
+        import cv2
+        cv2.fillPoly(probabilities[0], [points], 1.0)
+    return probabilities
+
+
 class ExteriorWallSelectionTests(unittest.TestCase):
     def test_selects_wall_with_one_footprint_interior_side(self):
         from vector_pdf_exterior import select_exterior_walls
@@ -157,6 +235,207 @@ class ExteriorGapEnumerationTests(unittest.TestCase):
         self.assertEqual(len(gaps), 1)
         self.assertEqual(gaps[0]["decision"], "rejected_gap")
         self.assertIn("outside_building_roi", gaps[0]["reason_codes"])
+
+
+class ExteriorTopologyTests(unittest.TestCase):
+    def test_opening_bridge_closes_rectangle_without_becoming_real_wall(self):
+        from vector_pdf_exterior import build_exterior_topology
+
+        polygon = [(20, 20), (80, 20), (80, 80), (20, 80)]
+        walls = rectangle_with_bottom_gap(door_gap=(40, 60))
+        topology = build_exterior_topology(
+            walls,
+            [topology_gap(40, 80, 60, 80)],
+            [door_opening(40, 80, 60, 80)],
+            supported_footprint(polygon),
+            (100, 100),
+            [0, 0, 100, 100],
+        )
+
+        self.assertEqual(topology["status"], "review_required")
+        self.assertEqual(topology["area_px2"], 3600.0)
+        self.assertEqual(topology["bridges"][0]["bridge_type"], "opening_bridge")
+        self.assertEqual(topology["opening_ids"], ["opening-0001"])
+        self.assertEqual(topology["source_wall_ids"], [
+            "bottom-left", "bottom-right", "left", "right", "top",
+        ])
+        self.assertNotIn("opening-0001", topology["source_wall_ids"])
+        self.assertFalse(topology["confirmed"])
+        self.assertFalse(topology["load_geometry_ready"])
+
+    def test_unknown_gap_repairs_at_metric_boundary_only(self):
+        from vector_pdf_exterior import build_exterior_topology
+
+        polygon = [(20, 20), (80, 20), (80, 80), (20, 80)]
+        walls = rectangle_with_bottom_gap(door_gap=(40, 60))
+        accepted = build_exterior_topology(
+            walls, [topology_gap(40, 80, 60, 80)], [],
+            supported_footprint(polygon), (100, 100), [0, 0, 100, 100],
+            scale_m_per_px=0.03,
+        )
+        rejected = build_exterior_topology(
+            walls, [topology_gap(40, 80, 61, 80)], [],
+            supported_footprint(polygon), (100, 100), [0, 0, 100, 100],
+            scale_m_per_px=0.03,
+        )
+
+        self.assertEqual(accepted["bridges"][0]["bridge_type"], "small_gap_repair")
+        self.assertEqual(
+            rejected["unresolved_gaps"][0]["reason_codes"],
+            ["gap_exceeds_repair_limit"],
+        )
+
+    def test_unknown_gap_repairs_at_unscaled_pixel_boundary_only(self):
+        from vector_pdf_exterior import build_exterior_topology
+
+        polygon = [(20, 20), (80, 20), (80, 80), (20, 80)]
+        accepted = build_exterior_topology(
+            rectangle_with_bottom_gap(door_gap=(40, 44)),
+            [topology_gap(40, 80, 44, 80)], [], supported_footprint(polygon),
+            (100, 100), [0, 0, 100, 100],
+        )
+        rejected = build_exterior_topology(
+            rectangle_with_bottom_gap(door_gap=(40, 45)),
+            [topology_gap(40, 80, 45, 80)], [], supported_footprint(polygon),
+            (100, 100), [0, 0, 100, 100],
+        )
+
+        self.assertEqual(accepted["bridges"][0]["bridge_type"], "small_gap_repair")
+        self.assertEqual(
+            rejected["unresolved_gaps"][0]["reason_codes"],
+            ["gap_exceeds_repair_limit"],
+        )
+
+    def test_concave_orthogonal_footprint_keeps_its_notch(self):
+        from vector_pdf_exterior import build_exterior_topology
+
+        polygon = [(20, 20), (80, 20), (80, 50), (50, 50), (50, 80), (20, 80)]
+        topology = build_exterior_topology(
+            walls_from_polygon(polygon), [], [], supported_footprint(polygon),
+            (100, 100), [0, 0, 100, 100],
+        )
+
+        self.assertEqual(topology["status"], "review_required")
+        self.assertEqual(topology["area_px2"], 2700.0)
+        self.assertEqual(topology["perimeter_px"], 240.0)
+        self.assertEqual(set(map(tuple, topology["polygon_px"])), set(polygon))
+
+    def test_duplicate_wall_sources_survive_collinear_merge(self):
+        from vector_pdf_exterior import build_exterior_topology
+
+        polygon = [(20, 20), (80, 20), (80, 80), (20, 80)]
+        walls = walls_from_polygon(polygon)
+        walls.append(exterior_wall("duplicate-top", (20, 20), (80, 20), "horizontal", "down"))
+        topology = build_exterior_topology(
+            walls, [], [], supported_footprint(polygon),
+            (100, 100), [0, 0, 100, 100],
+        )
+
+        self.assertIn("duplicate-top", topology["source_wall_ids"])
+        self.assertEqual(len(topology["source_wall_ids"]), 5)
+
+    def test_open_wall_chain_has_no_bounding_rectangle_fallback(self):
+        from vector_pdf_exterior import build_exterior_topology
+
+        polygon = [(20, 20), (80, 20), (80, 80), (20, 80)]
+        walls = walls_from_polygon(polygon)[:-1]
+        topology = build_exterior_topology(
+            walls, [], [], supported_footprint(polygon),
+            (100, 100), [0, 0, 100, 100],
+        )
+
+        self.assertEqual(topology["status"], "exterior_not_closed")
+        self.assertEqual(topology["polygon_px"], [])
+        self.assertEqual(topology["area_px2"], 0.0)
+
+    def test_multiple_comparable_faces_are_ambiguous(self):
+        from vector_pdf_exterior import build_exterior_topology
+
+        first = [(10, 10), (40, 10), (40, 40), (10, 40)]
+        second = [(60, 60), (90, 60), (90, 90), (60, 90)]
+        topology = build_exterior_topology(
+            walls_from_polygon(first, "first") + walls_from_polygon(second, "second"),
+            [], [], supported_footprint(first, second),
+            (100, 100), [0, 0, 100, 100],
+        )
+
+        self.assertEqual(topology["status"], "ambiguous_exterior")
+        self.assertEqual(topology["polygon_px"], [])
+        self.assertFalse(topology["confirmed"])
+
+    def test_corner_gap_remains_unresolved(self):
+        from vector_pdf_exterior import build_exterior_topology
+
+        polygon = [(20, 20), (80, 20), (80, 80), (20, 80)]
+        walls = [
+            exterior_wall("top", (20, 20), (80, 20), "horizontal", "down"),
+            exterior_wall("right", (80, 20), (80, 70), "vertical", "left"),
+            exterior_wall("bottom", (70, 80), (20, 80), "horizontal", "up"),
+            exterior_wall("left", (20, 80), (20, 20), "vertical", "right"),
+        ]
+        corner = topology_gap(
+            80, 70, 70, 80, host_wall_ids=("right", "bottom"),
+        )
+        topology = build_exterior_topology(
+            walls, [corner], [], supported_footprint(polygon),
+            (100, 100), [0, 0, 100, 100],
+        )
+
+        self.assertEqual(topology["status"], "exterior_not_closed")
+        self.assertEqual(len(topology["bridges"]), 0)
+        self.assertEqual(topology["unresolved_gaps"][0]["gap_id"], "gap-0001")
+
+    def test_rejected_gap_stays_traceable_and_never_closes(self):
+        from vector_pdf_exterior import build_exterior_topology
+
+        polygon = [(20, 20), (80, 20), (80, 80), (20, 80)]
+        rejected = topology_gap(40, 80, 60, 80, decision="rejected_gap")
+        topology = build_exterior_topology(
+            rectangle_with_bottom_gap(), [rejected], [], supported_footprint(polygon),
+            (100, 100), [0, 0, 100, 100],
+        )
+
+        self.assertEqual(topology["status"], "exterior_not_closed")
+        self.assertEqual(topology["bridges"], [])
+        self.assertEqual(topology["unresolved_gaps"][0]["decision"], "rejected_gap")
+
+    def test_opening_must_match_gap_endpoints_and_hosts(self):
+        from vector_pdf_exterior import build_exterior_topology
+
+        polygon = [(20, 20), (80, 20), (80, 80), (20, 80)]
+        mismatched = door_opening(40, 80, 60, 80)
+        mismatched["host_wall_ids"] = ["left", "right"]
+        topology = build_exterior_topology(
+            rectangle_with_bottom_gap(), [topology_gap(40, 80, 60, 80)],
+            [mismatched], supported_footprint(polygon),
+            (100, 100), [0, 0, 100, 100], scale_m_per_px=0.03,
+        )
+
+        self.assertEqual(topology["bridges"][0]["bridge_type"], "small_gap_repair")
+        self.assertEqual(topology["opening_ids"], [])
+
+    def test_small_gap_repair_must_improve_supported_exterior_closure(self):
+        from vector_pdf_exterior import build_exterior_topology
+
+        walls = [
+            exterior_wall("left-part", (20, 20), (40, 20), "horizontal", "down"),
+            exterior_wall("right-part", (44, 20), (60, 20), "horizontal", "down"),
+        ]
+        topology = build_exterior_topology(
+            walls,
+            [topology_gap(
+                40, 20, 44, 20,
+                host_wall_ids=("left-part", "right-part"),
+            )],
+            [], supported_footprint(), (100, 100), [0, 0, 100, 100],
+        )
+
+        self.assertEqual(topology["status"], "exterior_not_closed")
+        self.assertEqual(topology["bridges"], [])
+        self.assertEqual(
+            topology["unresolved_gaps"][0]["reason_codes"],
+            ["gap_does_not_close_supported_exterior"],
+        )
 
 
 if __name__ == "__main__":

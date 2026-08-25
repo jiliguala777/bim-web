@@ -1,3 +1,5 @@
+import hashlib
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -37,6 +39,29 @@ class VectorPdfFusionRouteTests(unittest.TestCase):
                 image = np.full((20, 30, 3), 255, dtype=np.uint8)
                 cv2.imwrite(str(output / "pdf_vector_model_input.png"), image)
                 cv2.imwrite(str(output / "pdf_vector_fusion_overlay.png"), image)
+                cv2.imwrite(str(output / "pdf_exterior_overlay.png"), image)
+                topology = {
+                    "format": "pdf-exterior-topology/1",
+                    "status": "review_required",
+                    "confirmed": False,
+                    "load_geometry_ready": False,
+                    "polygon_px": [[0, 0], [20, 0], [20, 10], [0, 10]],
+                    "area_px2": 200.0,
+                    "perimeter_px": 60.0,
+                    "bridges": [],
+                    "unresolved_gaps": [],
+                    "provenance": {
+                        "page_number": 1,
+                        "analysis_size_px": [30, 20],
+                        "crop_bbox_page_px": None,
+                    },
+                }
+                (output / "pdf_exterior_topology.json").write_text(
+                    json.dumps(topology), encoding="utf-8",
+                )
+                (output / "pdf_opening_candidates.json").write_text(
+                    json.dumps({"accepted_openings": []}), encoding="utf-8",
+                )
                 return {
                     "format": "pdf-vector-fusion/1",
                     "status": "evaluable",
@@ -49,9 +74,16 @@ class VectorPdfFusionRouteTests(unittest.TestCase):
                         "suspicious_room_count": 0,
                     },
                     "reason_codes": [],
+                    "exterior_summary": {
+                        "exterior_wall_count": 4,
+                        "accepted_opening_count": 0,
+                        "footprint_status": "review_required",
+                    },
                 }
 
             try:
+                segmenter = mock.Mock()
+                segmenter.predict.side_effect = AssertionError("legacy ONNX must not run")
                 with (
                     mock.patch.object(self.server, "HAS_VECTOR_PDF_FUSION", True),
                     mock.patch.object(self.server, "_vector_pdf_fusion_config", object()),
@@ -61,9 +93,7 @@ class VectorPdfFusionRouteTests(unittest.TestCase):
                         side_effect=fake_analysis,
                     ) as analyze,
                     mock.patch.object(
-                        self.server._floorplan_segmenter,
-                        "predict",
-                        side_effect=AssertionError("legacy ONNX must not run"),
+                        self.server, "_floorplan_segmenter", segmenter, create=True,
                     ),
                 ):
                     response = self.client.post(
@@ -84,8 +114,21 @@ class VectorPdfFusionRouteTests(unittest.TestCase):
             self.assertFalse(payload["load_geometry_ready"])
             self.assertEqual(payload["summary"]["accepted_wall_count"], 4)
             self.assertIn("overlay", payload["images"])
+            self.assertIn("exterior_overlay", payload["images"])
+            self.assertEqual(payload["exterior_summary"]["exterior_wall_count"], 4)
+            self.assertEqual(
+                payload["topology_sha256"],
+                hashlib.sha256(
+                    (report_dir / "vector_pdf_fusion" / "pdf_exterior_topology.json").read_bytes()
+                ).hexdigest(),
+            )
+            self.assertEqual(
+                payload["artifacts"]["exterior_topology"],
+                "vector_pdf_fusion/pdf_exterior_topology.json",
+            )
             self.assertFalse((report_dir / "recognition.json").exists())
             analyze.assert_called_once()
+            segmenter.predict.assert_not_called()
 
 
 if __name__ == "__main__":

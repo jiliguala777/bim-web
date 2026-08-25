@@ -2,8 +2,12 @@ import os
 from pathlib import Path
 import secrets
 import json
+import copy
+import hashlib
+import hmac
 import math
 import shutil
+import tempfile
 import zipfile
 import threading
 import uuid
@@ -1565,6 +1569,254 @@ def _validated_prepared_pdf(report_number, pdf_upload_token, pdf_page_number):
     return pdf_path, page_number, page_count
 
 
+def _sha256_file(path):
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def _require_exterior_report_dir(report_number):
+    """Resolve one literal report directory without accepting aliases or links."""
+    if not isinstance(report_number, str) or not report_number:
+        raise ValueError('report_number is required')
+    if secure_filename(report_number) != report_number:
+        raise ValueError('report_number is invalid')
+    energy_root = (Path(app.config['UPLOAD_FOLDER']) / 'energy').resolve()
+    report_path = energy_root / report_number
+    if not report_path.is_dir():
+        raise FileNotFoundError('Report does not exist')
+    resolved_report = report_path.resolve(strict=True)
+    if report_path.is_symlink() or resolved_report.parent != energy_root:
+        raise ValueError('report_number is invalid')
+    artifact_path = resolved_report / 'vector_pdf_fusion'
+    if not artifact_path.is_dir():
+        raise FileNotFoundError('Vector PDF fusion artifacts do not exist')
+    resolved_artifacts = artifact_path.resolve(strict=True)
+    if artifact_path.is_symlink() or resolved_artifacts.parent != resolved_report:
+        raise ValueError('Vector PDF fusion artifact path is invalid')
+    return resolved_report, resolved_artifacts
+
+
+def _read_exterior_artifact(artifact_dir, filename):
+    path = artifact_dir / filename
+    if not path.is_file() or path.is_symlink():
+        raise FileNotFoundError(f'{filename} does not exist')
+    resolved = path.resolve(strict=True)
+    if resolved.parent != artifact_dir:
+        raise ValueError(f'{filename} path is invalid')
+    raw = resolved.read_bytes()
+    try:
+        payload = json.loads(raw.decode('utf-8'))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f'{filename} is invalid JSON') from exc
+    if not isinstance(payload, dict):
+        raise ValueError(f'{filename} must contain an object')
+    return raw, payload
+
+
+def _positive_finite_number(value, name):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f'{name} must be a finite positive number')
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError(f'{name} must be a finite positive number') from None
+    if not math.isfinite(number) or number <= 0:
+        raise ValueError(f'{name} must be a finite positive number')
+    return number
+
+
+def _normalized_crop_bbox(value, name):
+    if value is None:
+        return None
+    if (
+        not isinstance(value, list)
+        or len(value) != 4
+        or any(isinstance(item, bool) or not isinstance(item, int) for item in value)
+    ):
+        raise ValueError(f'{name} must be null or four normalized integers')
+    left, top, right, bottom = value
+    if left < 0 or top < 0 or right <= left or bottom <= top:
+        raise ValueError(f'{name} must be null or four normalized integers')
+    return list(value)
+
+
+def _artifact_provenance(topology, opening_artifact):
+    topology_provenance = topology.get('provenance')
+    opening_provenance = opening_artifact.get('provenance')
+    if not isinstance(topology_provenance, dict) or opening_provenance != topology_provenance:
+        raise RuntimeError('Exterior artifact provenance does not match')
+    page_number = topology_provenance.get('page_number')
+    if isinstance(page_number, bool) or not isinstance(page_number, int) or page_number < 1:
+        raise RuntimeError('Exterior artifact page number is invalid')
+    try:
+        crop_bbox = _normalized_crop_bbox(
+            topology_provenance.get('crop_bbox_page_px'),
+            'artifact crop_bbox_page_px',
+        )
+    except ValueError as exc:
+        raise RuntimeError(str(exc)) from exc
+    image_size = topology_provenance.get('analysis_size_px')
+    if (
+        not isinstance(image_size, list)
+        or len(image_size) != 2
+        or any(isinstance(item, bool) or not isinstance(item, int) or item <= 0 for item in image_size)
+    ):
+        raise RuntimeError('Exterior artifact image size is invalid')
+    return topology_provenance, page_number, crop_bbox, list(image_size)
+
+
+def _axis_segment(item, name):
+    try:
+        start = [float(value) for value in item['start_px']]
+        end = [float(value) for value in item['end_px']]
+    except (KeyError, TypeError, ValueError, OverflowError) as exc:
+        raise RuntimeError(f'{name} endpoints are invalid') from exc
+    if len(start) != 2 or len(end) != 2 or not all(math.isfinite(value) for value in start + end):
+        raise RuntimeError(f'{name} endpoints are invalid')
+    if start[1] == end[1] and start[0] != end[0]:
+        orientation = 'horizontal'
+        fixed = start[1]
+        interval = sorted((start[0], end[0]))
+    elif start[0] == end[0] and start[1] != end[1]:
+        orientation = 'vertical'
+        fixed = start[0]
+        interval = sorted((start[1], end[1]))
+    else:
+        raise RuntimeError(f'{name} must be a nonzero axis-aligned segment')
+    return orientation, fixed, interval, start, end
+
+
+def _validate_confirmable_topology(topology, opening_artifact, scale):
+    if (
+        topology.get('format') != 'pdf-exterior-topology/1'
+        or topology.get('status') != 'review_required'
+        or topology.get('confirmed') is not False
+        or topology.get('load_geometry_ready') is not False
+    ):
+        raise RuntimeError('Exterior topology is not an unconfirmed closed candidate')
+    polygon = topology.get('polygon_px')
+    if not isinstance(polygon, list) or len(polygon) < 4:
+        raise RuntimeError('Exterior topology is not closed')
+    polygon_points = []
+    for index, point in enumerate(polygon):
+        try:
+            values = [float(value) for value in point]
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise RuntimeError(f'Exterior polygon point {index} is invalid') from exc
+        if len(values) != 2 or not all(math.isfinite(value) for value in values):
+            raise RuntimeError(f'Exterior polygon point {index} is invalid')
+        polygon_points.append(values)
+    if polygon_points[0] == polygon_points[-1]:
+        polygon_points.pop()
+    if len(polygon_points) < 4 or len({tuple(point) for point in polygon_points}) != len(polygon_points):
+        raise RuntimeError('Exterior topology is not a single closed candidate')
+    for index, (start, end) in enumerate(zip(polygon_points, polygon_points[1:] + polygon_points[:1])):
+        _axis_segment({'start_px': start, 'end_px': end}, f'polygon edge {index}')
+    signed_area = 0.5 * sum(
+        start[0] * end[1] - end[0] * start[1]
+        for start, end in zip(polygon_points, polygon_points[1:] + polygon_points[:1])
+    )
+    if not math.isfinite(signed_area) or signed_area == 0:
+        raise RuntimeError('Exterior topology is not a single closed candidate')
+    _positive_finite_number(topology.get('area_px2'), 'topology area_px2')
+    _positive_finite_number(topology.get('perimeter_px'), 'topology perimeter_px')
+    if topology.get('unresolved_gaps') or topology.get('unresolved'):
+        raise RuntimeError('Exterior topology still has unresolved gaps')
+    if not isinstance(topology.get('source_wall_ids'), list) or not topology['source_wall_ids']:
+        raise RuntimeError('Exterior topology has no real exterior wall evidence')
+    if opening_artifact.get('format') != 'pdf-opening-candidates/1':
+        raise RuntimeError('Opening artifact format is invalid')
+    if (
+        opening_artifact.get('confirmed') is not False
+        or opening_artifact.get('load_geometry_ready') is not False
+        or opening_artifact.get('ambiguous_openings')
+    ):
+        raise RuntimeError('Opening artifact is not confirmable')
+
+    bridges = topology.get('bridges')
+    if not isinstance(bridges, list):
+        raise RuntimeError('Exterior topology bridges are invalid')
+    for index, bridge in enumerate(bridges):
+        if not isinstance(bridge, dict):
+            raise RuntimeError(f'bridge {index} is invalid')
+        if bridge.get('bridge_type') == 'small_gap_repair':
+            _, _, interval, _, _ = _axis_segment(bridge, f'small gap repair {index}')
+            length_m = (interval[1] - interval[0]) * scale
+            if not math.isfinite(length_m) or length_m > math.nextafter(0.6, math.inf):
+                raise RuntimeError('Small gap repair exceeds 0.6 m')
+    return polygon_points
+
+
+def _real_exterior_wall_geometry(polygon_points, topology):
+    selected_bridge_ids = {str(value) for value in topology.get('bridge_ids', [])}
+    bridges = []
+    for index, bridge in enumerate(topology.get('bridges', [])):
+        if str(bridge.get('bridge_id')) not in selected_bridge_ids:
+            continue
+        orientation, fixed, interval, _, _ = _axis_segment(bridge, f'bridge {index}')
+        bridges.append((orientation, fixed, interval))
+
+    walls = []
+    for edge_index, (start, end) in enumerate(
+        zip(polygon_points, polygon_points[1:] + polygon_points[:1]), 1,
+    ):
+        orientation, fixed, edge_interval, _, _ = _axis_segment(
+            {'start_px': start, 'end_px': end}, f'polygon edge {edge_index}',
+        )
+        intervals = [edge_interval]
+        for bridge_orientation, bridge_fixed, bridge_interval in bridges:
+            if bridge_orientation != orientation or bridge_fixed != fixed:
+                continue
+            cut_start = max(edge_interval[0], bridge_interval[0])
+            cut_end = min(edge_interval[1], bridge_interval[1])
+            if cut_start >= cut_end:
+                continue
+            remaining = []
+            for interval_start, interval_end in intervals:
+                if cut_end <= interval_start or cut_start >= interval_end:
+                    remaining.append([interval_start, interval_end])
+                    continue
+                if interval_start < cut_start:
+                    remaining.append([interval_start, cut_start])
+                if cut_end < interval_end:
+                    remaining.append([cut_end, interval_end])
+            intervals = remaining
+        for interval_start, interval_end in intervals:
+            if orientation == 'horizontal':
+                points = [[interval_start, fixed], [interval_end, fixed]]
+            else:
+                points = [[fixed, interval_start], [fixed, interval_end]]
+            walls.append({
+                'id': f'exterior-wall-{len(walls) + 1:04d}',
+                'pts': points,
+                'length_px': interval_end - interval_start,
+                'exterior': True,
+                'real_wall': True,
+            })
+    if not walls:
+        raise RuntimeError('Exterior topology has no real wall segments')
+    return walls
+
+
+def _atomic_write_json(path, payload):
+    path = Path(path)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode='w', encoding='utf-8', dir=path.parent,
+            prefix=f'.{path.name}.', suffix='.tmp', delete=False,
+        ) as handle:
+            temporary = Path(handle.name)
+            json.dump(payload, handle, ensure_ascii=False, indent=2, sort_keys=True, allow_nan=False)
+            handle.write('\n')
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    except BaseException:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+        raise
+
+
 @app.route('/energy/pdf_prepare', methods=['POST'])
 @login_required
 def prepare_energy_pdf():
@@ -1715,6 +1967,7 @@ def vector_pdf_fusion():
         )
         original = cv2.imread(str(target_dir / 'pdf_vector_model_input.png'), cv2.IMREAD_COLOR)
         overlay = cv2.imread(str(target_dir / 'pdf_vector_fusion_overlay.png'), cv2.IMREAD_COLOR)
+        exterior_overlay = cv2.imread(str(target_dir / 'pdf_exterior_overlay.png'), cv2.IMREAD_COLOR)
         images = {}
         if original is not None:
             encoded, buffer = cv2.imencode('.png', original)
@@ -1724,6 +1977,11 @@ def vector_pdf_fusion():
             encoded, buffer = cv2.imencode('.png', overlay)
             if encoded:
                 images['overlay'] = base64.b64encode(buffer).decode('utf-8')
+        if exterior_overlay is not None:
+            encoded, buffer = cv2.imencode('.png', exterior_overlay)
+            if encoded:
+                images['exterior_overlay'] = base64.b64encode(buffer).decode('utf-8')
+        topology_sha256 = _sha256_file(target_dir / 'pdf_exterior_topology.json')
     except ValueError as exc:
         return jsonify({'error': str(exc)}), 400
     except Exception as exc:
@@ -1739,13 +1997,183 @@ def vector_pdf_fusion():
         'recognition_mode': region_request['mode'],
         'crop_bbox_page_px': crop_bbox_page_px,
         'summary': result.get('summary') or {},
+        'exterior_summary': result.get('exterior_summary') or {},
+        'topology_sha256': topology_sha256,
         'reason_codes': result.get('reason_codes') or [],
         'artifacts': {
             'native_candidates': 'vector_pdf_fusion/pdf_native_candidates.json',
             'fusion': 'vector_pdf_fusion/pdf_vector_fusion.json',
             'overlay': 'vector_pdf_fusion/pdf_vector_fusion_overlay.png',
+            'opening_candidates': 'vector_pdf_fusion/pdf_opening_candidates.json',
+            'exterior_topology': 'vector_pdf_fusion/pdf_exterior_topology.json',
+            'exterior_overlay': 'vector_pdf_fusion/pdf_exterior_overlay.png',
         },
         'images': images,
+    })
+
+
+@app.route('/energy/vector_pdf_exterior_confirm', methods=['POST'])
+@login_required
+def vector_pdf_exterior_confirm():
+    """Confirm only the current, hashed server-side exterior artifacts."""
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return jsonify({'error': 'JSON request body is required'}), 400
+    if payload.get('confirmed') is not True:
+        return jsonify({'error': 'confirmed must be boolean true'}), 400
+    try:
+        scale = _positive_finite_number(payload.get('scale_m_per_px'), 'scale_m_per_px')
+        request_page = payload.get('page_number')
+        if isinstance(request_page, bool) or not isinstance(request_page, int) or request_page < 1:
+            raise ValueError('page_number must be a positive integer')
+        if 'crop_bbox_page_px' not in payload:
+            raise ValueError('crop_bbox_page_px is required (null for a full page)')
+        request_crop = _normalized_crop_bbox(
+            payload.get('crop_bbox_page_px'), 'crop_bbox_page_px',
+        )
+        supplied_hash = payload.get('topology_sha256')
+        if not isinstance(supplied_hash, str) or len(supplied_hash) != 64:
+            raise ValueError('topology_sha256 must be a SHA-256 hex digest')
+        try:
+            int(supplied_hash, 16)
+        except ValueError:
+            raise ValueError('topology_sha256 must be a SHA-256 hex digest') from None
+        report_dir, artifact_dir = _require_exterior_report_dir(payload.get('report_number'))
+        topology_raw, topology = _read_exterior_artifact(
+            artifact_dir, 'pdf_exterior_topology.json',
+        )
+        _, opening_artifact = _read_exterior_artifact(
+            artifact_dir, 'pdf_opening_candidates.json',
+        )
+    except FileNotFoundError as exc:
+        return jsonify({'error': str(exc)}), 404
+    except ValueError as exc:
+        return jsonify({'error': str(exc)}), 400
+
+    current_hash = hashlib.sha256(topology_raw).hexdigest()
+    if not hmac.compare_digest(current_hash, supplied_hash.lower()):
+        return jsonify({'error': 'Exterior topology has changed; review it again'}), 409
+
+    try:
+        provenance, artifact_page, artifact_crop, image_size = _artifact_provenance(
+            topology, opening_artifact,
+        )
+        if request_page != artifact_page or request_crop != artifact_crop:
+            raise RuntimeError('Confirmed page or crop does not match current artifacts')
+        polygon_points = _validate_confirmable_topology(topology, opening_artifact, scale)
+        accepted_openings = opening_artifact.get('accepted_openings')
+        if not isinstance(accepted_openings, list):
+            raise RuntimeError('Accepted openings are invalid')
+        selected_opening_ids = {str(value) for value in topology.get('opening_ids', [])}
+        openings = [
+            opening for opening in accepted_openings
+            if isinstance(opening, dict)
+            and str(opening.get('opening_id')) in selected_opening_ids
+        ]
+        if {str(opening.get('opening_id')) for opening in openings} != selected_opening_ids:
+            raise RuntimeError('Exterior topology opening references are invalid')
+
+        from vector_pdf_energy_geometry import apply_scale_to_exterior
+        scaled_topology, scaled_openings = apply_scale_to_exterior(topology, openings, scale)
+        scaled_topology['confirmed'] = True
+        scaled_topology['load_geometry_ready'] = True
+        scaled_topology['status'] = 'confirmed'
+
+        walls = _real_exterior_wall_geometry(polygon_points, topology)
+        doors = []
+        windows = []
+        for opening in scaled_openings:
+            _, _, _, start, end = _axis_segment(opening, 'opening')
+            geometry_opening = copy.deepcopy(opening)
+            geometry_opening.update({
+                'id': str(opening['opening_id']),
+                'pts': [start, end],
+                'length_px': float(opening['width_px']),
+            })
+            if opening.get('kind') == 'door':
+                doors.append(geometry_opening)
+            elif opening.get('kind') == 'window':
+                windows.append(geometry_opening)
+            else:
+                raise RuntimeError('Opening kind must be door or window')
+        door_width = math.fsum(float(opening['width_m']) for opening in doors)
+        window_width = math.fsum(float(opening['width_m']) for opening in windows)
+        if not math.isfinite(door_width) or not math.isfinite(window_width):
+            raise RuntimeError('Opening width totals must be finite')
+        geometry = {'walls': walls, 'windows': windows, 'doors': doors}
+        recognition = {
+            'schema_version': RECOGNITION_SCHEMA_VERSION,
+            'created_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+            'model': {
+                'backend': VECTOR_PYTORCH_BACKEND,
+                'name': 'vector_pdf_fusion',
+                'version': current_hash,
+            },
+            'preprocessing': {'requested': 'vector_pdf_fusion', 'use_preprocessing': False},
+            'source_image': {'path': 'vector_pdf_fusion/pdf_vector_model_input.png'},
+            'source_page': copy.deepcopy(provenance),
+            'image_size': image_size,
+            'stats': {},
+            'geometry_summary': _geometry_summary(geometry),
+            'geometry': geometry,
+            'contours': copy.deepcopy(geometry),
+            'room_topology': {
+                'status': 'exterior_only',
+                'room_count': 0,
+                'closure_applied': False,
+                'rooms': [],
+                'total_area_px2': 0.0,
+                'total_area_m2': None,
+                'scale_m_per_px': None,
+                'load_geometry_ready': False,
+            },
+            'exterior_topology': scaled_topology,
+            'openings': scaled_openings,
+            'opening_widths': {
+                'door_total_width_m': door_width,
+                'window_total_width_m': window_width,
+            },
+            'scale_calibration': {
+                'status': 'confirmed',
+                'method': 'manual_exterior_confirmation',
+                'scale_m_per_px': scale,
+                'confidence': 1.0,
+                'evidence': [{'topology_sha256': current_hash}],
+            },
+            'pdf_page_number': artifact_page,
+            'pdf_page_count': None,
+            'recognition_mode': 'crop_region' if artifact_crop is not None else 'full_page',
+            'crop_bbox_page_px': artifact_crop,
+            'crop_bbox_preview_px': None,
+            'crop_preview_size': None,
+            'pixel_lengths': {
+                'wall_px': _polyline_total_length(walls),
+                'window_px': _polyline_total_length(windows),
+            },
+            'artifacts': {
+                'original': 'vector_pdf_fusion/pdf_vector_model_input.png',
+                'overlay': 'vector_pdf_fusion/pdf_exterior_overlay.png',
+                'exterior_topology': 'vector_pdf_fusion/pdf_exterior_topology.json',
+                'opening_candidates': 'vector_pdf_fusion/pdf_opening_candidates.json',
+                'topology_sha256': current_hash,
+            },
+        }
+        _atomic_write_json(report_dir / 'recognition.json', recognition)
+    except (RuntimeError, ValueError) as exc:
+        return jsonify({'error': str(exc)}), 409
+    except Exception as exc:
+        return jsonify({'error': f'Cannot persist exterior recognition: {exc}'}), 500
+
+    return jsonify({
+        'success': True,
+        'status': 'confirmed',
+        'load_geometry_ready': True,
+        'topology_sha256': current_hash,
+        'exterior_topology': scaled_topology,
+        'openings': scaled_openings,
+        'opening_widths': recognition['opening_widths'],
+        'geometry_summary': recognition['geometry_summary'],
+        'recognition': {'schema_version': RECOGNITION_SCHEMA_VERSION, 'path': 'recognition.json'},
     })
 
 

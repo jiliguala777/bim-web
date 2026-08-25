@@ -87,6 +87,25 @@ class ExteriorEnergyGeometryTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     apply_scale_to_exterior(footprint(area=100, perimeter=40), [], scale)
 
+    def test_rejects_overflowed_metric_square_and_multiplication(self):
+        from vector_pdf_energy_geometry import apply_scale_to_exterior
+
+        with self.assertRaisesRegex(ValueError, "finite"):
+            apply_scale_to_exterior(footprint(area=1e308, perimeter=1), [], 1e308)
+        with self.assertRaisesRegex(ValueError, "finite"):
+            apply_scale_to_exterior(
+                footprint(area=1, perimeter=1), [opening("door", 1e308)], 2,
+            )
+
+    def test_rejects_overflowed_energy_geometry_derivation(self):
+        from vector_pdf_energy_geometry import build_exterior_energy_geometry
+
+        with self.assertRaisesRegex(ValueError, "finite"):
+            build_exterior_energy_geometry(
+                scaled_footprint(area=1, perimeter=1e308), [],
+                storey_height_m=2, floors=1, door_height_m=2, window_height_m=2,
+            )
+
     def test_rejects_invalid_heights_floors_and_repeat_counts(self):
         from vector_pdf_energy_geometry import build_exterior_energy_geometry
 

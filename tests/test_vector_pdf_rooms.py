@@ -128,6 +128,23 @@ class OrthogonalRoomTests(unittest.TestCase):
             [1200.0, 1200.0],
         )
 
+    def test_duplicate_wall_interval_merges_without_losing_provenance(self):
+        from vector_pdf_rooms import RoomClosureThresholds, find_room_candidates
+
+        lines = accepted_rectangle_lines()
+        lines.append(accepted_line("wall-1-duplicate", (20, 20), (80, 20)))
+        result = find_room_candidates(
+            lines, supported_probabilities(), (100, 100),
+            [0, 0, 100, 100], RoomClosureThresholds(),
+        )
+
+        self.assertEqual(result["summary"]["accepted_room_count"], 1)
+        self.assertEqual(len(result["merged_lines"]), 4)
+        self.assertEqual(
+            set(result["room_candidates"][0]["source_wall_ids"]),
+            {"wall-1", "wall-1-duplicate", "wall-2", "wall-3", "wall-4"},
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

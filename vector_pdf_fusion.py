@@ -108,18 +108,20 @@ def build_line_candidates(
     return candidates
 
 
-def _line_mask(
-    image_size: tuple[int, int],
+def _local_line_mask(
+    window_shape: tuple[int, int],
     start: list[int],
     end: list[int],
     thickness: int,
+    origin: tuple[int, int],
 ) -> np.ndarray:
-    width, height = image_size
+    height, width = window_shape
+    origin_x, origin_y = origin
     mask = np.zeros((height, width), dtype=np.uint8)
     cv2.line(
         mask,
-        (int(start[0]), int(start[1])),
-        (int(end[0]), int(end[1])),
+        (int(start[0]) - origin_x, int(start[1]) - origin_y),
+        (int(end[0]) - origin_x, int(end[1]) - origin_y),
         255,
         thickness=max(1, int(thickness)),
         lineType=cv2.LINE_8,
@@ -154,9 +156,11 @@ def fuse_line_candidates(
     results = []
     for original in candidates:
         item = copy.deepcopy(original)
+        if item["decision"] == "rejected_nonstructural":
+            results.append(item)
+            continue
         start = item["start_px"]
         end = item["end_px"]
-        center = _line_mask((width, height), start, end, radius * 2 + 1)
         offset = radius * 2 + 1
         if item["orientation"] == "horizontal":
             first_start, first_end = [start[0], start[1] - offset], [end[0], end[1] - offset]
@@ -164,17 +168,29 @@ def fuse_line_candidates(
         else:
             first_start, first_end = [start[0] - offset, start[1]], [end[0] - offset, end[1]]
             second_start, second_end = [start[0] + offset, start[1]], [end[0] + offset, end[1]]
-        first_side = _line_mask((width, height), first_start, first_end, radius + 1)
-        second_side = _line_mask((width, height), second_start, second_end, radius + 1)
+        sample_points = (
+            start, end, first_start, first_end, second_start, second_end,
+        )
+        padding = radius * 2 + 3
+        left = max(0, min(point[0] for point in sample_points) - padding)
+        top = max(0, min(point[1] for point in sample_points) - padding)
+        right = min(width, max(point[0] for point in sample_points) + padding + 1)
+        bottom = min(height, max(point[1] for point in sample_points) + padding + 1)
+        window_shape = (max(0, bottom - top), max(0, right - left))
+        origin = (left, top)
+        center = _local_line_mask(window_shape, start, end, radius * 2 + 1, origin)
+        first_side = _local_line_mask(window_shape, first_start, first_end, radius + 1, origin)
+        second_side = _local_line_mask(window_shape, second_start, second_end, radius + 1, origin)
+        local_values = values[:, top:bottom, left:right]
 
-        wall_mean, wall_p90, _ = _sample(values[4], center)
-        footprint_mean, _, _ = _sample(values[0], center | first_side | second_side)
-        room_first, _, _ = _sample(values[2], first_side)
-        room_second, _, _ = _sample(values[2], second_side)
-        _, _, door_max = _sample(values[5], center)
-        _, _, window_max = _sample(values[6], center)
-        _, _, door_endpoint_max = _sample(values[8], center)
-        _, _, window_endpoint_max = _sample(values[9], center)
+        wall_mean, wall_p90, _ = _sample(local_values[4], center)
+        footprint_mean, _, _ = _sample(local_values[0], center | first_side | second_side)
+        room_first, _, _ = _sample(local_values[2], first_side)
+        room_second, _, _ = _sample(local_values[2], second_side)
+        _, _, door_max = _sample(local_values[5], center)
+        _, _, window_max = _sample(local_values[6], center)
+        _, _, door_endpoint_max = _sample(local_values[8], center)
+        _, _, window_endpoint_max = _sample(local_values[9], center)
         model_evidence = {
             "sample_radius_px": radius,
             "wall_mean": wall_mean,
@@ -188,10 +204,6 @@ def fuse_line_candidates(
         }
         item["model_evidence"] = model_evidence
 
-        hard_rejected = item["decision"] == "rejected_nonstructural"
-        if hard_rejected:
-            results.append(item)
-            continue
         native = item["native_evidence"]
         roi_ratio = native.get("roi_inside_ratio")
         roi_supported = roi_ratio is not None and roi_ratio >= thresholds.roi_inside_ratio_min

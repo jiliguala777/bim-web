@@ -55,9 +55,10 @@ def _merge_collinear(lines: list[dict]) -> list[dict]:
     merged = []
     for (orientation, fixed), records in sorted(groups.items()):
         if orientation == "horizontal":
-            intervals = sorted((item["start"][0], item["end"][0], item) for item in records)
+            intervals = [(item["start"][0], item["end"][0], item) for item in records]
         else:
-            intervals = sorted((item["start"][1], item["end"][1], item) for item in records)
+            intervals = [(item["start"][1], item["end"][1], item) for item in records]
+        intervals.sort(key=lambda interval: (interval[0], interval[1]))
         first_start, first_end, first = intervals[0]
         current_start, current_end = first_start, first_end
         current_ids = set(first["source_wall_ids"])

@@ -1,4 +1,5 @@
 import unittest
+import time
 
 import numpy as np
 
@@ -160,6 +161,46 @@ class ModelEvidenceFusionTests(unittest.TestCase):
 
         self.assertEqual(result[0]["decision"], "rejected_nonstructural")
         self.assertIn("dimension_overlap", result[0]["reason_codes"])
+
+    def test_many_short_lines_do_not_allocate_full_page_masks_per_candidate(self):
+        from vector_pdf_fusion import FusionThresholds, fuse_line_candidates
+
+        width, height = 1600, 1200
+        probabilities = np.broadcast_to(
+            np.zeros((10, 1, 1), dtype=np.float32),
+            (10, height, width),
+        )
+        candidates = []
+        for index in range(500):
+            x = 20 + (index % 50) * 30
+            y = 20 + (index // 50) * 30
+            candidates.append({
+                "candidate_id": f"line-{index:05d}",
+                "source_native_id": f"native-{index:05d}",
+                "orientation": "horizontal",
+                "start_px": [x, y],
+                "end_px": [x + 20, y],
+                "native_evidence": {
+                    "native_structural": True,
+                    "roi_inside_ratio": 1.0,
+                },
+                "model_evidence": None,
+                "decision": "uncertain",
+                "reason_codes": ["model_evidence_pending"],
+            })
+
+        started = time.perf_counter()
+        result = fuse_line_candidates(
+            candidates,
+            probabilities,
+            (width, height),
+            [0, 0, width, height],
+            FusionThresholds(),
+        )
+        elapsed = time.perf_counter() - started
+
+        self.assertEqual(len(result), 500)
+        self.assertLess(elapsed, 1.5, f"500 short-line samples took {elapsed:.3f}s")
 
 
 if __name__ == "__main__":

@@ -352,9 +352,7 @@ def _gap_within_repair_limit(
     if scale_m_per_px is None:
         return width_px <= repair_limit_px
     width_m = width_px * float(scale_m_per_px)
-    return width_m < 0.6 or math.isclose(
-        width_m, 0.6, rel_tol=1e-12, abs_tol=1e-12,
-    )
+    return width_m <= math.nextafter(0.6, math.inf)
 
 
 def _strict_axis_segment(item: dict) -> dict:
@@ -805,20 +803,20 @@ def build_exterior_topology(
         face for face in roi_faces
         if _face_footprint_mean(face, values[0]) >= ExteriorThresholds().footprint_inside_mean_min
     ]
+    structurally_ambiguous = (
+        len({face["component_id"] for face in roi_faces}) > 1
+        or _has_nested_faces(roi_faces)
+    )
     used_bridge_ids = {
         bridge_id for face in faces for bridge_id in face["bridge_ids"]
     }
     bridges, unresolved_gaps = _discard_unused_small_gap_repairs(
         bridges, unresolved_gaps, gaps, used_bridge_ids,
     )
+    if structurally_ambiguous:
+        return _empty_exterior_topology("ambiguous_exterior", unresolved_gaps, bridges)
     if not faces:
         return _empty_exterior_topology("exterior_not_closed", unresolved_gaps, bridges)
-
-    if (
-        len({face["component_id"] for face in faces}) > 1
-        or _has_nested_faces(roi_faces)
-    ):
-        return _empty_exterior_topology("ambiguous_exterior", unresolved_gaps, bridges)
 
     faces.sort(key=lambda face: (-face["area"], face["polygon"]))
     largest = faces[0]

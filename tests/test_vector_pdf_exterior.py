@@ -322,6 +322,24 @@ class ExteriorTopologyTests(unittest.TestCase):
             ["gap_exceeds_repair_limit"],
         )
 
+    def test_unknown_gap_rejects_value_inside_old_isclose_window(self):
+        from vector_pdf_exterior import build_exterior_topology
+
+        polygon = [(20, 20), (80, 20), (80, 80), (20, 80)]
+        gap_end = 46.000000000005
+        topology = build_exterior_topology(
+            rectangle_with_bottom_gap(door_gap=(40, gap_end)),
+            [topology_gap(40, 80, gap_end, 80)], [],
+            supported_footprint(polygon), (100, 100), [0, 0, 100, 100],
+            scale_m_per_px=0.1,
+        )
+
+        self.assertEqual(topology["bridges"], [])
+        self.assertEqual(
+            topology["unresolved_gaps"][0]["reason_codes"],
+            ["gap_exceeds_repair_limit"],
+        )
+
     def test_unknown_gap_repairs_at_unscaled_pixel_boundary_only(self):
         from vector_pdf_exterior import build_exterior_topology
 
@@ -414,6 +432,21 @@ class ExteriorTopologyTests(unittest.TestCase):
         self.assertEqual(topology["status"], "ambiguous_exterior")
         self.assertEqual(topology["polygon_px"], [])
         self.assertEqual(topology["area_px2"], 0.0)
+
+    def test_unsupported_small_disconnected_building_is_still_ambiguous(self):
+        from vector_pdf_exterior import build_exterior_topology
+
+        large = [(10, 10), (70, 10), (70, 70), (10, 70)]
+        small = [(75, 75), (95, 75), (95, 95), (75, 95)]
+        topology = build_exterior_topology(
+            walls_from_polygon(large, "large") + walls_from_polygon(small, "small"),
+            [], [], supported_footprint(large),
+            (100, 100), [0, 0, 100, 100],
+        )
+
+        self.assertEqual(topology["status"], "ambiguous_exterior")
+        self.assertEqual(topology["polygon_px"], [])
+        self.assertEqual(topology["source_wall_ids"], [])
 
     def test_outer_ring_with_unsupported_courtyard_is_ambiguous(self):
         from vector_pdf_exterior import build_exterior_topology

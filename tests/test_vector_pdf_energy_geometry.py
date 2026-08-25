@@ -97,6 +97,21 @@ class ExteriorEnergyGeometryTests(unittest.TestCase):
                 footprint(area=1, perimeter=1), [opening("door", 1e308)], 2,
             )
 
+    def test_rejects_integer_that_overflows_float_normalization(self):
+        from vector_pdf_energy_geometry import (
+            apply_scale_to_exterior,
+            build_exterior_energy_geometry,
+        )
+
+        with self.assertRaisesRegex(ValueError, "finite positive"):
+            apply_scale_to_exterior(footprint(area=10**400, perimeter=1), [], 1)
+        with self.assertRaisesRegex(ValueError, "finite positive"):
+            build_exterior_energy_geometry(
+                scaled_footprint(area=1, perimeter=1), [],
+                storey_height_m=10**400, floors=1,
+                door_height_m=2, window_height_m=2,
+            )
+
     def test_rejects_overflowed_energy_geometry_derivation(self):
         from vector_pdf_energy_geometry import build_exterior_energy_geometry
 

@@ -10,7 +10,10 @@ from numbers import Real
 def _require_positive_number(value, name: str) -> float:
     if isinstance(value, bool) or not isinstance(value, Real):
         raise ValueError(f"{name} must be a finite positive number")
-    number = float(value)
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError(f"{name} must be a finite positive number") from None
     if not math.isfinite(number) or number <= 0:
         raise ValueError(f"{name} must be a finite positive number")
     return number

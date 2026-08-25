@@ -5,8 +5,9 @@ import re
 import io
 import json
 import os
+import subprocess
 import tempfile
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import nullcontext, redirect_stderr, redirect_stdout
 from unittest.mock import MagicMock, patch
 
 import cv2
@@ -209,6 +210,82 @@ class EnergyTemplateTests(unittest.TestCase):
         self.assertIn("function hasCurrentConfirmedGeometry()", html)
         self.assertIn("exterior_topology?.confirmed === true", html)
         self.assertIn("room_topology?.load_geometry_ready === true", html)
+
+    def test_report_identity_change_invalidates_executable_client_state(self):
+        node_script = r'''
+const fs = require('fs');
+const vm = require('vm');
+const html = fs.readFileSync('templates/energy.html', 'utf8');
+const inlineScript = [...html.matchAll(/<script(?:[^>]*)>([\s\S]*?)<\/script>/g)]
+  .map(match => match[1]).find(Boolean);
+const elements = new Proxy({}, {
+  get(target, key) {
+    if (!target[key]) {
+      target[key] = {
+        value: '', checked: true, disabled: false, innerText: '',
+        style: {}, classList: { add() {}, remove() {}, toggle() {} },
+        addEventListener() {}, setAttribute() {}, removeAttribute() {},
+        querySelectorAll() { return []; }
+      };
+    }
+    return target[key];
+  }
+});
+elements['current-report-number'].value = '  REPORT-A  ';
+elements['pdf-page-select'].value = '1';
+let fetchCalls = 0;
+const context = {
+  EnergyPdfRecognitionState: require('./static/energy/pdf_recognition_state.js'),
+  document: {
+    addEventListener() {}, getElementById(id) { return elements[id]; },
+    querySelectorAll() { return []; }
+  },
+  window: { addEventListener() {}, scrollTo() {} },
+  console, AbortController, FormData, alert() {},
+  fetch: async () => {
+    fetchCalls += 1;
+    throw new Error('stale state attempted a request');
+  },
+  Chart: function Chart() {}
+};
+vm.createContext(context);
+vm.runInContext(inlineScript, context);
+vm.runInContext(`
+  preparedPdf = { uploadToken: 'token-a' };
+  pdfUploadSessionId = 1;
+  const start = pdfRecognitionRequests.begin(
+    currentPdfRecognitionSelection(), { abort() {} }
+  );
+  if (!pdfRecognitionRequests.accept(start.request, currentPdfRecognitionSelection())) {
+    throw new Error('REPORT-A recognition was not accepted');
+  }
+  acceptedRecognitionReportNumber = 'REPORT-A';
+  aiResultData = {
+    report_number: 'REPORT-A',
+    exterior_topology: { confirmed: true, load_geometry_ready: true }
+  };
+  if (!hasCurrentConfirmedGeometry()) throw new Error('REPORT-A was not ready');
+  document.getElementById('current-report-number').value = 'REPORT-B';
+  handleReportNumberInputChange();
+  if (hasCurrentConfirmedGeometry()) throw new Error('stale REPORT-A stayed ready');
+  if (aiResultData !== null || pendingExteriorFusion !== null) {
+    throw new Error('report change did not clear derived state');
+  }
+  if (pdfRecognitionRequests.hasAccepted(currentPdfRecognitionSelection())) {
+    throw new Error('REPORT-A fingerprint was accepted for REPORT-B');
+  }
+  calculateEnergy();
+`, context);
+if (fetchCalls !== 0) throw new Error('stale REPORT-A was sent as REPORT-B');
+'''
+        completed = subprocess.run(
+            ["node", "-e", node_script],
+            cwd=Path.cwd(),
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
 
     def test_pdf_region_recognition_ui_loads_preview_and_manages_crop_state(self):
         html = Path("templates/energy.html").read_text(encoding="utf-8")
@@ -1938,6 +2015,19 @@ class EnergyRouteClientTests(unittest.TestCase):
         with (
             patch.object(self.server, "HAS_FLOORPLAN_AI", True),
             patch.object(self.server, "HAS_ENERGY_CALC", True),
+            patch.object(
+                self.server, "_exterior_report_lock",
+                return_value=nullcontext(), create=True,
+            ),
+            patch.object(
+                self.server, "_require_current_exterior_generation",
+                return_value={
+                    "generation": "test-generation",
+                    "status": "ready",
+                    "topology_sha256": "a" * 64,
+                },
+                create=True,
+            ),
             patch.object(self.server, "_load_recognition_payload", return_value=recognition),
             patch.object(self.server.energy_calc, "calculate_energy", return_value=result) as calculate,
             patch.object(self.server, "get_db_connection", return_value=connection),
@@ -1973,6 +2063,106 @@ class EnergyRouteClientTests(unittest.TestCase):
                 {"opening_id": "window-1", "kind": "window", "width_m": 8.0},
             ],
         }
+
+    def post_persisted_exterior_energy(self, recognition, marker):
+        result = {
+            "success": True,
+            "summary": {"total_energy_kwh": 0, "eui": 0, "rating": "A", "rating_label": "test"},
+        }
+        temporary = tempfile.TemporaryDirectory()
+        upload_root = Path(temporary.name)
+        report_dir = upload_root / "energy" / "EXT-ENERGY"
+        report_dir.mkdir(parents=True)
+        (report_dir / "recognition.json").write_text(
+            json.dumps(recognition), encoding="utf-8",
+        )
+        if marker is not None:
+            (report_dir / "exterior_generation.json").write_text(
+                json.dumps(marker), encoding="utf-8",
+            )
+        connection = MagicMock()
+        connection.execute.return_value.fetchone.return_value = None
+        previous_upload = self.server.app.config["UPLOAD_FOLDER"]
+        self.server.app.config["UPLOAD_FOLDER"] = str(upload_root)
+        try:
+            with (
+                patch.object(self.server, "HAS_FLOORPLAN_AI", True),
+                patch.object(self.server, "HAS_ENERGY_CALC", True),
+                patch.object(self.server, "HAS_DESIGN_LOAD_CALC", False),
+                patch.object(self.server.energy_calc, "calculate_energy", return_value=result) as calculate,
+                patch.object(self.server, "get_db_connection", return_value=connection),
+            ):
+                response = self.client.post(
+                    "/energy/ai_simulate",
+                    json={"report_number": "EXT-ENERGY", "height": 3.0, "floors": 2},
+                )
+        finally:
+            self.server.app.config["UPLOAD_FOLDER"] = previous_upload
+            temporary.cleanup()
+        return response, calculate
+
+    @staticmethod
+    def bind_exterior_generation(recognition, *, generation="generation-a", topology_sha256="a" * 64):
+        recognition = json.loads(json.dumps(recognition))
+        recognition["schema_version"] = 1
+        recognition["report_number"] = "EXT-ENERGY"
+        recognition["exterior_generation"] = {
+            "generation": generation,
+            "topology_sha256": topology_sha256,
+        }
+        return recognition
+
+    @staticmethod
+    def exterior_marker(*, status="ready", generation="generation-a", topology_sha256="a" * 64):
+        return {
+            "format": "pdf-exterior-generation/1",
+            "report_number": "EXT-ENERGY",
+            "generation": generation,
+            "status": status,
+            "topology_sha256": topology_sha256 if status == "ready" else None,
+        }
+
+    def test_energy_route_rejects_confirmed_exterior_when_generation_is_not_current(self):
+        recognition = self.bind_exterior_generation(self.exterior_recognition())
+        cases = (
+            ("missing marker", None),
+            ("running generation", self.exterior_marker(status="running", generation="generation-b")),
+            ("failed generation", self.exterior_marker(status="failed", generation="generation-b")),
+            ("generation mismatch", self.exterior_marker(generation="generation-b")),
+            ("hash mismatch", self.exterior_marker(topology_sha256="b" * 64)),
+        )
+        for label, marker in cases:
+            with self.subTest(label=label):
+                response, calculate = self.post_persisted_exterior_energy(recognition, marker)
+                self.assertEqual(response.status_code, 409, response.get_json())
+                self.assertIn("generation", response.get_json()["error"].lower())
+                calculate.assert_not_called()
+
+    def test_stale_exterior_uses_existing_ready_room_fallback(self):
+        room_topology = {
+            "status": "closed",
+            "room_count": 1,
+            "rooms": [{"id": "room-1", "area_px2": 400.0}],
+            "total_area_px2": 400.0,
+            "scale_m_per_px": 0.5,
+            "load_geometry_ready": True,
+        }
+        recognition = self.bind_exterior_generation(
+            self.exterior_recognition(room_topology=room_topology),
+        )
+        recognition["scale_calibration"] = {
+            "status": "confirmed",
+            "method": "legacy-room-test",
+            "scale_m_per_px": 0.5,
+        }
+        response, calculate = self.post_persisted_exterior_energy(
+            recognition,
+            self.exterior_marker(status="failed", generation="generation-b"),
+        )
+
+        self.assertEqual(response.status_code, 200, response.get_json())
+        self.assertEqual(response.get_json()["floor_area_source"], "room_polygons")
+        self.assertEqual(calculate.call_args.args[0]["geometry"]["floor_area_m2"], 100.0)
 
     def test_energy_route_uses_confirmed_exterior_and_separate_opening_heights(self):
         response, calculate = self.post_exterior_energy(

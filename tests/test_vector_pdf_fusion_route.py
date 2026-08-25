@@ -119,6 +119,7 @@ class VectorPdfFusionRouteTests(unittest.TestCase):
 
             self.assertEqual(response.status_code, 200, response.get_json())
             payload = response.get_json()
+            self.assertEqual(payload["report_number"], "FUSION-1")
             self.assertTrue(payload["fusion_debug"])
             self.assertFalse(payload["load_geometry_ready"])
             self.assertEqual(payload["summary"]["accepted_wall_count"], 4)
@@ -136,8 +137,115 @@ class VectorPdfFusionRouteTests(unittest.TestCase):
                 "vector_pdf_fusion/pdf_exterior_topology.json",
             )
             self.assertFalse((report_dir / "recognition.json").exists())
+            marker = json.loads(
+                (report_dir / "exterior_generation.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(marker["report_number"], "FUSION-1")
+            self.assertEqual(marker["status"], "ready")
+            self.assertEqual(marker["topology_sha256"], payload["topology_sha256"])
+            self.assertNotIn("generation", payload)
             analyze.assert_called_once()
             segmenter.predict.assert_not_called()
+
+    def test_failed_new_fusion_generation_invalidates_old_confirmed_exterior(self):
+        with tempfile.TemporaryDirectory() as directory:
+            upload_root = Path(directory)
+            report_dir = upload_root / "energy" / "FUSION-RACE"
+            report_dir.mkdir(parents=True)
+            prepared = report_dir / "prepared.pdf"
+            prepared.write_bytes(b"pdf")
+            topology_hash_a = "a" * 64
+            recognition = {
+                "schema_version": 1,
+                "report_number": "FUSION-RACE",
+                "model": {"version": "generation-a"},
+                "preprocessing": {"requested": "vector_pdf_fusion", "use_preprocessing": False},
+                "image_size": [100, 100],
+                "geometry": {"walls": [], "windows": [], "doors": []},
+                "room_topology": {
+                    "status": "exterior_only", "room_count": 0, "rooms": [],
+                    "total_area_px2": 0.0, "load_geometry_ready": False,
+                },
+                "exterior_topology": {
+                    "confirmed": True, "load_geometry_ready": True,
+                    "area_m2": 100.0, "perimeter_m": 40.0,
+                },
+                "openings": [],
+                "exterior_generation": {
+                    "generation": "generation-a",
+                    "topology_sha256": topology_hash_a,
+                },
+            }
+            (report_dir / "recognition.json").write_text(
+                json.dumps(recognition), encoding="utf-8",
+            )
+            marker_path = report_dir / "exterior_generation.json"
+            marker_path.write_text(json.dumps({
+                "format": "pdf-exterior-generation/1",
+                "report_number": "FUSION-RACE",
+                "generation": "generation-a",
+                "status": "ready",
+                "topology_sha256": topology_hash_a,
+            }), encoding="utf-8")
+            token = self.server._make_pdf_upload_token(
+                "FUSION-RACE", "prepared.pdf", 1,
+            )
+
+            def fail_after_running_marker(*args, **kwargs):
+                marker = json.loads(marker_path.read_text("utf-8"))
+                self.assertEqual(marker["status"], "running")
+                self.assertNotEqual(marker["generation"], "generation-a")
+                self.assertIsNone(marker["topology_sha256"])
+                raise RuntimeError("simulated fusion failure")
+
+            previous_upload = self.server.app.config["UPLOAD_FOLDER"]
+            self.server.app.config["UPLOAD_FOLDER"] = str(upload_root)
+            try:
+                with (
+                    mock.patch.object(self.server, "HAS_VECTOR_PDF_FUSION", True),
+                    mock.patch.object(self.server, "_vector_pdf_fusion_config", object()),
+                    mock.patch.object(
+                        self.server, "analyze_vector_pdf_page",
+                        side_effect=fail_after_running_marker,
+                    ),
+                ):
+                    fusion_response = self.client.post(
+                        "/energy/vector_pdf_fusion",
+                        data={
+                            "report_number": "FUSION-RACE",
+                            "pdf_upload_token": token,
+                            "pdf_page_number": "1",
+                            "recognition_mode": "full_page",
+                        },
+                    )
+
+                calculation = {
+                    "success": True,
+                    "summary": {"total_energy_kwh": 0, "eui": 0, "rating": "A", "rating_label": "test"},
+                }
+                with (
+                    mock.patch.object(self.server, "HAS_FLOORPLAN_AI", True),
+                    mock.patch.object(self.server, "HAS_ENERGY_CALC", True),
+                    mock.patch.object(self.server, "HAS_DESIGN_LOAD_CALC", False),
+                    mock.patch.object(
+                        self.server.energy_calc, "calculate_energy",
+                        return_value=calculation,
+                    ) as calculate,
+                ):
+                    energy_response = self.client.post(
+                        "/energy/ai_simulate",
+                        json={"report_number": "FUSION-RACE", "height": 3.0, "floors": 1},
+                    )
+            finally:
+                self.server.app.config["UPLOAD_FOLDER"] = previous_upload
+
+            self.assertEqual(fusion_response.status_code, 500, fusion_response.get_json())
+            failed_marker = json.loads(marker_path.read_text("utf-8"))
+            self.assertEqual(failed_marker["status"], "failed")
+            self.assertNotEqual(failed_marker["generation"], "generation-a")
+            self.assertEqual(energy_response.status_code, 409, energy_response.get_json())
+            self.assertIn("generation", energy_response.get_json()["error"].lower())
+            calculate.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -1688,6 +1688,7 @@
     <script>
         let currentStep = 1;
         let reportNumber = '';
+        let acceptedRecognitionReportNumber = null;
         let aiResultData = null;
         let pendingExteriorFusion = null;
         let preparedPdf = null;
@@ -2474,7 +2475,7 @@
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({
-                        report_number: reportNumber,
+                        report_number: acceptedRecognitionReportNumber,
                         point_a: calibrationPoints[0],
                         point_b: calibrationPoints[1],
                         actual_length: actualLength,
@@ -2585,10 +2586,19 @@
             gotoStep(1);
         }
 
-        function currentPdfRecognitionSelection() {
+        function normalizedReportNumber(value) {
+            return String(value || '').trim();
+        }
+
+        function currentPdfRecognitionSelection(reportNumberOverride = null) {
+            const selectedReportNumber = normalizedReportNumber(
+                reportNumberOverride ?? document.getElementById('current-report-number').value
+            );
             return EnergyPdfRecognitionState.createSelectionFingerprint({
                 uploadSessionId: pdfUploadSessionId,
-                uploadToken: preparedPdf?.uploadToken || null,
+                // The helper owns the fingerprint schema, so bind report identity into
+                // its opaque upload-token slot without changing the actual server token.
+                uploadToken: `${selectedReportNumber}\u0000${preparedPdf?.uploadToken || ''}`,
                 pageNumber: preparedPdf
                     ? document.getElementById('pdf-page-select').value
                     : null,
@@ -2599,8 +2609,16 @@
         }
 
         function hasCurrentAiRecognitionResult() {
+            const currentReportNumber = normalizedReportNumber(
+                document.getElementById('current-report-number').value
+            );
             return Boolean(
                 aiResultData
+                && acceptedRecognitionReportNumber === currentReportNumber
+                && (
+                    aiResultData.report_number == null
+                    || aiResultData.report_number === acceptedRecognitionReportNumber
+                )
                 && pdfRecognitionRequests.hasAccepted(
                     currentPdfRecognitionSelection()
                 )
@@ -2658,6 +2676,7 @@
             aiResultData = derivedState.aiResultData;
             energyResultData = derivedState.energyResultData;
             calibrationPoints = derivedState.calibrationPoints;
+            acceptedRecognitionReportNumber = null;
             pendingExteriorFusion = null;
             clearExteriorReviewState();
         }
@@ -2774,6 +2793,10 @@
         function setupUpload() {
             const uploadWrapper = document.getElementById('uploadWrapper');
             const fileInput = document.getElementById('rasterFileInput');
+
+            document.getElementById('current-report-number').addEventListener(
+                'input', handleReportNumberInputChange
+            );
 
             uploadWrapper.addEventListener('dragover', (e) => {
                 e.preventDefault();
@@ -2930,8 +2953,30 @@
         }
 
         function updateReportNumberFromInput() {
-            const repNumInput = document.getElementById('current-report-number').value.trim();
+            const repNumInput = normalizedReportNumber(
+                document.getElementById('current-report-number').value
+            );
             if (repNumInput) reportNumber = repNumInput;
+        }
+
+        function handleReportNumberInputChange() {
+            const nextReportNumber = normalizedReportNumber(
+                document.getElementById('current-report-number').value
+            );
+            const identityChanged = nextReportNumber !== reportNumber
+                || (
+                    acceptedRecognitionReportNumber !== null
+                    && nextReportNumber !== acceptedRecognitionReportNumber
+                )
+                || (
+                    pendingExteriorFusion?.report_number != null
+                    && nextReportNumber !== pendingExteriorFusion.report_number
+                );
+            reportNumber = nextReportNumber;
+            if (identityChanged) {
+                invalidatePdfRecognitionSelection({ returnToUpload: false });
+            }
+            updateCalculateEnergyAvailability();
         }
 
         function advancePdfPreviewRequest() {
@@ -3309,9 +3354,15 @@
 
         async function confirmPendingExterior() {
             const pending = pendingExteriorFusion;
-            const confirmationSelection = currentPdfRecognitionSelection();
+            const pendingReportNumber = normalizedReportNumber(pending?.report_number);
+            const confirmationSelection = currentPdfRecognitionSelection(pendingReportNumber);
             if (
                 !pending
+                || !pendingReportNumber
+                || pendingReportNumber !== acceptedRecognitionReportNumber
+                || pendingReportNumber !== normalizedReportNumber(
+                    document.getElementById('current-report-number').value
+                )
                 || !pdfRecognitionRequests.hasAccepted(confirmationSelection)
             ) {
                 alert('当前页码或识别区域已变化，请重新识别并复核外轮廓。');
@@ -3329,7 +3380,7 @@
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({
-                        report_number: reportNumber,
+                        report_number: pendingReportNumber,
                         topology_sha256: pending.topology_sha256,
                         scale_m_per_px: scale,
                         confirmed: true,
@@ -3351,6 +3402,8 @@
                 }
                 if (
                     !data.recognition
+                    || data.report_number !== pendingReportNumber
+                    || data.recognition.report_number !== pendingReportNumber
                     || data.recognition.exterior_topology?.confirmed !== true
                     || data.recognition.exterior_topology?.load_geometry_ready !== true
                 ) {
@@ -3358,6 +3411,8 @@
                 }
 
                 aiResultData = data.recognition;
+                acceptedRecognitionReportNumber = data.report_number;
+                reportNumber = data.report_number;
                 pendingExteriorFusion = null;
                 const exterior = aiResultData.exterior_topology;
                 document.getElementById('param-scale').value = scale.toFixed(8);
@@ -3389,6 +3444,14 @@
                 || pdfPrepareAbortController
                 || pdfPreviewAbortController
             ) return false;
+            const requestReportNumber = normalizedReportNumber(
+                document.getElementById('current-report-number').value
+            );
+            if (!requestReportNumber) {
+                alert('请输入报告编号。');
+                return false;
+            }
+            reportNumber = requestReportNumber;
             const fd = new FormData();
             if (file) {
                 fd.append('raster_file', file);
@@ -3426,10 +3489,9 @@
             }
             fd.append('preprocessing', 'auto');
             fd.append('model_backend', document.getElementById('model-backend').value);
-            updateReportNumberFromInput();
-            fd.append('report_number', reportNumber);
+            fd.append('report_number', requestReportNumber);
 
-            const recognitionSelection = currentPdfRecognitionSelection();
+            const recognitionSelection = currentPdfRecognitionSelection(requestReportNumber);
             invalidatePdfRecognitionSelection({ returnToUpload: false });
             const requestController = new AbortController();
             const requestStart = pdfRecognitionRequests.begin(
@@ -3469,12 +3531,16 @@
                 if (!response.ok || data.error) {
                     throw new Error(data.error || response.statusText);
                 }
+                if (vectorPdfFusion && data.report_number !== requestReportNumber) {
+                    throw new Error('服务器返回的报告编号与本次识别不一致');
+                }
                 if (!pdfRecognitionRequests.accept(
                     recognitionRequest,
                     currentSelection
                 )) {
                     return false;
                 }
+                acceptedRecognitionReportNumber = requestReportNumber;
 
                 if (data.fusion_debug) {
                     aiResultData = null;
@@ -3500,6 +3566,7 @@
 
                 pendingExteriorFusion = null;
                 clearExteriorReviewState();
+                if (data.report_number == null) data.report_number = requestReportNumber;
                 aiResultData = data;
                 
                 document.getElementById('imgOriginal').src = 'data:image/jpeg;base64,' + data.images.original;
@@ -3658,9 +3725,11 @@
             }
             showLoader("正在运用度日数负荷模型与机电 COP 耦合求解能耗...");
 
-            const repNumInput = document.getElementById('current-report-number').value.trim();
-            if (repNumInput) {
-                reportNumber = repNumInput;
+            const calculationReportNumber = acceptedRecognitionReportNumber;
+            if (!calculationReportNumber) {
+                hideLoader();
+                alert('当前报告没有已确认的识别结果。');
+                return;
             }
             const windowShgc = parseFloat(document.getElementById('param-shgc').value);
             const curtainShading = parseFloat(document.getElementById('param-curtain-shading').value) || 1;
@@ -3674,7 +3743,7 @@
                 : Number(windowRepeatValue);
 
             const params = {
-                report_number: reportNumber,
+                report_number: calculationReportNumber,
                 calculation_mode: calculationMode,
                 scale: parseFloat(document.getElementById('param-scale').value),
                 height: parseFloat(document.getElementById('param-height').value),
@@ -4022,8 +4091,8 @@
                     throw new Error(data.error);
                 }
 
-                reportNumber = data.report_number;
-                document.getElementById('current-report-number').value = reportNumber;
+                document.getElementById('current-report-number').value = data.report_number;
+                handleReportNumberInputChange();
 
                 const p = data.params || {};
                 const geometry = p.geometry || {};

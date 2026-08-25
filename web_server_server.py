@@ -20,6 +20,7 @@ import logging
 import numpy as np
 import psutil
 import subprocess
+from contextlib import contextmanager
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MODELS_DIR = os.path.join(BASE_DIR, 'models')
@@ -2068,6 +2069,152 @@ def _atomic_write_json(path, payload):
         raise
 
 
+class ExteriorGenerationConflict(RuntimeError):
+    """The confirmed exterior no longer belongs to the current fusion generation."""
+
+
+_exterior_thread_locks_guard = threading.Lock()
+_exterior_thread_locks = {}
+
+
+@contextmanager
+def _exterior_report_lock(report_dir):
+    """Serialize exterior fusion/confirmation/use for one report across workers."""
+    report_dir = Path(report_dir).resolve()
+    report_dir.mkdir(parents=True, exist_ok=True)
+    lock_key = os.fspath(report_dir)
+    with _exterior_thread_locks_guard:
+        thread_lock = _exterior_thread_locks.setdefault(lock_key, threading.RLock())
+
+    with thread_lock:
+        lock_path = report_dir / '.exterior_generation.lock'
+        with open(lock_path, 'a+b') as lock_file:
+            lock_file.seek(0, os.SEEK_END)
+            if lock_file.tell() == 0:
+                lock_file.write(b'0')
+                lock_file.flush()
+            lock_file.seek(0)
+            if os.name == 'nt':
+                import msvcrt
+                while True:
+                    try:
+                        msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+                        break
+                    except OSError:
+                        time.sleep(0.05)
+                try:
+                    yield
+                finally:
+                    lock_file.seek(0)
+                    msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+                try:
+                    yield
+                finally:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def _exterior_generation_path(report_dir):
+    return Path(report_dir) / 'exterior_generation.json'
+
+
+def _read_exterior_generation(report_dir):
+    path = _exterior_generation_path(report_dir)
+    if not path.is_file() or path.is_symlink():
+        return None
+    try:
+        marker = json.loads(path.read_text(encoding='utf-8'))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    return marker if isinstance(marker, dict) else None
+
+
+def _new_exterior_generation(report_number):
+    return {
+        'format': 'pdf-exterior-generation/1',
+        'report_number': report_number,
+        'generation': uuid.uuid4().hex,
+        'status': 'running',
+        'topology_sha256': None,
+        'updated_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+    }
+
+
+def _write_exterior_generation(report_dir, marker):
+    marker = copy.deepcopy(marker)
+    marker['updated_at'] = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+    _atomic_write_json(_exterior_generation_path(report_dir), marker)
+    return marker
+
+
+def _update_exterior_generation_if_current(report_dir, generation, *, status, topology_sha256=None):
+    marker = _read_exterior_generation(report_dir)
+    if not marker or marker.get('generation') != generation:
+        return False
+    marker['status'] = status
+    marker['topology_sha256'] = topology_sha256 if status == 'ready' else None
+    _write_exterior_generation(report_dir, marker)
+    return True
+
+
+def _require_current_exterior_generation(
+    report_dir,
+    report_number,
+    *,
+    recognition=None,
+    topology_sha256=None,
+    expected_generation=None,
+):
+    marker = _read_exterior_generation(report_dir)
+    if not marker:
+        raise ExteriorGenerationConflict('Exterior generation marker is missing; run fusion again')
+    marker_generation = marker.get('generation')
+    marker_hash = marker.get('topology_sha256')
+    if (
+        marker.get('format') != 'pdf-exterior-generation/1'
+        or marker.get('report_number') != report_number
+        or not isinstance(marker_generation, str)
+        or not marker_generation
+        or marker.get('status') != 'ready'
+        or not isinstance(marker_hash, str)
+        or len(marker_hash) != 64
+        or any(character not in '0123456789abcdef' for character in marker_hash)
+    ):
+        raise ExteriorGenerationConflict('Exterior generation is not ready for this report')
+    if expected_generation is not None and marker_generation != expected_generation:
+        raise ExteriorGenerationConflict('Exterior generation changed during confirmation')
+    if topology_sha256 is not None and not hmac.compare_digest(marker_hash, topology_sha256):
+        raise ExteriorGenerationConflict('Exterior generation topology hash does not match')
+    if recognition is not None:
+        binding = recognition.get('exterior_generation') or {}
+        if (
+            recognition.get('report_number') != report_number
+            or binding.get('generation') != marker_generation
+            or binding.get('topology_sha256') != marker_hash
+        ):
+            raise ExteriorGenerationConflict('Recognition generation does not match current exterior generation')
+    return marker
+
+
+def _serialized_exterior_report(route):
+    """Hold the same report lock for each mutating exterior route."""
+    @wraps(route)
+    def wrapped(*args, **kwargs):
+        if request.is_json:
+            supplied = (request.get_json(silent=True) or {}).get('report_number')
+        else:
+            supplied = request.form.get('report_number', 'default')
+        report_number = secure_filename(supplied or '') if isinstance(supplied, str) else ''
+        if not report_number or report_number != supplied:
+            return jsonify({'error': 'report_number is invalid'}), 400
+        report_dir = Path(app.config['UPLOAD_FOLDER']) / 'energy' / report_number
+        with _exterior_report_lock(report_dir):
+            return route(*args, **kwargs)
+    return wrapped
+
+
 @app.route('/energy/pdf_prepare', methods=['POST'])
 @login_required
 def prepare_energy_pdf():
@@ -2173,6 +2320,7 @@ def energy_pdf_recognition_state_helper():
 
 @app.route('/energy/vector_pdf_fusion', methods=['POST'])
 @login_required
+@_serialized_exterior_report
 def vector_pdf_fusion():
     """Publish isolated native-PDF/model diagnostics without energy geometry."""
     if not HAS_VECTOR_PDF_FUSION or _vector_pdf_fusion_config is None:
@@ -2207,7 +2355,10 @@ def vector_pdf_fusion():
     except ValueError as exc:
         return jsonify({'error': str(exc)}), 400
 
-    target_dir = Path(app.config['UPLOAD_FOLDER']) / 'energy' / report_number / 'vector_pdf_fusion'
+    report_dir = Path(app.config['UPLOAD_FOLDER']) / 'energy' / report_number
+    target_dir = report_dir / 'vector_pdf_fusion'
+    generation_marker = _new_exterior_generation(report_number)
+    _write_exterior_generation(report_dir, generation_marker)
     try:
         result = analyze_vector_pdf_page(
             pdf_path,
@@ -2234,8 +2385,14 @@ def vector_pdf_fusion():
                 images['exterior_overlay'] = base64.b64encode(buffer).decode('utf-8')
         topology_sha256 = _sha256_file(target_dir / 'pdf_exterior_topology.json')
     except ValueError as exc:
+        _update_exterior_generation_if_current(
+            report_dir, generation_marker['generation'], status='failed',
+        )
         return jsonify({'error': str(exc)}), 400
     except Exception as exc:
+        _update_exterior_generation_if_current(
+            report_dir, generation_marker['generation'], status='failed',
+        )
         return jsonify({'error': f'Vector PDF fusion failed: {exc}'}), 500
 
     exterior_topology = result.get('exterior_topology') or {}
@@ -2268,8 +2425,15 @@ def vector_pdf_fusion():
         'unresolved_gap_count': len(exterior_topology.get('unresolved') or []),
     })
 
+    _update_exterior_generation_if_current(
+        report_dir,
+        generation_marker['generation'],
+        status='ready',
+        topology_sha256=topology_sha256,
+    )
     return jsonify({
         'success': True,
+        'report_number': report_number,
         'fusion_debug': True,
         'status': result['status'],
         'load_geometry_ready': False,
@@ -2295,6 +2459,7 @@ def vector_pdf_fusion():
 
 @app.route('/energy/vector_pdf_exterior_confirm', methods=['POST'])
 @login_required
+@_serialized_exterior_report
 def vector_pdf_exterior_confirm():
     """Confirm only the current, hashed server-side exterior artifacts."""
     payload = request.get_json(silent=True)
@@ -2319,7 +2484,8 @@ def vector_pdf_exterior_confirm():
             int(supplied_hash, 16)
         except ValueError:
             raise ValueError('topology_sha256 must be a SHA-256 hex digest') from None
-        report_dir, artifact_dir = _require_exterior_report_dir(payload.get('report_number'))
+        report_number = payload.get('report_number')
+        report_dir, artifact_dir = _require_exterior_report_dir(report_number)
         topology_raw, topology = _read_exterior_artifact(
             artifact_dir, 'pdf_exterior_topology.json',
         )
@@ -2334,6 +2500,13 @@ def vector_pdf_exterior_confirm():
     current_hash = hashlib.sha256(topology_raw).hexdigest()
     if not hmac.compare_digest(current_hash, supplied_hash.lower()):
         return jsonify({'error': 'Exterior topology has changed; review it again'}), 409
+
+    try:
+        generation_marker = _require_current_exterior_generation(
+            report_dir, report_number, topology_sha256=current_hash,
+        )
+    except ExteriorGenerationConflict as exc:
+        return jsonify({'error': str(exc)}), 409
 
     opening_hash = topology.get('opening_artifact_sha256')
     if (
@@ -2390,6 +2563,11 @@ def vector_pdf_exterior_confirm():
         geometry = {'walls': walls, 'windows': windows, 'doors': doors}
         recognition = {
             'schema_version': RECOGNITION_SCHEMA_VERSION,
+            'report_number': report_number,
+            'exterior_generation': {
+                'generation': generation_marker['generation'],
+                'topology_sha256': current_hash,
+            },
             'created_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
             'model': {
                 'backend': VECTOR_PYTORCH_BACKEND,
@@ -2445,7 +2623,22 @@ def vector_pdf_exterior_confirm():
                 'topology_sha256': current_hash,
             },
         }
+        _require_current_exterior_generation(
+            report_dir,
+            report_number,
+            topology_sha256=current_hash,
+            expected_generation=generation_marker['generation'],
+        )
         _atomic_write_json(report_dir / 'recognition.json', recognition)
+        _require_current_exterior_generation(
+            report_dir,
+            report_number,
+            recognition=recognition,
+            topology_sha256=current_hash,
+            expected_generation=generation_marker['generation'],
+        )
+    except ExteriorGenerationConflict as exc:
+        return jsonify({'error': str(exc)}), 409
     except (RuntimeError, ValueError) as exc:
         return jsonify({'error': str(exc)}), 409
     except Exception as exc:
@@ -2453,6 +2646,7 @@ def vector_pdf_exterior_confirm():
 
     return jsonify({
         'success': True,
+        'report_number': report_number,
         'status': 'confirmed',
         'load_geometry_ready': True,
         'topology_sha256': current_hash,
@@ -3011,6 +3205,8 @@ def ai_simulate():
     if not (HAS_FLOORPLAN_AI or HAS_VECTOR_FLOORPLAN_AI):
         return jsonify({'error': 'AI module not available'}), 501
 
+    exterior_lock_context = None
+    exterior_lock_acquired = False
     try:
         data = request.get_json() or {}
         report_number = data.get('report_number', 'default')
@@ -3127,6 +3323,20 @@ def ai_simulate():
                 'error': 'No current recognition.json found. Run AI recognition first.'
             }), 404
 
+        initially_confirmed_exterior = recognition.get('exterior_topology') or {}
+        if (
+            initially_confirmed_exterior.get('confirmed') is True
+            and initially_confirmed_exterior.get('load_geometry_ready') is True
+        ):
+            exterior_lock_context = _exterior_report_lock(Path(target_dir))
+            exterior_lock_context.__enter__()
+            exterior_lock_acquired = True
+            recognition = _load_recognition_payload(target_dir)
+            if recognition is None:
+                raise ExteriorGenerationConflict(
+                    'Recognition generation disappeared while acquiring the exterior lock'
+                )
+
         scale_source = 'request'
         scale_calibration = recognition.get('scale_calibration') or {}
         if scale_calibration.get('status') == 'confirmed':
@@ -3150,6 +3360,23 @@ def ai_simulate():
             (recognition.get('topology_repair') or {}).get('manual_exterior_wall_required')
         )
         exterior_geometry = None
+        if exterior.get('confirmed') is True and exterior.get('load_geometry_ready') is True:
+            try:
+                _require_current_exterior_generation(
+                    Path(target_dir), report_number, recognition=recognition,
+                )
+            except ExteriorGenerationConflict:
+                if (
+                    not exterior_repair_required
+                    and room_topology.get('load_geometry_ready') is True
+                    and room_count > 0
+                    and math.isfinite(room_area_px2)
+                    and room_area_px2 > 0
+                ):
+                    exterior = {}
+                else:
+                    raise
+
         if exterior.get('confirmed') is True and exterior.get('load_geometry_ready') is True:
             from vector_pdf_energy_geometry import build_exterior_energy_geometry
 
@@ -3350,11 +3577,16 @@ def ai_simulate():
         else:
             return jsonify({'error': 'Energy calculation engine missing on server'}), 500
 
+    except ExteriorGenerationConflict as e:
+        return jsonify({'error': str(e)}), 409
     except ValueError as e:
         return jsonify({'error': str(e)}), 400
     except Exception as e:
         logger.error(f"AI simulate error: {e}", exc_info=True)
         return jsonify({'error': str(e)}), 500
+    finally:
+        if exterior_lock_acquired:
+            exterior_lock_context.__exit__(None, None, None)
 
 
 @app.route('/energy/report/<report_number>', methods=['GET'])

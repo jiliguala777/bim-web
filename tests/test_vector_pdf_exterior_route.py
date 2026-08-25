@@ -106,6 +106,17 @@ class VectorPdfExteriorConfirmRouteTests(unittest.TestCase):
         (artifact_dir / "pdf_opening_candidates.json").write_bytes(opening_raw)
         topology["opening_artifact_sha256"] = hashlib.sha256(opening_raw).hexdigest()
         topology_path.write_text(json.dumps(topology), encoding="utf-8")
+        topology_sha256 = hashlib.sha256(topology_path.read_bytes()).hexdigest()
+        (report_dir / "exterior_generation.json").write_text(
+            json.dumps({
+                "format": "pdf-exterior-generation/1",
+                "report_number": "EXT-1",
+                "generation": "generation-a",
+                "status": "ready",
+                "topology_sha256": topology_sha256,
+            }),
+            encoding="utf-8",
+        )
         return topology, openings, topology_path
 
     def _post_artifacts(self, upload_root, topology, openings, topology_path):
@@ -113,6 +124,16 @@ class VectorPdfExteriorConfirmRouteTests(unittest.TestCase):
         (topology_path.parent / "pdf_opening_candidates.json").write_bytes(opening_raw)
         topology["opening_artifact_sha256"] = hashlib.sha256(opening_raw).hexdigest()
         topology_path.write_text(json.dumps(topology), encoding="utf-8")
+        (topology_path.parent.parent / "exterior_generation.json").write_text(
+            json.dumps({
+                "format": "pdf-exterior-generation/1",
+                "report_number": "EXT-1",
+                "generation": "generation-a",
+                "status": "ready",
+                "topology_sha256": hashlib.sha256(topology_path.read_bytes()).hexdigest(),
+            }),
+            encoding="utf-8",
+        )
         previous = self.server.app.config["UPLOAD_FOLDER"]
         self.server.app.config["UPLOAD_FOLDER"] = str(upload_root)
         try:
@@ -168,6 +189,14 @@ class VectorPdfExteriorConfirmRouteTests(unittest.TestCase):
             self.assertEqual(saved["pdf_page_number"], 2)
             self.assertEqual(saved["crop_bbox_page_px"], [10, 20, 110, 70])
             self.assertFalse(saved["room_topology"]["load_geometry_ready"])
+            self.assertEqual(saved["report_number"], "EXT-1")
+            self.assertEqual(saved["exterior_generation"]["generation"], "generation-a")
+            self.assertEqual(
+                saved["exterior_generation"]["topology_sha256"],
+                hashlib.sha256(topology_path.read_bytes()).hexdigest(),
+            )
+            self.assertEqual(response.get_json()["report_number"], "EXT-1")
+            self.assertEqual(response.get_json()["recognition"]["report_number"], "EXT-1")
             self.assertEqual(saved["geometry"]["doors"][0]["pts"], [[20, 0], [50, 0]])
             wall_segments = [wall["pts"] for wall in saved["geometry"]["walls"]]
             self.assertNotIn([[20, 0], [50, 0]], wall_segments)
@@ -200,6 +229,70 @@ class VectorPdfExteriorConfirmRouteTests(unittest.TestCase):
                         )
             self.assertNotEqual(saved["exterior_topology"]["polygon_px"], [[999, 999], [1000, 999], [1000, 1000]])
             segmenter.predict.assert_not_called()
+
+    def test_confirm_rejects_marker_hash_mismatch_without_overwriting_recognition(self):
+        with tempfile.TemporaryDirectory() as directory:
+            upload_root = Path(directory)
+            report_dir = upload_root / "energy" / "EXT-1"
+            _, _, topology_path = self._artifacts(report_dir)
+            marker_path = report_dir / "exterior_generation.json"
+            marker = json.loads(marker_path.read_text("utf-8"))
+            marker["topology_sha256"] = "0" * 64
+            marker_path.write_text(json.dumps(marker), encoding="utf-8")
+            recognition_path = report_dir / "recognition.json"
+            recognition_path.write_bytes(b'{"sentinel": true}\n')
+            before = recognition_path.read_bytes()
+            previous = self.server.app.config["UPLOAD_FOLDER"]
+            self.server.app.config["UPLOAD_FOLDER"] = str(upload_root)
+            try:
+                response = self.client.post(
+                    "/energy/vector_pdf_exterior_confirm",
+                    json=self._payload(topology_path),
+                )
+            finally:
+                self.server.app.config["UPLOAD_FOLDER"] = previous
+
+            self.assertEqual(response.status_code, 409, response.get_json())
+            self.assertIn("generation", response.get_json()["error"].lower())
+            self.assertEqual(recognition_path.read_bytes(), before)
+
+    def test_confirm_revalidates_generation_before_persisting(self):
+        with tempfile.TemporaryDirectory() as directory:
+            upload_root = Path(directory)
+            report_dir = upload_root / "energy" / "EXT-1"
+            _, _, topology_path = self._artifacts(report_dir)
+            marker_path = report_dir / "exterior_generation.json"
+            recognition_path = report_dir / "recognition.json"
+            original_validate = self.server._validate_opening_bindings
+
+            def advance_generation(topology, openings):
+                marker_path.write_text(json.dumps({
+                    "format": "pdf-exterior-generation/1",
+                    "report_number": "EXT-1",
+                    "generation": "generation-b",
+                    "status": "running",
+                    "topology_sha256": None,
+                }), encoding="utf-8")
+                return original_validate(topology, openings)
+
+            previous = self.server.app.config["UPLOAD_FOLDER"]
+            self.server.app.config["UPLOAD_FOLDER"] = str(upload_root)
+            try:
+                with mock.patch.object(
+                    self.server,
+                    "_validate_opening_bindings",
+                    side_effect=advance_generation,
+                ):
+                    response = self.client.post(
+                        "/energy/vector_pdf_exterior_confirm",
+                        json=self._payload(topology_path),
+                    )
+            finally:
+                self.server.app.config["UPLOAD_FOLDER"] = previous
+
+            self.assertEqual(response.status_code, 409, response.get_json())
+            self.assertIn("generation", response.get_json()["error"].lower())
+            self.assertFalse(recognition_path.exists())
 
     def test_confirm_rejects_hash_mismatch_without_overwriting_recognition(self):
         with tempfile.TemporaryDirectory() as directory:

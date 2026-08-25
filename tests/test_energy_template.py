@@ -35,7 +35,7 @@ class EnergyTemplateTests(unittest.TestCase):
         self.assertIn("function startManualScaleCalibration()", html)
         self.assertIn("function saveManualScaleCalibration()", html)
         self.assertIn("fetch('/energy/scale_calibration'", html)
-        self.assertIn("!aiResultData?.room_topology?.load_geometry_ready", html)
+        self.assertIn("!hasCurrentConfirmedGeometry()", html)
         self.assertIn("!hasCurrentAiRecognitionResult()", html)
         self.assertIn('id="param-scale" class="form-control" value=""', html)
         self.assertNotIn("const scale = 0.05;", html)
@@ -148,6 +148,67 @@ class EnergyTemplateTests(unittest.TestCase):
         self.assertIn("if (data.fusion_debug)", html)
         self.assertIn("aiResultData = null;", html)
         self.assertIn("调试结果，尚不可用于能耗计算", html)
+
+    def test_exterior_debug_requires_confirmation_before_energy_state(self):
+        html = Path("templates/energy.html").read_text(encoding="utf-8")
+
+        self.assertIn("pendingExteriorFusion", html)
+        self.assertIn("/energy/vector_pdf_exterior_confirm", html)
+        self.assertIn("确认外轮廓并用于能耗计算", html)
+        self.assertIn('id="exterior-review-panel"', html)
+        self.assertIn('id="exterior-review-overlay"', html)
+        self.assertIn("images.exterior_overlay", html)
+        self.assertIn("area_px2", html)
+        self.assertIn("perimeter_px", html)
+        self.assertIn("door_count", html)
+        self.assertIn("window_count", html)
+        self.assertIn("small_repair_count", html)
+        self.assertIn("unresolved_gap_count", html)
+        self.assertIn("topology_sha256: pending.topology_sha256", html)
+        self.assertIn("scale_m_per_px: scale", html)
+        self.assertIn("confirmed: true", html)
+        self.assertIn("page_number: pending.pdf_page_number", html)
+        self.assertIn("crop_bbox_page_px: pending.crop_bbox_page_px", html)
+        self.assertIn("aiResultData = data.recognition;", html)
+
+    def test_exterior_height_and_repeat_controls_are_sent_to_energy_route(self):
+        html = Path("templates/energy.html").read_text(encoding="utf-8")
+
+        expected_inputs = {
+            "param-door-height": ('min="0.1"', 'step="0.1"', 'value="2.1"'),
+            "param-window-height": ('min="0.1"', 'step="0.1"', 'value="1.5"'),
+            "param-door-repeat-count": ('min="1"', 'step="1"', 'value="1"'),
+            "param-window-repeat-count": ('min="1"', 'step="1"'),
+        }
+        for element_id, fragments in expected_inputs.items():
+            with self.subTest(element_id=element_id):
+                input_tag = re.search(
+                    rf'<input[^>]*id="{element_id}"[^>]*>', html,
+                ).group(0)
+                for fragment in fragments:
+                    self.assertIn(fragment, input_tag)
+
+        for field in (
+            "door_height_m",
+            "window_height_m",
+            "door_repeat_count",
+            "window_repeat_count",
+        ):
+            with self.subTest(field=field):
+                self.assertIn(f"{field}:", html)
+
+    def test_exterior_pending_and_confirmed_state_is_cleared_with_recognition_selection(self):
+        html = Path("templates/energy.html").read_text(encoding="utf-8")
+        clear_segment = html[
+            html.index("function clearPdfRecognitionDerivedState()")
+            :html.index("function invalidatePdfRecognitionSelection")
+        ]
+
+        self.assertIn("pendingExteriorFusion = null;", clear_segment)
+        self.assertIn("aiResultData = derivedState.aiResultData;", clear_segment)
+        self.assertIn("function hasCurrentConfirmedGeometry()", html)
+        self.assertIn("exterior_topology?.confirmed === true", html)
+        self.assertIn("room_topology?.load_geometry_ready === true", html)
 
     def test_pdf_region_recognition_ui_loads_preview_and_manages_crop_state(self):
         html = Path("templates/energy.html").read_text(encoding="utf-8")
@@ -1639,18 +1700,19 @@ class EnergyRouteClientTests(unittest.TestCase):
                     ("VALID-REPORT", prepared["upload_token"] + "tampered", "1", "token"),
                     ("OTHER-REPORT", prepared["upload_token"], "1", "report"),
                 ]
-                for report_number, token, page_number, expected_error in cases:
-                    with self.subTest(report_number=report_number, page_number=page_number):
-                        response = self.client.post(
-                            "/energy/ai_recognize",
-                            data={
-                                "report_number": report_number,
-                                "pdf_upload_token": token,
-                                "pdf_page_number": page_number,
-                            },
-                        )
-                        self.assertEqual(response.status_code, 400)
-                        self.assertIn(expected_error, response.get_json()["error"].lower())
+                with patch.object(self.server, "HAS_FLOORPLAN_AI", True):
+                    for report_number, token, page_number, expected_error in cases:
+                        with self.subTest(report_number=report_number, page_number=page_number):
+                            response = self.client.post(
+                                "/energy/ai_recognize",
+                                data={
+                                    "report_number": report_number,
+                                    "pdf_upload_token": token,
+                                    "pdf_page_number": page_number,
+                                },
+                            )
+                            self.assertEqual(response.status_code, 400)
+                            self.assertIn(expected_error, response.get_json()["error"].lower())
             finally:
                 self.server.app.config["UPLOAD_FOLDER"] = previous_upload
 
@@ -1775,6 +1837,64 @@ class EnergyRouteClientTests(unittest.TestCase):
             self.assertTrue((report_dir / "ai_raw_model_mask.png").exists())
             self.assertEqual(body["topology_repair"]["exterior_repair"]["status"], "manual_exterior_wall_required")
 
+    def test_vector_pdf_fusion_returns_complete_exterior_review_summary(self):
+        fusion = {
+            "status": "evaluable",
+            "summary": {},
+            "reason_codes": [],
+            "exterior_summary": {
+                "footprint_status": "closed",
+                "unresolved_gap_count": 1,
+            },
+            "exterior_topology": {
+                "area_px2": 5000.0,
+                "perimeter_px": 300.0,
+                "bridges": [
+                    {"bridge_id": "repair-1", "bridge_type": "small_gap_repair"},
+                    {"bridge_id": "opening-bridge-1", "bridge_type": "opening_bridge"},
+                ],
+                "unresolved": [{"gap_id": "gap-1"}],
+            },
+            "opening_candidates": {
+                "accepted_openings": [
+                    {"opening_id": "door-1", "kind": "door", "width_px": 30.0},
+                    {"opening_id": "window-1", "kind": "window", "width_px": 20.0},
+                ],
+            },
+        }
+        with (
+            patch.object(self.server, "HAS_VECTOR_PDF_FUSION", True),
+            patch.object(self.server, "_vector_pdf_fusion_config", object()),
+            patch.object(
+                self.server,
+                "_validated_prepared_pdf",
+                return_value=(Path("prepared.pdf"), 2, 3),
+            ),
+            patch.object(self.server, "analyze_vector_pdf_page", return_value=fusion),
+            patch.object(self.server, "_sha256_file", return_value="a" * 64),
+            patch.object(self.server.cv2, "imread", return_value=None),
+        ):
+            response = self.client.post(
+                "/energy/vector_pdf_fusion",
+                data={
+                    "report_number": "EXT-REVIEW",
+                    "pdf_upload_token": "token",
+                    "pdf_page_number": "2",
+                    "recognition_mode": "full_page",
+                },
+            )
+
+        self.assertEqual(response.status_code, 200, response.get_json())
+        summary = response.get_json()["exterior_summary"]
+        self.assertEqual(summary["area_px2"], 5000.0)
+        self.assertEqual(summary["perimeter_px"], 300.0)
+        self.assertEqual(summary["door_count"], 1)
+        self.assertEqual(summary["door_total_width_px"], 30.0)
+        self.assertEqual(summary["window_count"], 1)
+        self.assertEqual(summary["window_total_width_px"], 20.0)
+        self.assertEqual(summary["small_repair_count"], 1)
+        self.assertEqual(summary["unresolved_gap_count"], 1)
+
     def post_and_capture_params(self, payload):
         result = {
             "success": True,
@@ -1802,6 +1922,163 @@ class EnergyRouteClientTests(unittest.TestCase):
 
         params = calculate.call_args.args[0] if calculate.called else None
         return response, params
+
+    def post_exterior_energy(self, recognition, payload=None):
+        result = {
+            "success": True,
+            "summary": {
+                "total_energy_kwh": 0,
+                "eui": 0,
+                "rating": "A",
+                "rating_label": "test",
+            },
+        }
+        connection = MagicMock()
+        connection.execute.return_value.fetchone.return_value = None
+        with (
+            patch.object(self.server, "HAS_FLOORPLAN_AI", True),
+            patch.object(self.server, "HAS_ENERGY_CALC", True),
+            patch.object(self.server, "_load_recognition_payload", return_value=recognition),
+            patch.object(self.server.energy_calc, "calculate_energy", return_value=result) as calculate,
+            patch.object(self.server, "get_db_connection", return_value=connection),
+        ):
+            response = self.client.post(
+                "/energy/ai_simulate",
+                json={"report_number": "EXT-ENERGY", **(payload or {})},
+            )
+        return response, calculate
+
+    @staticmethod
+    def exterior_recognition(*, confirmed=True, room_topology=None, perimeter_m=40.0):
+        return {
+            "model": {"version": "exterior-test"},
+            "preprocessing": {"requested": "vector_pdf_fusion", "use_preprocessing": False},
+            "image_size": [100, 100],
+            "geometry": {"walls": [], "windows": [], "doors": []},
+            "room_topology": room_topology or {
+                "status": "exterior_only",
+                "room_count": 0,
+                "rooms": [],
+                "total_area_px2": 0.0,
+                "load_geometry_ready": False,
+            },
+            "exterior_topology": {
+                "area_m2": 100.0,
+                "perimeter_m": perimeter_m,
+                "confirmed": confirmed,
+                "load_geometry_ready": confirmed,
+            },
+            "openings": [
+                {"opening_id": "door-1", "kind": "door", "width_m": 2.0},
+                {"opening_id": "window-1", "kind": "window", "width_m": 8.0},
+            ],
+        }
+
+    def test_energy_route_uses_confirmed_exterior_and_separate_opening_heights(self):
+        response, calculate = self.post_exterior_energy(
+            self.exterior_recognition(),
+            {
+                "height": 3.0,
+                "floors": 2,
+                "door_height_m": 2.1,
+                "window_height_m": 1.5,
+                "door_repeat_count": 1,
+                "window_repeat_count": 2,
+            },
+        )
+
+        self.assertEqual(response.status_code, 200, response.get_json())
+        geometry = calculate.call_args.args[0]["geometry"]
+        self.assertEqual(geometry["floor_area_m2"], 100.0)
+        self.assertEqual(geometry["roof_area_m2"], 100.0)
+        self.assertEqual(geometry["door_area_m2"], 4.2)
+        self.assertEqual(geometry["window_area_m2"], 24.0)
+        self.assertEqual(geometry["wall_area_m2"], 211.8)
+        self.assertEqual(response.get_json()["floor_area_source"], "confirmed_exterior_footprint")
+
+    def test_energy_route_defaults_exterior_repeats_to_door_once_and_windows_all_floors(self):
+        response, calculate = self.post_exterior_energy(
+            self.exterior_recognition(),
+            {
+                "height": 3.0,
+                "floors": 2,
+                "door_height_m": 2.1,
+                "window_height_m": 1.5,
+            },
+        )
+
+        self.assertEqual(response.status_code, 200, response.get_json())
+        geometry = calculate.call_args.args[0]["geometry"]
+        self.assertEqual(geometry["door_area_m2"], 4.2)
+        self.assertEqual(geometry["window_area_m2"], 24.0)
+
+    def test_unconfirmed_exterior_cannot_calculate_without_an_existing_fallback(self):
+        response, calculate = self.post_exterior_energy(
+            self.exterior_recognition(confirmed=False),
+            {"height": 3.0, "floors": 2},
+        )
+
+        self.assertEqual(response.status_code, 400, response.get_json())
+        calculate.assert_not_called()
+
+    def test_unconfirmed_exterior_does_not_preempt_old_confirmed_room_topology(self):
+        room_topology = {
+            "status": "closed",
+            "room_count": 1,
+            "rooms": [{"id": "room-1", "area_px2": 400.0}],
+            "total_area_px2": 400.0,
+            "scale_m_per_px": 0.5,
+            "load_geometry_ready": True,
+        }
+        recognition = self.exterior_recognition(
+            confirmed=False,
+            room_topology=room_topology,
+        )
+        recognition["scale_calibration"] = {
+            "status": "confirmed",
+            "method": "legacy-room-test",
+            "scale_m_per_px": 0.5,
+        }
+
+        response, calculate = self.post_exterior_energy(
+            recognition,
+            {"height": 3.0, "floors": 2},
+        )
+
+        self.assertEqual(response.status_code, 200, response.get_json())
+        self.assertEqual(response.get_json()["floor_area_source"], "room_polygons")
+        self.assertEqual(calculate.call_args.args[0]["geometry"]["floor_area_m2"], 100.0)
+
+    def test_energy_route_rejects_exterior_openings_larger_than_gross_wall(self):
+        response, calculate = self.post_exterior_energy(
+            self.exterior_recognition(perimeter_m=4.0),
+            {
+                "height": 3.0,
+                "floors": 1,
+                "door_height_m": 3.0,
+                "window_height_m": 1.0,
+            },
+        )
+
+        self.assertEqual(response.status_code, 400, response.get_json())
+        self.assertIn("gross exterior wall area", response.get_json()["error"])
+        calculate.assert_not_called()
+
+    def test_energy_route_strictly_validates_exterior_repeat_counts(self):
+        for field, value in (
+            ("door_repeat_count", 1.5),
+            ("door_repeat_count", 3),
+            ("window_repeat_count", 1.5),
+            ("window_repeat_count", 3),
+        ):
+            with self.subTest(field=field, value=value):
+                response, calculate = self.post_exterior_energy(
+                    self.exterior_recognition(),
+                    {"height": 3.0, "floors": 2, field: value},
+                )
+                self.assertEqual(response.status_code, 400, response.get_json())
+                self.assertIn(field, response.get_json()["error"])
+                calculate.assert_not_called()
 
     def post_with_actual_calculator(self, payload):
         recognition = {
@@ -2466,10 +2743,11 @@ class EnergyRouteClientTests(unittest.TestCase):
                 self.assertEqual(params["cooling"]["enabled"], expected[1])
 
     def test_route_rejects_both_calculation_scopes_disabled(self):
-        response = self.client.post(
-            "/energy/ai_simulate",
-            json={"calculate_heating": False, "calculate_cooling": False},
-        )
+        with patch.object(self.server, "HAS_FLOORPLAN_AI", True):
+            response = self.client.post(
+                "/energy/ai_simulate",
+                json={"calculate_heating": False, "calculate_cooling": False},
+            )
 
         self.assertEqual(response.status_code, 400, response.get_json())
         self.assertIn("供暖或制冷", response.get_json()["error"])

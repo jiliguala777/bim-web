@@ -2238,6 +2238,36 @@ def vector_pdf_fusion():
     except Exception as exc:
         return jsonify({'error': f'Vector PDF fusion failed: {exc}'}), 500
 
+    exterior_topology = result.get('exterior_topology') or {}
+    opening_candidates = result.get('opening_candidates') or {}
+    accepted_openings = opening_candidates.get('accepted_openings') or []
+    exterior_summary = dict(result.get('exterior_summary') or {})
+    exterior_summary.update({
+        'area_px2': exterior_topology.get('area_px2'),
+        'perimeter_px': exterior_topology.get('perimeter_px'),
+        'door_count': sum(
+            opening.get('kind') == 'door' for opening in accepted_openings
+        ),
+        'door_total_width_px': math.fsum(
+            float(opening.get('width_px') or 0.0)
+            for opening in accepted_openings
+            if opening.get('kind') == 'door'
+        ),
+        'window_count': sum(
+            opening.get('kind') == 'window' for opening in accepted_openings
+        ),
+        'window_total_width_px': math.fsum(
+            float(opening.get('width_px') or 0.0)
+            for opening in accepted_openings
+            if opening.get('kind') == 'window'
+        ),
+        'small_repair_count': sum(
+            bridge.get('bridge_type') == 'small_gap_repair'
+            for bridge in (exterior_topology.get('bridges') or [])
+        ),
+        'unresolved_gap_count': len(exterior_topology.get('unresolved') or []),
+    })
+
     return jsonify({
         'success': True,
         'fusion_debug': True,
@@ -2248,7 +2278,7 @@ def vector_pdf_fusion():
         'recognition_mode': region_request['mode'],
         'crop_bbox_page_px': crop_bbox_page_px,
         'summary': result.get('summary') or {},
-        'exterior_summary': result.get('exterior_summary') or {},
+        'exterior_summary': exterior_summary,
         'topology_sha256': topology_sha256,
         'reason_codes': result.get('reason_codes') or [],
         'artifacts': {
@@ -2430,7 +2460,7 @@ def vector_pdf_exterior_confirm():
         'openings': scaled_openings,
         'opening_widths': recognition['opening_widths'],
         'geometry_summary': recognition['geometry_summary'],
-        'recognition': {'schema_version': RECOGNITION_SCHEMA_VERSION, 'path': 'recognition.json'},
+        'recognition': recognition,
     })
 
 
@@ -3111,19 +3141,39 @@ def ai_simulate():
         image_width = float(image_size[0] or 0)
         image_height = float(image_size[1] or 0)
 
-        # 1. 计算 AI 构件像素量
-        wall_pixels = sum(w['area'] for w in geometry['walls'])
-        window_pixels = sum(w['area'] for w in geometry['windows'])
-        door_pixels = sum(d.get('area', 0) for d in geometry['doors'])
-
-        # 2. 估计面积和长度 (使用真实比例尺 scale)
+        # 优先使用已确认的外轮廓；旧识别结果继续走原有房间/手工回退。
+        exterior = recognition.get('exterior_topology') or {}
         room_topology = recognition.get('room_topology') or {}
         room_area_px2 = float(room_topology.get('total_area_px2') or 0.0)
         room_count = int(room_topology.get('room_count') or 0)
         exterior_repair_required = bool(
             (recognition.get('topology_repair') or {}).get('manual_exterior_wall_required')
         )
-        if (
+        exterior_geometry = None
+        if exterior.get('confirmed') is True and exterior.get('load_geometry_ready') is True:
+            from vector_pdf_energy_geometry import build_exterior_energy_geometry
+
+            exterior_geometry = build_exterior_energy_geometry(
+                exterior,
+                recognition.get('openings') or [],
+                storey_height_m=height,
+                floors=floors,
+                door_height_m=parse_finite_number(
+                    'door_height_m', 2.1, minimum=0.1,
+                ),
+                window_height_m=parse_finite_number(
+                    'window_height_m', 1.5, minimum=0.1,
+                ),
+                door_repeat_count=parse_finite_number(
+                    'door_repeat_count', 1, minimum=1, maximum=floors, integer=True,
+                ),
+                window_repeat_count=parse_finite_number(
+                    'window_repeat_count', floors, minimum=1, maximum=floors, integer=True,
+                ),
+            )
+            floor_area_m2 = exterior_geometry['per_floor_footprint_area_m2']
+            floor_area_source = 'confirmed_exterior_footprint'
+        elif (
             not exterior_repair_required
             and room_count > 0
             and math.isfinite(room_area_px2)
@@ -3141,27 +3191,34 @@ def ai_simulate():
         else:
             raise ValueError('No closed room polygon was recognized; provide a corrected room boundary or manual floor area.')
 
-        # 计算总墙长和窗长以确定面积
-        wall_total_length = 0
-        for wall in geometry['walls']:
-            pts = wall['pts']
-            for i in range(len(pts) - 1):
-                dx = pts[i+1][0] - pts[i][0]
-                dy = pts[i+1][1] - pts[i][1]
-                wall_total_length += (dx*dx + dy*dy) ** 0.5
+        if exterior_geometry is not None:
+            wall_area_m2 = exterior_geometry['wall_area_m2']
+            window_area_m2 = exterior_geometry['window_area_m2']
+            door_area_m2 = exterior_geometry['door_area_m2']
+            roof_area_m2 = exterior_geometry['per_floor_footprint_area_m2']
+        else:
+            # Preserve the existing room/manual calculations exactly.
+            door_pixels = sum(d.get('area', 0) for d in geometry['doors'])
+            wall_total_length = 0
+            for wall in geometry['walls']:
+                pts = wall['pts']
+                for i in range(len(pts) - 1):
+                    dx = pts[i+1][0] - pts[i][0]
+                    dy = pts[i+1][1] - pts[i][1]
+                    wall_total_length += (dx*dx + dy*dy) ** 0.5
 
-        win_total_length = 0
-        for win in geometry['windows']:
-            pts = win['pts']
-            for i in range(len(pts) - 1):
-                dx = pts[i+1][0] - pts[i][0]
-                dy = pts[i+1][1] - pts[i][1]
-                win_total_length += (dx*dx + dy*dy) ** 0.5
+            win_total_length = 0
+            for win in geometry['windows']:
+                pts = win['pts']
+                for i in range(len(pts) - 1):
+                    dx = pts[i+1][0] - pts[i][0]
+                    dy = pts[i+1][1] - pts[i][1]
+                    win_total_length += (dx*dx + dy*dy) ** 0.5
 
-        # 换算为实际物理面积 (平米)
-        wall_area_m2 = (wall_total_length * scale) * height
-        window_area_m2 = (win_total_length * scale) * height
-        door_area_m2 = door_pixels * (scale ** 2)
+            wall_area_m2 = (wall_total_length * scale) * height
+            window_area_m2 = (win_total_length * scale) * height
+            door_area_m2 = door_pixels * (scale ** 2)
+            roof_area_m2 = floor_area_m2
 
         # 3. 构造传递给 energy_calc.py 的输入参数
         calc_params = {
@@ -3170,7 +3227,7 @@ def ai_simulate():
                 "floor_area_m2": floor_area_m2,
                 "wall_area_m2": wall_area_m2,
                 "window_area_m2": window_area_m2,
-                "roof_area_m2": floor_area_m2,
+                "roof_area_m2": roof_area_m2,
                 "door_area_m2": door_area_m2,
                 "include_roof": data.get("include_roof") is True,
                 "include_floor": data.get("include_floor") is True

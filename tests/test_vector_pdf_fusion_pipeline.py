@@ -1,6 +1,9 @@
 import json
+import os
+import shutil
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 import cv2
@@ -17,6 +20,26 @@ from vector_pdf_model import (
 
 class VectorPdfFusionPipelineTests(unittest.TestCase):
     @staticmethod
+    def _stub_render(*args, **kwargs):
+        return [Image.new("RGB", (556, 417), "white")]
+
+    def setUp(self):
+        self._render_fallback = None
+        poppler_path = os.environ.get("POPPLER_PATH")
+        has_poppler = shutil.which("pdftoppm") is not None or (
+            poppler_path is not None and (Path(poppler_path) / "pdftoppm.exe").is_file()
+        )
+        if not has_poppler:
+            self._render_fallback = patch(
+                "vector_pdf_fusion_pipeline.convert_from_path", self._stub_render,
+            )
+            self._render_fallback.start()
+
+    def tearDown(self):
+        if self._render_fallback is not None:
+            self._render_fallback.stop()
+
+    @staticmethod
     def _make_room_pdf(directory):
         path = Path(directory) / "room.pdf"
         pdf = canvas.Canvas(str(path), pagesize=(400, 300))
@@ -25,6 +48,20 @@ class VectorPdfFusionPipelineTests(unittest.TestCase):
         pdf.rect(40, 30, 320, 240, stroke=1, fill=0)
         pdf.rect(100, 80, 200, 140, stroke=1, fill=0)
         pdf.rect(2, 2, 396, 296, stroke=1, fill=0)
+        pdf.save()
+        return path
+
+    @staticmethod
+    def _make_room_with_door_gap_pdf(directory):
+        path = Path(directory) / "room-with-door-gap.pdf"
+        pdf = canvas.Canvas(str(path), pagesize=(400, 300))
+        pdf.setStrokeColorRGB(0, 0, 0)
+        pdf.setLineWidth(1.0)
+        pdf.line(40, 30, 180, 30)
+        pdf.line(220, 30, 360, 30)
+        pdf.line(360, 30, 360, 270)
+        pdf.line(360, 270, 40, 270)
+        pdf.line(40, 270, 40, 30)
         pdf.save()
         return path
 
@@ -54,6 +91,37 @@ class VectorPdfFusionPipelineTests(unittest.TestCase):
             probabilities_sha256="a" * 64,
         )
 
+    @staticmethod
+    def _opening_runner(image_path, artifact_parent, config, *, expected_size):
+        width, height = expected_size
+        probabilities = np.zeros((10, height, width), dtype=np.float32)
+        if (width, height) == (480, 375):
+            probabilities[0, 15:353, 14:463] = 0.9
+        else:
+            probabilities[0, 40:378, 54:503] = 0.9
+        probabilities[2, :, :] = 0.7
+        probabilities[4, :, :] = 0.8
+        probabilities[5, :, :] = 0.9
+        probabilities[8, :, :] = 0.9
+        artifact_dir = Path(artifact_parent) / "fake-opening-model"
+        artifact_dir.mkdir(parents=True)
+        np.savez_compressed(artifact_dir / "probabilities.npz", probabilities=probabilities)
+        inference = {
+            "format": "vector-floorplan-inference/1",
+            "channel_names": list(CHANNEL_NAMES),
+            "image_size": [width, height],
+            "runtime_seconds": 0.01,
+        }
+        (artifact_dir / "inference.json").write_text(
+            json.dumps(inference), encoding="utf-8"
+        )
+        return VectorProbabilityResult(
+            probabilities=probabilities,
+            inference=inference,
+            artifact_dir=artifact_dir,
+            probabilities_sha256="b" * 64,
+        )
+
     def test_publishes_evaluable_debug_artifacts(self):
         from vector_pdf_fusion_pipeline import analyze_vector_pdf_page
 
@@ -81,6 +149,91 @@ class VectorPdfFusionPipelineTests(unittest.TestCase):
             self.assertFalse(payload["load_geometry_ready"])
             self.assertGreaterEqual(payload["summary"]["accepted_wall_count"], 4)
             self.assertGreaterEqual(payload["summary"]["accepted_room_count"], 1)
+
+    def test_pipeline_publishes_unconfirmed_exterior_and_openings(self):
+        """Removing exterior integration must remove these review-only artifacts."""
+        from vector_pdf_fusion_pipeline import analyze_vector_pdf_page
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / "output"
+            with patch("vector_pdf_fusion_pipeline.convert_from_path", self._stub_render):
+                result = analyze_vector_pdf_page(
+                    self._make_room_with_door_gap_pdf(root),
+                    1,
+                    output,
+                    model_config=object(),
+                    model_runner=self._opening_runner,
+                )
+
+            self.assertFalse(result["load_geometry_ready"])
+            self.assertFalse(result["exterior_topology"]["confirmed"])
+            self.assertFalse(result["exterior_topology"]["load_geometry_ready"])
+            self.assertTrue((output / "pdf_opening_candidates.json").is_file())
+            self.assertTrue((output / "pdf_exterior_topology.json").is_file())
+            self.assertTrue((output / "pdf_exterior_overlay.png").is_file())
+            openings = json.loads((output / "pdf_opening_candidates.json").read_text(encoding="utf-8"))
+            exterior = json.loads((output / "pdf_exterior_topology.json").read_text(encoding="utf-8"))
+            self.assertIn("accepted_openings", openings)
+            self.assertIn("ambiguous_openings", openings)
+            self.assertIn("unclassified_gaps", openings)
+            self.assertIn("bridges", exterior)
+            self.assertIn("unresolved", exterior)
+            self.assertIn("provenance", exterior)
+
+    def test_model_unavailable_never_confirms_exterior_artifact(self):
+        """An unavailable model must publish only explicitly unconfirmed exterior state."""
+        from vector_pdf_fusion_pipeline import analyze_vector_pdf_page
+
+        def unavailable_runner(*args, **kwargs):
+            raise VectorModelUnavailableError("test model unavailable")
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / "output"
+            with patch("vector_pdf_fusion_pipeline.convert_from_path", self._stub_render):
+                result = analyze_vector_pdf_page(
+                    self._make_room_with_door_gap_pdf(root),
+                    1,
+                    output,
+                    model_config=object(),
+                    model_runner=unavailable_runner,
+                )
+
+            self.assertFalse(result["exterior_topology"]["confirmed"])
+            payload = json.loads((output / "pdf_exterior_topology.json").read_text(encoding="utf-8"))
+            self.assertFalse(payload["confirmed"])
+            self.assertFalse(payload["load_geometry_ready"])
+            self.assertEqual(payload["status"], "model_unavailable")
+
+    def test_crop_exterior_and_openings_are_local_with_page_traceability(self):
+        """Cropping must not leak page-space geometry into review artifacts."""
+        from vector_pdf_fusion_pipeline import analyze_vector_pdf_page
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / "output"
+            crop = [40, 25, 520, 400]
+            with patch("vector_pdf_fusion_pipeline.convert_from_path", self._stub_render):
+                result = analyze_vector_pdf_page(
+                    self._make_room_with_door_gap_pdf(root),
+                    1,
+                    output,
+                    model_config=object(),
+                    crop_bbox_page_px=crop,
+                    model_runner=self._opening_runner,
+                )
+
+            for opening in result["opening_candidates"]["accepted_openings"]:
+                for point in (opening["start_px"], opening["end_px"]):
+                    self.assertGreaterEqual(point[0], 0)
+                    self.assertGreaterEqual(point[1], 0)
+                    self.assertLess(point[0], result["page"]["analysis_size_px"][0])
+                    self.assertLess(point[1], result["page"]["analysis_size_px"][1])
+            self.assertTrue(result["opening_candidates"]["accepted_openings"])
+            self.assertEqual(result["exterior_topology"]["provenance"]["coordinate_space"], "crop-local-px")
+            self.assertEqual(result["exterior_topology"]["provenance"]["crop_bbox_page_px"], crop)
+            self.assertEqual(result["exterior_topology"]["provenance"]["page_number"], 1)
 
     def test_model_failure_publishes_partial_native_diagnostics(self):
         from vector_pdf_fusion_pipeline import analyze_vector_pdf_page

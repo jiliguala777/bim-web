@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 from dataclasses import asdict
 import json
 import os
@@ -14,6 +15,11 @@ import numpy as np
 from pdf2image import convert_from_path
 
 from vector_pdf_fusion import FusionThresholds, build_line_candidates, fuse_line_candidates
+from vector_pdf_exterior import (
+    build_exterior_topology,
+    enumerate_exterior_gaps,
+    select_exterior_walls,
+)
 from vector_pdf_model import (
     VectorModelConfig,
     VectorModelContractError,
@@ -28,6 +34,7 @@ from vector_pdf_native import (
     crop_native_page_data,
     extract_native_pdf_page,
 )
+from vector_pdf_openings import classify_exterior_openings
 from vector_pdf_rooms import RoomClosureThresholds, find_room_candidates
 
 
@@ -120,6 +127,179 @@ def _draw_overlay(
     return overlay
 
 
+def _draw_dashed_line(
+    image: np.ndarray,
+    start: list[int] | tuple[int, int],
+    end: list[int] | tuple[int, int],
+    colour: tuple[int, int, int],
+    *,
+    thickness: int = 2,
+    dash_px: int = 8,
+) -> None:
+    first = np.asarray(start, dtype=np.float64)
+    second = np.asarray(end, dtype=np.float64)
+    vector = second - first
+    length = float(np.linalg.norm(vector))
+    if length == 0:
+        return
+    direction = vector / length
+    for offset in np.arange(0.0, length, dash_px * 2):
+        segment_end = min(length, offset + dash_px)
+        cv2.line(
+            image,
+            tuple(np.rint(first + direction * offset).astype(int)),
+            tuple(np.rint(first + direction * segment_end).astype(int)),
+            colour,
+            thickness=thickness,
+            lineType=cv2.LINE_AA,
+        )
+
+
+def _draw_exterior_overlay(
+    base_bgr: np.ndarray,
+    exterior_walls: list[dict],
+    opening_result: dict,
+    exterior_topology: dict,
+) -> np.ndarray:
+    """Render review-only exterior evidence without changing source geometry."""
+    overlay = base_bgr.copy()
+    polygon = exterior_topology.get("polygon_px") or []
+    if len(polygon) >= 3:
+        footprint = overlay.copy()
+        cv2.fillPoly(
+            footprint,
+            [np.asarray(polygon, dtype=np.int32).reshape(-1, 1, 2)],
+            (180, 0, 180),
+        )
+        overlay = cv2.addWeighted(footprint, 0.25, overlay, 0.75, 0)
+        cv2.polylines(
+            overlay,
+            [np.asarray(polygon, dtype=np.int32).reshape(-1, 1, 2)],
+            isClosed=True,
+            color=(180, 0, 180),
+            thickness=4,
+            lineType=cv2.LINE_AA,
+        )
+    for wall in exterior_walls:
+        cv2.line(
+            overlay,
+            tuple(int(value) for value in wall["start_px"]),
+            tuple(int(value) for value in wall["end_px"]),
+            (0, 180, 0),
+            thickness=2,
+            lineType=cv2.LINE_AA,
+        )
+    opening_colours = {"door": (255, 0, 0), "window": (255, 255, 0)}
+    for opening in opening_result.get("accepted_openings", []):
+        colour = opening_colours.get(opening.get("kind"))
+        if colour is None:
+            continue
+        cv2.line(
+            overlay,
+            tuple(int(value) for value in opening["start_px"]),
+            tuple(int(value) for value in opening["end_px"]),
+            colour,
+            thickness=3,
+            lineType=cv2.LINE_AA,
+        )
+    for bridge in exterior_topology.get("bridges", []):
+        colour = (255, 0, 0) if bridge.get("bridge_type") == "opening_bridge" else (0, 165, 255)
+        _draw_dashed_line(overlay, bridge["start_px"], bridge["end_px"], colour)
+    for gap in exterior_topology.get("unresolved_gaps", []):
+        _draw_dashed_line(overlay, gap["start_px"], gap["end_px"], (0, 0, 255))
+    return overlay
+
+
+def _exterior_provenance(
+    page_data: dict,
+    page_number: int,
+    analysis_size: tuple[int, int],
+    roi: list[int] | None,
+) -> dict:
+    crop_bbox = copy.deepcopy(page_data.get("crop_bbox_page_px"))
+    return {
+        "coordinate_space": "crop-local-px" if crop_bbox is not None else "page-local-px",
+        "page_number": page_number,
+        "page_size_pt": copy.deepcopy(page_data["page_size_pt"]),
+        "analysis_size_px": list(analysis_size),
+        "crop_bbox_page_px": crop_bbox,
+        "building_roi_px": copy.deepcopy(roi),
+    }
+
+
+def _empty_exterior_topology(status: str) -> dict:
+    return {
+        "format": "pdf-exterior-topology/1",
+        "status": status,
+        "confirmed": False,
+        "polygon_px": [],
+        "area_px2": 0.0,
+        "perimeter_px": 0.0,
+        "area_m2": None,
+        "perimeter_m": None,
+        "source_wall_ids": [],
+        "bridge_ids": [],
+        "opening_ids": [],
+        "bridges": [],
+        "unresolved_gaps": [],
+        "load_geometry_ready": False,
+    }
+
+
+def _publish_exterior_artifacts(
+    output: Path,
+    base_bgr: np.ndarray,
+    page_data: dict,
+    page_number: int,
+    image_size: tuple[int, int],
+    roi: list[int] | None,
+    exterior_walls: list[dict],
+    gaps: list[dict],
+    opening_result: dict,
+    exterior: dict,
+) -> tuple[dict, dict, dict]:
+    """Atomically publish all unconfirmed exterior-review artifacts."""
+    provenance = _exterior_provenance(page_data, page_number, image_size, roi)
+    opening_candidates = {
+        "format": "pdf-opening-candidates/1",
+        "status": exterior["status"],
+        "confirmed": False,
+        "load_geometry_ready": False,
+        "provenance": provenance,
+        "gaps": copy.deepcopy(gaps),
+        "accepted_openings": copy.deepcopy(opening_result["accepted_openings"]),
+        "ambiguous_openings": copy.deepcopy(opening_result["ambiguous_openings"]),
+        "unclassified_gaps": copy.deepcopy(opening_result["unclassified_gaps"]),
+    }
+    exterior_topology = {
+        **copy.deepcopy(exterior),
+        "confirmed": False,
+        "load_geometry_ready": False,
+        "unresolved": copy.deepcopy(exterior.get("unresolved_gaps", [])),
+        "provenance": provenance,
+    }
+    exterior_summary = {
+        "exterior_wall_count": len(exterior_walls),
+        "accepted_gap_count": sum(gap.get("decision") == "accepted_gap" for gap in gaps),
+        "rejected_gap_count": sum(gap.get("decision") != "accepted_gap" for gap in gaps),
+        "accepted_opening_count": len(opening_result["accepted_openings"]),
+        "ambiguous_opening_count": len(opening_result["ambiguous_openings"]),
+        "unclassified_gap_count": len(opening_result["unclassified_gaps"]),
+        "bridge_count": len(exterior_topology["bridges"]),
+        "unresolved_gap_count": len(exterior_topology["unresolved"]),
+        "footprint_status": exterior_topology["status"],
+        "confirmed": False,
+        "load_geometry_ready": False,
+    }
+    _write_json(output / "pdf_opening_candidates.json", opening_candidates)
+    _write_json(output / "pdf_exterior_topology.json", exterior_topology)
+    _write_image(
+        output / "pdf_exterior_overlay.png",
+        _draw_exterior_overlay(base_bgr, exterior_walls, opening_result, exterior_topology),
+    )
+    return opening_candidates, exterior_topology, exterior_summary
+
+
 def analyze_vector_pdf_page(
     pdf_path: str | Path,
     page_number: int,
@@ -137,6 +317,19 @@ def analyze_vector_pdf_page(
     page_data = extract_native_pdf_page(pdf_path, page_index=page_number - 1, dpi=100)
     if not page_data["is_vector_pdf"]:
         _write_json(output / "pdf_native_candidates.json", page_data)
+        render_width, render_height = (int(value) for value in page_data["render_size_px"])
+        exterior_openings, exterior_topology, exterior_summary = _publish_exterior_artifacts(
+            output,
+            np.full((render_height, render_width, 3), 255, dtype=np.uint8),
+            page_data,
+            page_number,
+            (render_width, render_height),
+            None,
+            [],
+            [],
+            {"accepted_openings": [], "ambiguous_openings": [], "unclassified_gaps": []},
+            _empty_exterior_topology("not_vector_pdf"),
+        )
         rejected = {
             "format": "pdf-vector-fusion/1",
             "status": "rejected",
@@ -153,6 +346,9 @@ def analyze_vector_pdf_page(
             "line_candidates": [],
             "topology": {"merged_lines": [], "snaps": []},
             "room_candidates": [],
+            "opening_candidates": exterior_openings,
+            "exterior_topology": exterior_topology,
+            "exterior_summary": exterior_summary,
             "summary": {
                 "accepted_wall_count": 0,
                 "rejected_line_count": 0,
@@ -258,6 +454,23 @@ def analyze_vector_pdf_page(
             "summary": summary,
             "reason_codes": [reason],
         }
+        exterior_openings, exterior_topology, exterior_summary = _publish_exterior_artifacts(
+            output,
+            render_bgr,
+            page_data,
+            page_number,
+            (width, height),
+            roi,
+            [],
+            [],
+            {"accepted_openings": [], "ambiguous_openings": [], "unclassified_gaps": []},
+            _empty_exterior_topology(reason),
+        )
+        diagnostic.update({
+            "opening_candidates": exterior_openings,
+            "exterior_topology": exterior_topology,
+            "exterior_summary": exterior_summary,
+        })
         _write_json(output / "pdf_vector_fusion.json", diagnostic)
         _write_image(
             output / "pdf_vector_fusion_overlay.png",
@@ -277,6 +490,38 @@ def analyze_vector_pdf_page(
         (width, height),
         roi,
         room_thresholds,
+    )
+    exterior_walls = select_exterior_walls(
+        candidates,
+        model_result.probabilities,
+        (width, height),
+        roi,
+    )
+    gaps = enumerate_exterior_gaps(exterior_walls, (width, height), roi)
+    opening_result = classify_exterior_openings(
+        gaps,
+        model_result.probabilities,
+        (width, height),
+    )
+    exterior = build_exterior_topology(
+        exterior_walls,
+        gaps,
+        opening_result["accepted_openings"],
+        model_result.probabilities,
+        (width, height),
+        roi,
+    )
+    exterior_openings, exterior_topology, exterior_summary = _publish_exterior_artifacts(
+        output,
+        render_bgr,
+        page_data,
+        page_number,
+        (width, height),
+        roi,
+        exterior_walls,
+        gaps,
+        opening_result,
+        exterior,
     )
     summary = {
         "accepted_wall_count": sum(item["decision"] == "accepted_wall_candidate" for item in candidates),
@@ -313,6 +558,9 @@ def analyze_vector_pdf_page(
             "snaps": topology["snaps"],
         },
         "room_candidates": topology["room_candidates"],
+        "opening_candidates": exterior_openings,
+        "exterior_topology": exterior_topology,
+        "exterior_summary": exterior_summary,
         "summary": summary,
         "reason_codes": [],
     }

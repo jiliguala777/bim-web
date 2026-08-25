@@ -884,7 +884,7 @@
                 <label class="form-label" for="model-backend">识别模型</label>
                 <select id="model-backend" class="form-control">
                     <option value="legacy_onnx">旧 ONNX 四分类模型</option>
-                    <option value="vector_pytorch">新矢量模型（试验版，仅 PNG/JPG）</option>
+                    <option value="vector_pytorch">新矢量模型（矢量 PDF/图片试验版）</option>
                 </select>
             </div>
 
@@ -3271,13 +3271,19 @@
                 hideLoader();
             }
             const vectorBackend = document.getElementById('model-backend').value === 'vector_pytorch';
-            showLoader(vectorBackend
+            const vectorPdfFusion = Boolean(!file && preparedPdf && vectorBackend);
+            const recognitionEndpoint = vectorPdfFusion
+                ? '/energy/vector_pdf_fusion'
+                : '/energy/ai_recognize';
+            showLoader(vectorPdfFusion
+                ? "正在融合 PDF 原生线条与矢量模型概率（调试模式）..."
+                : vectorBackend
                 ? "矢量模型正在识别房间、墙、门窗（试验版）..."
                 : "ONNX 引擎正在提取空间构件 (红墙/蓝窗/绿门)...");
             updatePdfRecognitionControls();
 
             try {
-                const response = await fetch('/energy/ai_recognize', {
+                const response = await fetch(recognitionEndpoint, {
                     method: 'POST',
                     body: fd,
                     signal: requestController.signal
@@ -3298,6 +3304,25 @@
                     currentSelection
                 )) {
                     return false;
+                }
+
+                if (data.fusion_debug) {
+                    aiResultData = null;
+                    const images = data.images || {};
+                    document.getElementById('imgOriginal').src = images.original
+                        ? 'data:image/png;base64,' + images.original
+                        : '';
+                    document.getElementById('imgOverlay').src = images.overlay
+                        ? 'data:image/png;base64,' + images.overlay
+                        : '';
+                    document.getElementById('aiRecognitionResults').classList.remove('hidden');
+
+                    const summary = data.summary || {};
+                    const closureSummary = document.getElementById('room-closure-summary');
+                    closureSummary.innerText = `调试结果，尚不可用于能耗计算：墙候选 ${Number(summary.accepted_wall_count || 0)} 条，其他线 ${Number(summary.rejected_line_count || 0)} 条，不确定 ${Number(summary.uncertain_line_count || 0)} 条，闭合房间候选 ${Number(summary.accepted_room_count || 0)} 个。`;
+                    closureSummary.style.color = 'var(--warning)';
+                    document.getElementById('param-floor-area').value = '';
+                    return true;
                 }
 
                 aiResultData = data;

@@ -139,6 +139,16 @@ class EnergyTemplateTests(unittest.TestCase):
         self.assertIn("async function prepareVectorRasterCrop(file)", html)
         self.assertIn("vectorRasterRecognitionMode", html)
 
+    def test_vector_pdf_backend_uses_isolated_debug_route_and_blocks_energy_geometry(self):
+        html = Path("templates/energy.html").read_text(encoding="utf-8")
+
+        self.assertIn("新矢量模型（矢量 PDF/图片试验版）", html)
+        self.assertIn("const vectorPdfFusion = Boolean(!file && preparedPdf && vectorBackend);", html)
+        self.assertIn("'/energy/vector_pdf_fusion'", html)
+        self.assertIn("if (data.fusion_debug)", html)
+        self.assertIn("aiResultData = null;", html)
+        self.assertIn("调试结果，尚不可用于能耗计算", html)
+
     def test_pdf_region_recognition_ui_loads_preview_and_manages_crop_state(self):
         html = Path("templates/energy.html").read_text(encoding="utf-8")
 
@@ -496,7 +506,7 @@ class EnergyTemplateTests(unittest.TestCase):
 
         self.assertLess(
             recognize_segment.index("invalidatePdfRecognitionSelection("),
-            recognize_segment.index("fetch('/energy/ai_recognize'"),
+            recognize_segment.index("fetch(recognitionEndpoint"),
         )
         self.assertLess(calculate_segment.index("invalidateEnergyResult();"), calculate_segment.index("fetch('/energy/ai_simulate'"))
         self.assertNotIn("energyResultData =", calculate_failure)

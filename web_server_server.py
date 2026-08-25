@@ -68,6 +68,20 @@ except Exception as e:
     print(f"Vector FloorPlan AI not available: {e}")
 
 try:
+    from vector_pdf_fusion_pipeline import analyze_vector_pdf_page
+    from vector_pdf_model import VectorModelConfig as VectorPdfModelConfig
+    _vector_pdf_fusion_config = VectorPdfModelConfig.from_environment()
+    if _vector_pdf_fusion_config is None:
+        HAS_VECTOR_PDF_FUSION = False
+    else:
+        _vector_pdf_fusion_config.require_available()
+        HAS_VECTOR_PDF_FUSION = True
+except Exception as e:
+    _vector_pdf_fusion_config = None
+    HAS_VECTOR_PDF_FUSION = False
+    print(f"Vector PDF fusion not available: {e}")
+
+try:
     from vector_pdf_scale import (
         build_dimension_annotation_mask,
         build_nonstructural_vector_mask,
@@ -1652,6 +1666,87 @@ def energy_pdf_recognition_state_helper():
         'pdf_recognition_state.js',
         mimetype='application/javascript',
     )
+
+
+@app.route('/energy/vector_pdf_fusion', methods=['POST'])
+@login_required
+def vector_pdf_fusion():
+    """Publish isolated native-PDF/model diagnostics without energy geometry."""
+    if not HAS_VECTOR_PDF_FUSION or _vector_pdf_fusion_config is None:
+        return jsonify({'error': 'Vector PDF fusion module is not configured'}), 501
+    report_number = secure_filename(request.form.get('report_number', 'default')) or 'default'
+    try:
+        pdf_path, page_number, page_count = _validated_prepared_pdf(
+            report_number,
+            request.form.get('pdf_upload_token', '').strip(),
+            request.form.get('pdf_page_number', '1'),
+        )
+        region_request = parse_crop_region_request(
+            request.form.get('recognition_mode', 'full_page'),
+            request.form.get('crop_bbox_px'),
+            request.form.get('crop_preview_size'),
+        )
+        crop_bbox_page_px = None
+        if region_request['mode'] == 'crop_region':
+            import pdfplumber
+
+            with pdfplumber.open(str(pdf_path)) as document:
+                page = document.pages[page_number - 1]
+                render_size = [
+                    round(float(page.width) * 100 / 72),
+                    round(float(page.height) * 100 / 72),
+                ]
+            crop_bbox_page_px = map_crop_bbox_to_page(
+                region_request['crop_bbox_px'],
+                region_request['preview_size'],
+                render_size,
+            )
+    except ValueError as exc:
+        return jsonify({'error': str(exc)}), 400
+
+    target_dir = Path(app.config['UPLOAD_FOLDER']) / 'energy' / report_number / 'vector_pdf_fusion'
+    try:
+        result = analyze_vector_pdf_page(
+            pdf_path,
+            page_number,
+            target_dir,
+            _vector_pdf_fusion_config,
+            crop_bbox_page_px=crop_bbox_page_px,
+        )
+        original = cv2.imread(str(target_dir / 'pdf_vector_model_input.png'), cv2.IMREAD_COLOR)
+        overlay = cv2.imread(str(target_dir / 'pdf_vector_fusion_overlay.png'), cv2.IMREAD_COLOR)
+        images = {}
+        if original is not None:
+            encoded, buffer = cv2.imencode('.png', original)
+            if encoded:
+                images['original'] = base64.b64encode(buffer).decode('utf-8')
+        if overlay is not None:
+            encoded, buffer = cv2.imencode('.png', overlay)
+            if encoded:
+                images['overlay'] = base64.b64encode(buffer).decode('utf-8')
+    except ValueError as exc:
+        return jsonify({'error': str(exc)}), 400
+    except Exception as exc:
+        return jsonify({'error': f'Vector PDF fusion failed: {exc}'}), 500
+
+    return jsonify({
+        'success': True,
+        'fusion_debug': True,
+        'status': result['status'],
+        'load_geometry_ready': False,
+        'pdf_page_number': page_number,
+        'pdf_page_count': page_count,
+        'recognition_mode': region_request['mode'],
+        'crop_bbox_page_px': crop_bbox_page_px,
+        'summary': result.get('summary') or {},
+        'reason_codes': result.get('reason_codes') or [],
+        'artifacts': {
+            'native_candidates': 'vector_pdf_fusion/pdf_native_candidates.json',
+            'fusion': 'vector_pdf_fusion/pdf_vector_fusion.json',
+            'overlay': 'vector_pdf_fusion/pdf_vector_fusion_overlay.png',
+        },
+        'images': images,
+    })
 
 
 @app.route('/energy/ai_recognize', methods=['POST'])

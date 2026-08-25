@@ -161,6 +161,49 @@ class ModelEvidenceFusionTests(unittest.TestCase):
 
         self.assertEqual(result[0]["decision"], "rejected_nonstructural")
         self.assertIn("dimension_overlap", result[0]["reason_codes"])
+        self.assertIsInstance(result[0]["model_evidence"], dict)
+        self.assertGreater(result[0]["model_evidence"]["wall_mean"], 0.0)
+
+    def test_clipped_and_outside_lines_have_stable_empty_sampling(self):
+        from vector_pdf_fusion import FusionThresholds, fuse_line_candidates
+
+        def candidate(line_id, orientation, start, end):
+            return {
+                "candidate_id": line_id,
+                "source_native_id": f"native-{line_id}",
+                "orientation": orientation,
+                "start_px": list(start),
+                "end_px": list(end),
+                "native_evidence": {
+                    "native_structural": True,
+                    "roi_inside_ratio": 1.0,
+                },
+                "model_evidence": None,
+                "decision": "uncertain",
+                "reason_codes": ["model_evidence_pending"],
+            }
+
+        candidates = [
+            candidate("top-clipped", "horizontal", (-20, 0), (20, 0)),
+            candidate("left-clipped", "vertical", (0, -20), (0, 20)),
+            candidate("above-image", "horizontal", (10, -100), (20, -100)),
+            candidate("right-of-image", "vertical", (200, 10), (200, 20)),
+        ]
+        result = fuse_line_candidates(
+            candidates,
+            np.ones((10, 100, 100), dtype=np.float32),
+            (100, 100),
+            [0, 0, 100, 100],
+            FusionThresholds(),
+        )
+        by_id = {item["candidate_id"]: item for item in result}
+
+        self.assertEqual(by_id["top-clipped"]["model_evidence"]["wall_mean"], 1.0)
+        self.assertEqual(by_id["left-clipped"]["model_evidence"]["wall_mean"], 1.0)
+        self.assertEqual(by_id["above-image"]["model_evidence"]["wall_mean"], 0.0)
+        self.assertEqual(by_id["right-of-image"]["model_evidence"]["wall_mean"], 0.0)
+        self.assertEqual(by_id["above-image"]["decision"], "uncertain")
+        self.assertEqual(by_id["right-of-image"]["decision"], "uncertain")
 
     def test_many_short_lines_do_not_allocate_full_page_masks_per_candidate(self):
         from vector_pdf_fusion import FusionThresholds, fuse_line_candidates
@@ -200,6 +243,8 @@ class ModelEvidenceFusionTests(unittest.TestCase):
         elapsed = time.perf_counter() - started
 
         self.assertEqual(len(result), 500)
+        self.assertTrue(all(item["decision"] == "uncertain" for item in result))
+        self.assertTrue(all(item["model_evidence"]["wall_mean"] == 0.0 for item in result))
         self.assertLess(elapsed, 1.5, f"500 short-line samples took {elapsed:.3f}s")
 
 

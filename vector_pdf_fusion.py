@@ -156,9 +156,6 @@ def fuse_line_candidates(
     results = []
     for original in candidates:
         item = copy.deepcopy(original)
-        if item["decision"] == "rejected_nonstructural":
-            results.append(item)
-            continue
         start = item["start_px"]
         end = item["end_px"]
         offset = radius * 2 + 1
@@ -172,15 +169,20 @@ def fuse_line_candidates(
             start, end, first_start, first_end, second_start, second_end,
         )
         padding = radius * 2 + 3
-        left = max(0, min(point[0] for point in sample_points) - padding)
-        top = max(0, min(point[1] for point in sample_points) - padding)
-        right = min(width, max(point[0] for point in sample_points) + padding + 1)
-        bottom = min(height, max(point[1] for point in sample_points) + padding + 1)
+        left = min(width, max(0, min(point[0] for point in sample_points) - padding))
+        top = min(height, max(0, min(point[1] for point in sample_points) - padding))
+        right = min(width, max(0, max(point[0] for point in sample_points) + padding + 1))
+        bottom = min(height, max(0, max(point[1] for point in sample_points) + padding + 1))
         window_shape = (max(0, bottom - top), max(0, right - left))
         origin = (left, top)
-        center = _local_line_mask(window_shape, start, end, radius * 2 + 1, origin)
-        first_side = _local_line_mask(window_shape, first_start, first_end, radius + 1, origin)
-        second_side = _local_line_mask(window_shape, second_start, second_end, radius + 1, origin)
+        if window_shape[0] and window_shape[1]:
+            center = _local_line_mask(window_shape, start, end, radius * 2 + 1, origin)
+            first_side = _local_line_mask(window_shape, first_start, first_end, radius + 1, origin)
+            second_side = _local_line_mask(window_shape, second_start, second_end, radius + 1, origin)
+        else:
+            center = np.zeros(window_shape, dtype=bool)
+            first_side = np.zeros(window_shape, dtype=bool)
+            second_side = np.zeros(window_shape, dtype=bool)
         local_values = values[:, top:bottom, left:right]
 
         wall_mean, wall_p90, _ = _sample(local_values[4], center)
@@ -204,6 +206,9 @@ def fuse_line_candidates(
         }
         item["model_evidence"] = model_evidence
 
+        if item["decision"] == "rejected_nonstructural":
+            results.append(item)
+            continue
         native = item["native_evidence"]
         roi_ratio = native.get("roi_inside_ratio")
         roi_supported = roi_ratio is not None and roi_ratio >= thresholds.roi_inside_ratio_min

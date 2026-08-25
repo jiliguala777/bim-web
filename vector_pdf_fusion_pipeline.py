@@ -175,6 +175,20 @@ def analyze_vector_pdf_page(
     if len(rendered) != 1:
         raise ValueError("PDF renderer did not return exactly one selected page")
     render_bgr = cv2.cvtColor(np.asarray(rendered[0]), cv2.COLOR_RGB2BGR)
+    actual_height, actual_width = render_bgr.shape[:2]
+    actual_render_size = [actual_width, actual_height]
+    if page_data["render_size_px"] != actual_render_size:
+        page_data["render_size_px"] = actual_render_size
+        roi_record = page_data.get("building_roi") or {}
+        if roi_record.get("enabled") and roi_record.get("bbox_pt"):
+            page_width, page_height = (float(value) for value in page_data["page_size_pt"])
+            x0, y0, x1, y1 = (float(value) for value in roi_record["bbox_pt"])
+            roi_record["bbox_px"] = [
+                round(x0 * actual_width / page_width),
+                round(y0 * actual_height / page_height),
+                round(x1 * actual_width / page_width),
+                round(y1 * actual_height / page_height),
+            ]
     dimension_mask = build_dimension_mask(page_data)
     cleaned_bgr = _remove_masked_annotations(render_bgr, dimension_mask)
     if crop_bbox_page_px is not None:

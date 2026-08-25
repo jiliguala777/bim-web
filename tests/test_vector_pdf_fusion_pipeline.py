@@ -3,6 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import cv2
 import numpy as np
 from PIL import Image
 from reportlab.pdfgen import canvas
@@ -108,6 +109,38 @@ class VectorPdfFusionPipelineTests(unittest.TestCase):
             self.assertEqual(payload["status"], "partial")
             self.assertTrue(payload["line_candidates"])
             self.assertTrue(all(item["model_evidence"] is None for item in payload["line_candidates"]))
+
+    def test_poppler_rounding_difference_uses_actual_render_dimensions(self):
+        from vector_pdf_fusion_pipeline import analyze_vector_pdf_page
+
+        observed = {}
+
+        def unavailable_runner(image_path, artifact_parent, config, *, expected_size):
+            image = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
+            observed["image_size"] = (image.shape[1], image.shape[0])
+            observed["expected_size"] = expected_size
+            raise VectorModelUnavailableError("test model unavailable")
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            pdf_path = root / "fractional-render-size.pdf"
+            pdf = canvas.Canvas(str(pdf_path), pagesize=(238.4, 168.4))
+            pdf.setStrokeColorRGB(0, 0, 0)
+            pdf.rect(20, 20, 198, 128, stroke=1, fill=0)
+            pdf.rect(60, 50, 118, 68, stroke=1, fill=0)
+            pdf.save()
+
+            result = analyze_vector_pdf_page(
+                pdf_path,
+                1,
+                root / "output",
+                model_config=object(),
+                model_runner=unavailable_runner,
+            )
+
+        self.assertEqual(result["status"], "partial")
+        self.assertEqual(observed["expected_size"], observed["image_size"])
+        self.assertEqual(result["page"]["analysis_size_px"], list(observed["image_size"]))
 
     def test_image_only_pdf_is_rejected_before_model_runs(self):
         from vector_pdf_fusion_pipeline import analyze_vector_pdf_page

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 from dataclasses import asdict
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -38,21 +39,29 @@ from vector_pdf_openings import classify_exterior_openings
 from vector_pdf_rooms import RoomClosureThresholds, find_room_candidates
 
 
-def _write_json(path: Path, payload: dict) -> None:
+def _write_json(path: Path, payload: dict) -> bytes:
+    raw = (
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+            allow_nan=False,
+        )
+        + "\n"
+    ).encode("utf-8")
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = None
     try:
         with tempfile.NamedTemporaryFile(
-            mode="w",
-            encoding="utf-8",
+            mode="wb",
             dir=path.parent,
             prefix=f".{path.name}.",
             suffix=".tmp",
             delete=False,
         ) as handle:
             temporary = Path(handle.name)
-            json.dump(payload, handle, ensure_ascii=False, indent=2, sort_keys=True, allow_nan=False)
-            handle.write("\n")
+            handle.write(raw)
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary, path)
@@ -60,6 +69,7 @@ def _write_json(path: Path, payload: dict) -> None:
         if temporary is not None:
             temporary.unlink(missing_ok=True)
         raise
+    return raw
 
 
 def _write_image(path: Path, image: np.ndarray) -> None:
@@ -292,7 +302,8 @@ def _publish_exterior_artifacts(
         "confirmed": False,
         "load_geometry_ready": False,
     }
-    _write_json(output / "pdf_opening_candidates.json", opening_candidates)
+    opening_raw = _write_json(output / "pdf_opening_candidates.json", opening_candidates)
+    exterior_topology["opening_artifact_sha256"] = hashlib.sha256(opening_raw).hexdigest()
     _write_json(output / "pdf_exterior_topology.json", exterior_topology)
     _write_image(
         output / "pdf_exterior_overlay.png",

@@ -2293,7 +2293,7 @@ def vector_pdf_exterior_confirm():
         topology_raw, topology = _read_exterior_artifact(
             artifact_dir, 'pdf_exterior_topology.json',
         )
-        _, opening_artifact = _read_exterior_artifact(
+        opening_raw, opening_artifact = _read_exterior_artifact(
             artifact_dir, 'pdf_opening_candidates.json',
         )
     except FileNotFoundError as exc:
@@ -2304,6 +2304,15 @@ def vector_pdf_exterior_confirm():
     current_hash = hashlib.sha256(topology_raw).hexdigest()
     if not hmac.compare_digest(current_hash, supplied_hash.lower()):
         return jsonify({'error': 'Exterior topology has changed; review it again'}), 409
+
+    opening_hash = topology.get('opening_artifact_sha256')
+    if (
+        not isinstance(opening_hash, str)
+        or len(opening_hash) != 64
+        or any(character not in '0123456789abcdef' for character in opening_hash)
+        or not hmac.compare_digest(hashlib.sha256(opening_raw).hexdigest(), opening_hash)
+    ):
+        return jsonify({'error': 'Opening artifact has changed; review it again'}), 409
 
     try:
         provenance, artifact_page, artifact_crop, image_size = _artifact_provenance(

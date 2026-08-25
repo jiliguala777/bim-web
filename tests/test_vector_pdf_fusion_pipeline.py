@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 import shutil
@@ -172,8 +173,13 @@ class VectorPdfFusionPipelineTests(unittest.TestCase):
             self.assertTrue((output / "pdf_opening_candidates.json").is_file())
             self.assertTrue((output / "pdf_exterior_topology.json").is_file())
             self.assertTrue((output / "pdf_exterior_overlay.png").is_file())
-            openings = json.loads((output / "pdf_opening_candidates.json").read_text(encoding="utf-8"))
+            openings_raw = (output / "pdf_opening_candidates.json").read_bytes()
+            openings = json.loads(openings_raw)
             exterior = json.loads((output / "pdf_exterior_topology.json").read_text(encoding="utf-8"))
+            self.assertEqual(
+                exterior["opening_artifact_sha256"],
+                hashlib.sha256(openings_raw).hexdigest(),
+            )
             self.assertIn("accepted_openings", openings)
             self.assertIn("ambiguous_openings", openings)
             self.assertIn("unclassified_gaps", openings)
@@ -211,10 +217,19 @@ class VectorPdfFusionPipelineTests(unittest.TestCase):
 
             self.assertFalse(result["exterior_topology"]["confirmed"])
             payload = json.loads((output / "pdf_exterior_topology.json").read_text(encoding="utf-8"))
+            openings_raw = (output / "pdf_opening_candidates.json").read_bytes()
+            empty_openings = json.loads(openings_raw)
             self.assertFalse(payload["confirmed"])
             self.assertFalse(payload["load_geometry_ready"])
             self.assertEqual(payload["status"], "model_unavailable")
             self.assertEqual(payload["real_wall_segments"], [])
+            self.assertEqual(empty_openings["accepted_openings"], [])
+            self.assertEqual(empty_openings["ambiguous_openings"], [])
+            self.assertEqual(empty_openings["unclassified_gaps"], [])
+            self.assertEqual(
+                payload["opening_artifact_sha256"],
+                hashlib.sha256(openings_raw).hexdigest(),
+            )
 
     def test_crop_exterior_and_openings_are_local_with_page_traceability(self):
         """Cropping must not leak page-space geometry into review artifacts."""

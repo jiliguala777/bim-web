@@ -102,17 +102,17 @@ class VectorPdfExteriorConfirmRouteTests(unittest.TestCase):
         artifact_dir = report_dir / "vector_pdf_fusion"
         artifact_dir.mkdir(parents=True)
         topology_path = artifact_dir / "pdf_exterior_topology.json"
+        opening_raw = json.dumps(openings).encode("utf-8")
+        (artifact_dir / "pdf_opening_candidates.json").write_bytes(opening_raw)
+        topology["opening_artifact_sha256"] = hashlib.sha256(opening_raw).hexdigest()
         topology_path.write_text(json.dumps(topology), encoding="utf-8")
-        (artifact_dir / "pdf_opening_candidates.json").write_text(
-            json.dumps(openings), encoding="utf-8",
-        )
         return topology, openings, topology_path
 
     def _post_artifacts(self, upload_root, topology, openings, topology_path):
+        opening_raw = json.dumps(openings).encode("utf-8")
+        (topology_path.parent / "pdf_opening_candidates.json").write_bytes(opening_raw)
+        topology["opening_artifact_sha256"] = hashlib.sha256(opening_raw).hexdigest()
         topology_path.write_text(json.dumps(topology), encoding="utf-8")
-        (topology_path.parent / "pdf_opening_candidates.json").write_text(
-            json.dumps(openings), encoding="utf-8",
-        )
         previous = self.server.app.config["UPLOAD_FOLDER"]
         self.server.app.config["UPLOAD_FOLDER"] = str(upload_root)
         try:
@@ -221,6 +221,62 @@ class VectorPdfExteriorConfirmRouteTests(unittest.TestCase):
 
             self.assertEqual(response.status_code, 409, response.get_json())
             self.assertEqual(recognition_path.read_bytes(), before)
+
+    def test_confirm_rejects_any_opening_artifact_byte_change_without_overwrite(self):
+        for field, value in (("kind", "window"), ("confidence", 0.1)):
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as directory:
+                upload_root = Path(directory)
+                report_dir = upload_root / "energy" / "EXT-1"
+                topology, openings, topology_path = self._artifacts(report_dir)
+                opening_path = topology_path.parent / "pdf_opening_candidates.json"
+
+                opening_raw = json.dumps(openings).encode("utf-8")
+                opening_path.write_bytes(opening_raw)
+                topology["opening_artifact_sha256"] = hashlib.sha256(opening_raw).hexdigest()
+                topology_path.write_text(json.dumps(topology), encoding="utf-8")
+
+                recognition_path = report_dir / "recognition.json"
+                recognition_path.write_bytes(b'{"sentinel": true}\n')
+                before = recognition_path.read_bytes()
+                openings["accepted_openings"][0][field] = value
+                opening_path.write_text(json.dumps(openings), encoding="utf-8")
+
+                previous = self.server.app.config["UPLOAD_FOLDER"]
+                self.server.app.config["UPLOAD_FOLDER"] = str(upload_root)
+                try:
+                    response = self.client.post(
+                        "/energy/vector_pdf_exterior_confirm",
+                        json=self._payload(topology_path),
+                    )
+                finally:
+                    self.server.app.config["UPLOAD_FOLDER"] = previous
+
+                self.assertEqual(response.status_code, 409, response.get_json())
+                self.assertEqual(recognition_path.read_bytes(), before)
+
+    def test_confirm_rejects_noncanonical_opening_artifact_digest(self):
+        for digest in (None, "0" * 63, "g" * 64, "A" * 64):
+            with self.subTest(digest=digest), tempfile.TemporaryDirectory() as directory:
+                upload_root = Path(directory)
+                report_dir = upload_root / "energy" / "EXT-1"
+                topology, _, topology_path = self._artifacts(report_dir)
+                topology["opening_artifact_sha256"] = digest
+                topology_path.write_text(json.dumps(topology), encoding="utf-8")
+                recognition_path = report_dir / "recognition.json"
+                recognition_path.write_bytes(b"preserve")
+
+                previous = self.server.app.config["UPLOAD_FOLDER"]
+                self.server.app.config["UPLOAD_FOLDER"] = str(upload_root)
+                try:
+                    response = self.client.post(
+                        "/energy/vector_pdf_exterior_confirm",
+                        json=self._payload(topology_path),
+                    )
+                finally:
+                    self.server.app.config["UPLOAD_FOLDER"] = previous
+
+                self.assertEqual(response.status_code, 409, response.get_json())
+                self.assertEqual(recognition_path.read_bytes(), b"preserve")
 
     def test_confirm_rejects_non_unique_or_unreferenced_opening_ids(self):
         cases = ("duplicate topology opening id", "extra accepted opening")

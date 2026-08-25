@@ -48,6 +48,15 @@ class VectorPdfFusionRouteTests(unittest.TestCase):
                     "polygon_px": [[0, 0], [20, 0], [20, 10], [0, 10]],
                     "area_px2": 200.0,
                     "perimeter_px": 60.0,
+                    "source_wall_ids": ["wall-1", "wall-2", "wall-3", "wall-4"],
+                    "bridge_ids": [],
+                    "opening_ids": [],
+                    "real_wall_segments": [
+                        {"segment_id": "real-wall-1", "orientation": "horizontal", "start_px": [0, 0], "end_px": [20, 0], "length_px": 20.0, "source_wall_ids": ["wall-1"]},
+                        {"segment_id": "real-wall-2", "orientation": "vertical", "start_px": [20, 0], "end_px": [20, 10], "length_px": 10.0, "source_wall_ids": ["wall-2"]},
+                        {"segment_id": "real-wall-3", "orientation": "horizontal", "start_px": [0, 10], "end_px": [20, 10], "length_px": 20.0, "source_wall_ids": ["wall-3"]},
+                        {"segment_id": "real-wall-4", "orientation": "vertical", "start_px": [0, 0], "end_px": [0, 10], "length_px": 10.0, "source_wall_ids": ["wall-4"]},
+                    ],
                     "bridges": [],
                     "unresolved_gaps": [],
                     "provenance": {

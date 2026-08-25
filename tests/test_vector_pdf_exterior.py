@@ -266,6 +266,22 @@ class ExteriorTopologyTests(unittest.TestCase):
         self.assertEqual(topology["source_wall_ids"], [
             "bottom-left", "bottom-right", "left", "right", "top",
         ])
+        self.assertEqual(
+            sum(segment["length_px"] for segment in topology["real_wall_segments"]),
+            220.0,
+        )
+        self.assertEqual(
+            sum(bridge["width_px"] for bridge in topology["bridges"]), 20.0,
+        )
+        self.assertEqual(
+            len({segment["segment_id"] for segment in topology["real_wall_segments"]}),
+            len(topology["real_wall_segments"]),
+        )
+        self.assertTrue(all(
+            segment["source_wall_ids"]
+            and all(isinstance(source_id, str) and source_id for source_id in segment["source_wall_ids"])
+            for segment in topology["real_wall_segments"]
+        ))
         self.assertNotIn("opening-0001", topology["source_wall_ids"])
         self.assertFalse(topology["confirmed"])
         self.assertFalse(topology["load_geometry_ready"])
@@ -388,6 +404,14 @@ class ExteriorTopologyTests(unittest.TestCase):
 
         self.assertIn("duplicate-top", topology["source_wall_ids"])
         self.assertEqual(len(topology["source_wall_ids"]), 5)
+        top_segments = [
+            segment for segment in topology["real_wall_segments"]
+            if segment["orientation"] == "horizontal" and segment["start_px"][1] == 20
+        ]
+        self.assertEqual(len(top_segments), 1)
+        self.assertEqual(
+            top_segments[0]["source_wall_ids"], ["duplicate-top", "wall-1"],
+        )
 
     def test_open_wall_chain_has_no_bounding_rectangle_fallback(self):
         from vector_pdf_exterior import build_exterior_topology
@@ -402,6 +426,7 @@ class ExteriorTopologyTests(unittest.TestCase):
         self.assertEqual(topology["status"], "exterior_not_closed")
         self.assertEqual(topology["polygon_px"], [])
         self.assertEqual(topology["area_px2"], 0.0)
+        self.assertEqual(topology["real_wall_segments"], [])
 
     def test_multiple_comparable_faces_are_ambiguous(self):
         from vector_pdf_exterior import build_exterior_topology

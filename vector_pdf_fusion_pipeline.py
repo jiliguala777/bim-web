@@ -240,6 +240,7 @@ def _empty_exterior_topology(status: str) -> dict:
         "source_wall_ids": [],
         "bridge_ids": [],
         "opening_ids": [],
+        "real_wall_segments": [],
         "bridges": [],
         "unresolved_gaps": [],
         "load_geometry_ready": False,

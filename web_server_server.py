@@ -1639,37 +1639,106 @@ def _normalized_crop_bbox(value, name):
     return list(value)
 
 
-def _artifact_provenance(topology, opening_artifact):
-    topology_provenance = topology.get('provenance')
-    opening_provenance = opening_artifact.get('provenance')
-    if not isinstance(topology_provenance, dict) or opening_provenance != topology_provenance:
-        raise RuntimeError('Exterior artifact provenance does not match')
-    page_number = topology_provenance.get('page_number')
+def _strict_provenance(value, name):
+    required_fields = {
+        'coordinate_space', 'page_number', 'page_size_pt', 'analysis_size_px',
+        'crop_bbox_page_px', 'building_roi_px',
+    }
+    if not isinstance(value, dict) or set(value) != required_fields:
+        raise RuntimeError(f'{name} provenance schema is invalid')
+    page_number = value.get('page_number')
     if isinstance(page_number, bool) or not isinstance(page_number, int) or page_number < 1:
-        raise RuntimeError('Exterior artifact page number is invalid')
-    try:
-        crop_bbox = _normalized_crop_bbox(
-            topology_provenance.get('crop_bbox_page_px'),
-            'artifact crop_bbox_page_px',
-        )
-    except ValueError as exc:
-        raise RuntimeError(str(exc)) from exc
-    image_size = topology_provenance.get('analysis_size_px')
+        raise RuntimeError(f'{name} provenance page number is invalid')
+    page_size = value.get('page_size_pt')
+    if not isinstance(page_size, list) or len(page_size) != 2:
+        raise RuntimeError(f'{name} provenance page size is invalid')
+    for item in page_size:
+        if isinstance(item, bool) or not isinstance(item, (int, float)):
+            raise RuntimeError(f'{name} provenance page size is invalid')
+        try:
+            finite = math.isfinite(float(item))
+        except (ValueError, OverflowError):
+            finite = False
+        if not finite or item <= 0:
+            raise RuntimeError(f'{name} provenance page size is invalid')
+    image_size = value.get('analysis_size_px')
     if (
         not isinstance(image_size, list)
         or len(image_size) != 2
         or any(isinstance(item, bool) or not isinstance(item, int) or item <= 0 for item in image_size)
     ):
-        raise RuntimeError('Exterior artifact image size is invalid')
-    return topology_provenance, page_number, crop_bbox, list(image_size)
+        raise RuntimeError(f'{name} provenance image size is invalid')
+    try:
+        crop_bbox = _normalized_crop_bbox(
+            value.get('crop_bbox_page_px'), f'{name} provenance crop_bbox_page_px',
+        )
+    except ValueError as exc:
+        raise RuntimeError(str(exc)) from exc
+    expected_space = 'page-local-px' if crop_bbox is None else 'crop-local-px'
+    if value.get('coordinate_space') != expected_space:
+        raise RuntimeError(f'{name} provenance coordinate space does not match crop')
+    roi = value.get('building_roi_px')
+    if (
+        not isinstance(roi, list)
+        or len(roi) != 4
+        or any(isinstance(item, bool) or not isinstance(item, int) for item in roi)
+    ):
+        raise RuntimeError(f'{name} provenance building ROI is invalid')
+    left, top, right, bottom = roi
+    if (
+        left < 0 or top < 0 or right <= left or bottom <= top
+        or right > image_size[0] or bottom > image_size[1]
+    ):
+        raise RuntimeError(f'{name} provenance building ROI is outside analysis bounds')
+    return copy.deepcopy(value)
+
+
+def _strict_value_equal(left, right):
+    if type(left) is not type(right):
+        return False
+    if isinstance(left, dict):
+        return left.keys() == right.keys() and all(
+            _strict_value_equal(left[key], right[key]) for key in left
+        )
+    if isinstance(left, list):
+        return len(left) == len(right) and all(
+            _strict_value_equal(first, second) for first, second in zip(left, right)
+        )
+    return left == right
+
+
+def _artifact_provenance(topology, opening_artifact):
+    topology_provenance = _strict_provenance(topology.get('provenance'), 'topology')
+    opening_provenance = _strict_provenance(
+        opening_artifact.get('provenance'), 'opening artifact',
+    )
+    if not _strict_value_equal(topology_provenance, opening_provenance):
+        raise RuntimeError('Exterior artifact provenance does not match')
+    return (
+        topology_provenance,
+        topology_provenance['page_number'],
+        topology_provenance['crop_bbox_page_px'],
+        list(topology_provenance['analysis_size_px']),
+    )
 
 
 def _axis_segment(item, name):
     try:
-        start = [float(value) for value in item['start_px']]
-        end = [float(value) for value in item['end_px']]
+        raw_start = item['start_px']
+        raw_end = item['end_px']
     except (KeyError, TypeError, ValueError, OverflowError) as exc:
         raise RuntimeError(f'{name} endpoints are invalid') from exc
+    if (
+        not isinstance(raw_start, list) or not isinstance(raw_end, list)
+        or len(raw_start) != 2 or len(raw_end) != 2
+        or any(
+            isinstance(value, bool) or not isinstance(value, (int, float))
+            for value in raw_start + raw_end
+        )
+    ):
+        raise RuntimeError(f'{name} endpoints are invalid')
+    start = [float(value) for value in raw_start]
+    end = [float(value) for value in raw_end]
     if len(start) != 2 or len(end) != 2 or not all(math.isfinite(value) for value in start + end):
         raise RuntimeError(f'{name} endpoints are invalid')
     if start[1] == end[1] and start[0] != end[0]:
@@ -1685,7 +1754,102 @@ def _axis_segment(item, name):
     return orientation, fixed, interval, start, end
 
 
-def _validate_confirmable_topology(topology, opening_artifact, scale):
+def _strict_string_ids(value, name):
+    if not isinstance(value, list):
+        raise RuntimeError(f'{name} must be a list')
+    if any(not isinstance(item, str) or not item for item in value):
+        raise RuntimeError(f'{name} must contain non-empty strings')
+    if len(value) != len(set(value)):
+        raise RuntimeError(f'{name} must contain unique strings')
+    return list(value)
+
+
+def _metric_matches(value, expected):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    return math.isfinite(number) and math.isclose(
+        number, expected, rel_tol=0.0, abs_tol=math.ulp(expected) * 4,
+    )
+
+
+def _validate_opening_bindings(topology, opening_artifact):
+    source_ids = _strict_string_ids(topology.get('source_wall_ids'), 'source_wall_ids')
+    opening_ids = _strict_string_ids(topology.get('opening_ids'), 'opening_ids')
+    selected_bridge_ids = _strict_string_ids(topology.get('bridge_ids'), 'bridge_ids')
+    bridges = topology.get('bridges')
+    if not isinstance(bridges, list) or any(not isinstance(item, dict) for item in bridges):
+        raise RuntimeError('Exterior topology bridges are invalid')
+    all_bridge_ids = _strict_string_ids(
+        [bridge.get('bridge_id') for bridge in bridges], 'topology bridge IDs',
+    )
+    if set(selected_bridge_ids) != set(all_bridge_ids):
+        raise RuntimeError('Selected bridge IDs must exactly match topology bridges')
+
+    accepted = opening_artifact.get('accepted_openings')
+    if not isinstance(accepted, list) or any(not isinstance(item, dict) for item in accepted):
+        raise RuntimeError('Accepted openings are invalid')
+    accepted_ids = _strict_string_ids(
+        [opening.get('opening_id') for opening in accepted], 'accepted opening IDs',
+    )
+    if set(accepted_ids) != set(opening_ids):
+        raise RuntimeError('Accepted openings must exactly match topology opening_ids')
+
+    opening_by_id = dict(zip(accepted_ids, accepted))
+    opening_bridges = [
+        bridge for bridge in bridges if bridge.get('bridge_type') == 'opening_bridge'
+    ]
+    bridge_opening_ids = _strict_string_ids(
+        [bridge.get('opening_id') for bridge in opening_bridges],
+        'opening bridge opening IDs',
+    )
+    if set(bridge_opening_ids) != set(opening_ids):
+        raise RuntimeError('Opening bridges must exactly match accepted openings')
+
+    source_id_set = set(source_ids)
+    for bridge in opening_bridges:
+        opening_id = bridge['opening_id']
+        opening = opening_by_id[opening_id]
+        bridge_orientation, bridge_fixed, bridge_interval, _, _ = _axis_segment(
+            bridge, f'opening bridge {opening_id}',
+        )
+        opening_orientation, opening_fixed, opening_interval, _, _ = _axis_segment(
+            opening, f'opening {opening_id}',
+        )
+        if (
+            bridge.get('orientation') != bridge_orientation
+            or opening.get('orientation') != opening_orientation
+            or bridge_orientation != opening_orientation
+            or bridge_fixed != opening_fixed
+            or bridge_interval != opening_interval
+        ):
+            raise RuntimeError(f'Opening bridge {opening_id} geometry does not match')
+        width = bridge_interval[1] - bridge_interval[0]
+        if not _metric_matches(bridge.get('width_px'), width) or not _metric_matches(
+            opening.get('width_px'), width,
+        ):
+            raise RuntimeError(f'Opening bridge {opening_id} width does not match endpoints')
+        bridge_hosts = _strict_string_ids(
+            bridge.get('host_wall_ids'), f'opening bridge {opening_id} host_wall_ids',
+        )
+        opening_hosts = _strict_string_ids(
+            opening.get('host_wall_ids'), f'opening {opening_id} host_wall_ids',
+        )
+        if (
+            not bridge_hosts or not opening_hosts
+            or set(bridge_hosts) != set(opening_hosts)
+            or not set(opening_hosts).issubset(source_id_set)
+        ):
+            raise RuntimeError(f'Opening bridge {opening_id} host walls do not match')
+        if opening.get('exterior') is not True or opening.get('kind') not in {'door', 'window'}:
+            raise RuntimeError(f'Opening {opening_id} is not a valid exterior door or window')
+    return accepted
+
+
+def _validate_confirmable_topology(topology, opening_artifact, scale, image_size):
     if (
         topology.get('format') != 'pdf-exterior-topology/1'
         or topology.get('status') != 'review_required'
@@ -1709,16 +1873,50 @@ def _validate_confirmable_topology(topology, opening_artifact, scale):
         polygon_points.pop()
     if len(polygon_points) < 4 or len({tuple(point) for point in polygon_points}) != len(polygon_points):
         raise RuntimeError('Exterior topology is not a single closed candidate')
+    width, height = image_size
+    if any(
+        point[0] < 0 or point[0] > width or point[1] < 0 or point[1] > height
+        for point in polygon_points
+    ):
+        raise RuntimeError('Exterior polygon is outside the analysis image')
+    edges = []
     for index, (start, end) in enumerate(zip(polygon_points, polygon_points[1:] + polygon_points[:1])):
-        _axis_segment({'start_px': start, 'end_px': end}, f'polygon edge {index}')
+        edges.append(_axis_segment(
+            {'start_px': start, 'end_px': end}, f'polygon edge {index}',
+        )[:3])
+    for first_index, first in enumerate(edges):
+        for second_index in range(first_index + 1, len(edges)):
+            if second_index == first_index + 1 or (
+                first_index == 0 and second_index == len(edges) - 1
+            ):
+                continue
+            second = edges[second_index]
+            if first[0] == second[0]:
+                intersects = first[1] == second[1] and max(
+                    first[2][0], second[2][0],
+                ) <= min(first[2][1], second[2][1])
+            else:
+                horizontal, vertical = (
+                    (first, second) if first[0] == 'horizontal' else (second, first)
+                )
+                intersects = (
+                    horizontal[2][0] <= vertical[1] <= horizontal[2][1]
+                    and vertical[2][0] <= horizontal[1] <= vertical[2][1]
+                )
+            if intersects:
+                raise RuntimeError('Exterior polygon has non-adjacent edge intersections')
     signed_area = 0.5 * sum(
         start[0] * end[1] - end[0] * start[1]
         for start, end in zip(polygon_points, polygon_points[1:] + polygon_points[:1])
     )
     if not math.isfinite(signed_area) or signed_area == 0:
         raise RuntimeError('Exterior topology is not a single closed candidate')
-    _positive_finite_number(topology.get('area_px2'), 'topology area_px2')
-    _positive_finite_number(topology.get('perimeter_px'), 'topology perimeter_px')
+    area_px2 = abs(signed_area)
+    perimeter_px = math.fsum(edge[2][1] - edge[2][0] for edge in edges)
+    if not _metric_matches(topology.get('area_px2'), area_px2) or not _metric_matches(
+        topology.get('perimeter_px'), perimeter_px,
+    ):
+        raise RuntimeError('Exterior topology metrics do not match its polygon')
     if topology.get('unresolved_gaps') or topology.get('unresolved'):
         raise RuntimeError('Exterior topology still has unresolved gaps')
     if not isinstance(topology.get('source_wall_ids'), list) or not topology['source_wall_ids']:
@@ -1743,57 +1941,110 @@ def _validate_confirmable_topology(topology, opening_artifact, scale):
             length_m = (interval[1] - interval[0]) * scale
             if not math.isfinite(length_m) or length_m > math.nextafter(0.6, math.inf):
                 raise RuntimeError('Small gap repair exceeds 0.6 m')
-    return polygon_points
+    return polygon_points, area_px2, perimeter_px
 
 
-def _real_exterior_wall_geometry(polygon_points, topology):
-    selected_bridge_ids = {str(value) for value in topology.get('bridge_ids', [])}
-    bridges = []
-    for index, bridge in enumerate(topology.get('bridges', [])):
-        if str(bridge.get('bridge_id')) not in selected_bridge_ids:
-            continue
-        orientation, fixed, interval, _, _ = _axis_segment(bridge, f'bridge {index}')
-        bridges.append((orientation, fixed, interval))
+def _boundary_edge_index(item, name, edges):
+    orientation, fixed, interval, start, end = _axis_segment(item, name)
+    if item.get('orientation') != orientation:
+        raise RuntimeError(f'{name} orientation does not match endpoints')
+    matches = [
+        index for index, edge in enumerate(edges)
+        if edge[0] == orientation and edge[1] == fixed
+        and edge[2][0] <= interval[0] < interval[1] <= edge[2][1]
+    ]
+    if len(matches) != 1:
+        raise RuntimeError(f'{name} must lie completely on exactly one polygon edge')
+    return matches[0], interval, start, end
 
-    walls = []
-    for edge_index, (start, end) in enumerate(
-        zip(polygon_points, polygon_points[1:] + polygon_points[:1]), 1,
-    ):
-        orientation, fixed, edge_interval, _, _ = _axis_segment(
-            {'start_px': start, 'end_px': end}, f'polygon edge {edge_index}',
+
+def _validated_real_exterior_wall_geometry(polygon_points, topology):
+    edges = [
+        _axis_segment({'start_px': start, 'end_px': end}, f'polygon edge {index}')[:3]
+        for index, (start, end) in enumerate(
+            zip(polygon_points, polygon_points[1:] + polygon_points[:1]), 1,
         )
-        intervals = [edge_interval]
-        for bridge_orientation, bridge_fixed, bridge_interval in bridges:
-            if bridge_orientation != orientation or bridge_fixed != fixed:
-                continue
-            cut_start = max(edge_interval[0], bridge_interval[0])
-            cut_end = min(edge_interval[1], bridge_interval[1])
-            if cut_start >= cut_end:
-                continue
-            remaining = []
-            for interval_start, interval_end in intervals:
-                if cut_end <= interval_start or cut_start >= interval_end:
-                    remaining.append([interval_start, interval_end])
-                    continue
-                if interval_start < cut_start:
-                    remaining.append([interval_start, cut_start])
-                if cut_end < interval_end:
-                    remaining.append([cut_end, interval_end])
-            intervals = remaining
-        for interval_start, interval_end in intervals:
-            if orientation == 'horizontal':
-                points = [[interval_start, fixed], [interval_end, fixed]]
-            else:
-                points = [[fixed, interval_start], [fixed, interval_end]]
-            walls.append({
-                'id': f'exterior-wall-{len(walls) + 1:04d}',
-                'pts': points,
-                'length_px': interval_end - interval_start,
-                'exterior': True,
-                'real_wall': True,
-            })
-    if not walls:
-        raise RuntimeError('Exterior topology has no real wall segments')
+    ]
+    source_ids = set(_strict_string_ids(
+        topology.get('source_wall_ids'), 'source_wall_ids',
+    ))
+    selected_bridge_ids = _strict_string_ids(
+        topology.get('bridge_ids'), 'bridge_ids',
+    )
+    bridges = topology.get('bridges')
+    if not isinstance(bridges, list) or any(not isinstance(item, dict) for item in bridges):
+        raise RuntimeError('Exterior topology bridges are invalid')
+    bridge_ids = _strict_string_ids(
+        [bridge.get('bridge_id') for bridge in bridges], 'topology bridge IDs',
+    )
+    bridge_by_id = dict(zip(bridge_ids, bridges))
+    if set(selected_bridge_ids) != set(bridge_by_id):
+        raise RuntimeError('Selected bridge IDs must resolve exactly once with no extras')
+    if any(
+        bridge.get('bridge_type') not in {'opening_bridge', 'small_gap_repair'}
+        for bridge in bridges
+    ):
+        raise RuntimeError('Exterior topology contains an unknown bridge type')
+
+    edge_parts = [[] for _ in edges]
+    for bridge_id in selected_bridge_ids:
+        bridge = bridge_by_id[bridge_id]
+        edge_index, interval, _, _ = _boundary_edge_index(
+            bridge, f'bridge {bridge_id}', edges,
+        )
+        if not _metric_matches(bridge.get('width_px'), interval[1] - interval[0]):
+            raise RuntimeError(f'bridge {bridge_id} width does not match endpoints')
+        bridge_hosts = _strict_string_ids(
+            bridge.get('host_wall_ids'), f'bridge {bridge_id} host_wall_ids',
+        )
+        if not bridge_hosts or not set(bridge_hosts).issubset(source_ids):
+            raise RuntimeError(f'bridge {bridge_id} host walls are invalid')
+        if bridge['bridge_type'] == 'small_gap_repair' and bridge.get('opening_id') is not None:
+            raise RuntimeError(f'bridge {bridge_id} repair must not reference an opening')
+        edge_parts[edge_index].append((interval[0], interval[1], f'bridge {bridge_id}'))
+
+    real_segments = topology.get('real_wall_segments')
+    if not isinstance(real_segments, list) or not real_segments or any(
+        not isinstance(item, dict) for item in real_segments
+    ):
+        raise RuntimeError('real_wall_segments must be a non-empty list')
+    segment_ids = _strict_string_ids(
+        [segment.get('segment_id') for segment in real_segments], 'real wall segment IDs',
+    )
+    walls = []
+    for segment_id, segment in zip(segment_ids, real_segments):
+        edge_index, interval, start, end = _boundary_edge_index(
+            segment, f'real wall segment {segment_id}', edges,
+        )
+        length = interval[1] - interval[0]
+        if not _metric_matches(segment.get('length_px'), length):
+            raise RuntimeError(f'real wall segment {segment_id} length does not match endpoints')
+        segment_sources = _strict_string_ids(
+            segment.get('source_wall_ids'),
+            f'real wall segment {segment_id} source_wall_ids',
+        )
+        if not segment_sources or not set(segment_sources).issubset(source_ids):
+            raise RuntimeError(f'real wall segment {segment_id} source walls are invalid')
+        edge_parts[edge_index].append((interval[0], interval[1], f'real wall {segment_id}'))
+        wall = copy.deepcopy(segment)
+        wall.update({
+            'id': segment_id,
+            'pts': [start, end],
+            'exterior': True,
+            'real_wall': True,
+        })
+        walls.append(wall)
+
+    for edge, parts in zip(edges, edge_parts):
+        parts.sort(key=lambda item: (item[0], item[1], item[2]))
+        cursor = edge[2][0]
+        for interval_start, interval_end, label in parts:
+            if interval_start != cursor:
+                condition = 'overlaps' if interval_start < cursor else 'leaves a gap in'
+                raise RuntimeError(f'{label} {condition} the polygon boundary partition')
+            cursor = interval_end
+        if cursor != edge[2][1]:
+            raise RuntimeError('Real walls and selected bridges do not cover the polygon boundary')
     return walls
 
 
@@ -2060,26 +2311,23 @@ def vector_pdf_exterior_confirm():
         )
         if request_page != artifact_page or request_crop != artifact_crop:
             raise RuntimeError('Confirmed page or crop does not match current artifacts')
-        polygon_points = _validate_confirmable_topology(topology, opening_artifact, scale)
-        accepted_openings = opening_artifact.get('accepted_openings')
-        if not isinstance(accepted_openings, list):
-            raise RuntimeError('Accepted openings are invalid')
-        selected_opening_ids = {str(value) for value in topology.get('opening_ids', [])}
-        openings = [
-            opening for opening in accepted_openings
-            if isinstance(opening, dict)
-            and str(opening.get('opening_id')) in selected_opening_ids
-        ]
-        if {str(opening.get('opening_id')) for opening in openings} != selected_opening_ids:
-            raise RuntimeError('Exterior topology opening references are invalid')
+        polygon_points, area_px2, perimeter_px = _validate_confirmable_topology(
+            topology, opening_artifact, scale, image_size,
+        )
+        openings = _validate_opening_bindings(topology, opening_artifact)
 
         from vector_pdf_energy_geometry import apply_scale_to_exterior
-        scaled_topology, scaled_openings = apply_scale_to_exterior(topology, openings, scale)
+        normalized_topology = copy.deepcopy(topology)
+        normalized_topology['area_px2'] = area_px2
+        normalized_topology['perimeter_px'] = perimeter_px
+        scaled_topology, scaled_openings = apply_scale_to_exterior(
+            normalized_topology, openings, scale,
+        )
         scaled_topology['confirmed'] = True
         scaled_topology['load_geometry_ready'] = True
         scaled_topology['status'] = 'confirmed'
 
-        walls = _real_exterior_wall_geometry(polygon_points, topology)
+        walls = _validated_real_exterior_wall_geometry(polygon_points, topology)
         doors = []
         windows = []
         for opening in scaled_openings:

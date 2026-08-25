@@ -430,8 +430,11 @@ def _bridge_segment(bridge: dict) -> dict:
 
 def _wall_segment(wall: dict) -> dict:
     segment = _strict_axis_segment(wall)
+    candidate_id = wall.get("candidate_id")
+    if not isinstance(candidate_id, str) or not candidate_id:
+        raise ValueError("wall candidate_id must be a non-empty string")
     segment.update({
-        "source_wall_ids": {str(wall["candidate_id"])},
+        "source_wall_ids": {candidate_id},
         "bridge_ids": set(),
         "opening_ids": set(),
     })
@@ -681,10 +684,95 @@ def _empty_exterior_topology(status: str, unresolved_gaps: list[dict], bridges: 
         "source_wall_ids": [],
         "bridge_ids": [],
         "opening_ids": [],
+        "real_wall_segments": [],
         "bridges": bridges,
         "unresolved_gaps": unresolved_gaps,
         "load_geometry_ready": False,
     }
+
+
+def _real_wall_segments_for_face(
+    exterior_walls: list[dict],
+    polygon: list[tuple[float, float]],
+    bridges: list[dict],
+    selected_bridge_ids: set[str],
+) -> list[dict]:
+    wall_segments = []
+    for wall in exterior_walls:
+        try:
+            wall_segments.append(_wall_segment(wall))
+        except (KeyError, TypeError, ValueError):
+            continue
+    bridge_segments = []
+    for bridge in bridges:
+        if bridge.get("bridge_id") not in selected_bridge_ids:
+            continue
+        try:
+            bridge_segments.append(_strict_axis_segment(bridge))
+        except (KeyError, TypeError, ValueError):
+            continue
+
+    real_segments = []
+    for start, end in zip(polygon, polygon[1:] + polygon[:1]):
+        edge = _strict_axis_segment({
+            "orientation": "horizontal" if start[1] == end[1] else "vertical",
+            "start_px": start,
+            "end_px": end,
+        })
+        pieces = []
+        cuts = {edge["axis_start"], edge["axis_end"]}
+        for wall in wall_segments:
+            if wall["orientation"] != edge["orientation"] or wall["fixed"] != edge["fixed"]:
+                continue
+            overlap_start = max(edge["axis_start"], wall["axis_start"])
+            overlap_end = min(edge["axis_end"], wall["axis_end"])
+            if overlap_start < overlap_end:
+                pieces.append((overlap_start, overlap_end, wall["source_wall_ids"]))
+                cuts.update((overlap_start, overlap_end))
+        edge_bridges = []
+        for bridge in bridge_segments:
+            if bridge["orientation"] != edge["orientation"] or bridge["fixed"] != edge["fixed"]:
+                continue
+            overlap_start = max(edge["axis_start"], bridge["axis_start"])
+            overlap_end = min(edge["axis_end"], bridge["axis_end"])
+            if overlap_start < overlap_end:
+                edge_bridges.append((overlap_start, overlap_end))
+                cuts.update((overlap_start, overlap_end))
+
+        atomic = []
+        ordered = sorted(cuts)
+        for axis_start, axis_end in zip(ordered, ordered[1:]):
+            if any(
+                bridge_start <= axis_start and axis_end <= bridge_end
+                for bridge_start, bridge_end in edge_bridges
+            ):
+                continue
+            source_ids = {
+                source_id
+                for piece_start, piece_end, piece_sources in pieces
+                if piece_start <= axis_start and axis_end <= piece_end
+                for source_id in piece_sources
+            }
+            if source_ids:
+                atomic.append([axis_start, axis_end, source_ids])
+        merged = []
+        for item in atomic:
+            if merged and merged[-1][1] == item[0] and merged[-1][2] == item[2]:
+                merged[-1][1] = item[1]
+            else:
+                merged.append(item)
+        for axis_start, axis_end, source_ids in merged:
+            segment = dict(edge, axis_start=axis_start, axis_end=axis_end)
+            segment_start, segment_end = _segment_points(segment)
+            real_segments.append({
+                "segment_id": f"real-wall-{len(real_segments) + 1:04d}",
+                "orientation": edge["orientation"],
+                "start_px": list(segment_start),
+                "end_px": list(segment_end),
+                "length_px": float(axis_end - axis_start),
+                "source_wall_ids": sorted(source_ids),
+            })
+    return real_segments
 
 
 def _discard_unused_small_gap_repairs(
@@ -824,6 +912,9 @@ def build_exterior_topology(
         return _empty_exterior_topology("ambiguous_exterior", unresolved_gaps, bridges)
 
     scale = float(scale_m_per_px) if scale_m_per_px is not None else None
+    real_wall_segments = _real_wall_segments_for_face(
+        exterior_walls, largest["polygon"], bridges, set(largest["bridge_ids"]),
+    )
     return {
         "format": "pdf-exterior-topology/1",
         "status": "review_required",
@@ -836,6 +927,7 @@ def build_exterior_topology(
         "source_wall_ids": sorted(largest["source_wall_ids"]),
         "bridge_ids": sorted(largest["bridge_ids"]),
         "opening_ids": sorted(largest["opening_ids"]),
+        "real_wall_segments": real_wall_segments,
         "bridges": bridges,
         "unresolved_gaps": unresolved_gaps,
         "load_geometry_ready": False,

@@ -178,8 +178,17 @@ class VectorPdfFusionPipelineTests(unittest.TestCase):
             self.assertIn("ambiguous_openings", openings)
             self.assertIn("unclassified_gaps", openings)
             self.assertIn("bridges", exterior)
+            self.assertIn("real_wall_segments", exterior)
             self.assertIn("unresolved", exterior)
             self.assertIn("provenance", exterior)
+            self.assertEqual(
+                sum(item["length_px"] for item in exterior["real_wall_segments"])
+                + sum(
+                    item["width_px"] for item in exterior["bridges"]
+                    if item["bridge_id"] in exterior["bridge_ids"]
+                ),
+                exterior["perimeter_px"],
+            )
 
     def test_model_unavailable_never_confirms_exterior_artifact(self):
         """An unavailable model must publish only explicitly unconfirmed exterior state."""
@@ -205,6 +214,7 @@ class VectorPdfFusionPipelineTests(unittest.TestCase):
             self.assertFalse(payload["confirmed"])
             self.assertFalse(payload["load_geometry_ready"])
             self.assertEqual(payload["status"], "model_unavailable")
+            self.assertEqual(payload["real_wall_segments"], [])
 
     def test_crop_exterior_and_openings_are_local_with_page_traceability(self):
         """Cropping must not leak page-space geometry into review artifacts."""

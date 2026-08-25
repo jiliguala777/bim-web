@@ -125,9 +125,12 @@ def select_exterior_walls(
     for original in candidates:
         if original.get("decision") != "accepted_wall_candidate":
             continue
-        first, second, boundary_mean = _sample_footprint_sides(
-            original, values[0], (width, height), offset,
-        )
+        try:
+            first, second, boundary_mean = _sample_footprint_sides(
+                original, values[0], (width, height), offset,
+            )
+        except ValueError:
+            continue
         inside = max((first, second), key=lambda side: side[1])
         outside = second if inside == first else first
         difference = inside[1] - outside[1]
@@ -210,10 +213,9 @@ def _merge_overlapping_collinear_walls(walls: list[dict]) -> list[dict]:
 
 
 def _gap_points(left: dict, right: dict) -> tuple[list[int], list[int]]:
-    fixed = left["fixed"]
     if left["orientation"] == "horizontal":
-        return [left["axis_end"], fixed], [right["axis_start"], fixed]
-    return [fixed, left["axis_end"]], [fixed, right["axis_start"]]
+        return [left["axis_end"], left["fixed"]], [right["axis_start"], right["fixed"]]
+    return [left["fixed"], left["axis_end"]], [right["fixed"], right["axis_start"]]
 
 
 def _perpendicular_crosses_gap(
@@ -297,6 +299,8 @@ def enumerate_exterior_gaps(
         _, right = nearest[0]
         start, end = _gap_points(left, right)
         reasons = []
+        if left["fixed"] != right["fixed"]:
+            reasons.append("not_strictly_collinear")
         if left["inside_direction"] != right["inside_direction"]:
             reasons.append("different_inside_directions")
         if _perpendicular_crosses_gap(left, right, walls, thresholds.collinear_tolerance_px):

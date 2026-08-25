@@ -59,6 +59,22 @@ class ExteriorWallSelectionTests(unittest.TestCase):
         self.assertLess(result[0]["footprint_outside_mean"], 0.25)
         self.assertEqual(result[0]["candidate_id"], "left")
 
+    def test_skips_non_axis_aligned_candidate_without_losing_orthogonal_wall(self):
+        from vector_pdf_exterior import select_exterior_walls
+
+        probabilities = supported_probabilities(200, 120)
+        probabilities[0, 31:80, 20:181] = 0.9
+        walls = [
+            accepted_wall("valid", (20, 30), (20, 80), "vertical"),
+            accepted_wall("diagonal", (40, 30), (80, 50), "horizontal"),
+        ]
+
+        result = select_exterior_walls(
+            walls, probabilities, (200, 120), [10, 10, 190, 110],
+        )
+
+        self.assertEqual([wall["candidate_id"] for wall in result], ["valid"])
+
 
 class ExteriorGapEnumerationTests(unittest.TestCase):
     def test_enumerates_only_unambiguous_collinear_gap(self):
@@ -76,6 +92,20 @@ class ExteriorGapEnumerationTests(unittest.TestCase):
         self.assertEqual(gaps[0]["start_px"], [70, 20])
         self.assertEqual(gaps[0]["end_px"], [90, 20])
         self.assertEqual(gaps[0]["host_wall_ids"], ["a", "b"])
+
+    def test_rejects_nearby_parallel_walls_without_projecting_an_anchor(self):
+        from vector_pdf_exterior import enumerate_exterior_gaps
+
+        gaps = enumerate_exterior_gaps([
+            exterior_wall("a", (10, 20), (70, 20), "horizontal", "down"),
+            exterior_wall("b", (90, 21), (150, 21), "horizontal", "down"),
+        ], (200, 120), [0, 0, 200, 120])
+
+        self.assertEqual(len(gaps), 1)
+        self.assertEqual(gaps[0]["decision"], "rejected_gap")
+        self.assertIn("not_strictly_collinear", gaps[0]["reason_codes"])
+        self.assertEqual(gaps[0]["start_px"], [70, 20])
+        self.assertEqual(gaps[0]["end_px"], [90, 21])
 
     def test_rejects_gap_between_walls_with_different_inside_directions(self):
         from vector_pdf_exterior import enumerate_exterior_gaps

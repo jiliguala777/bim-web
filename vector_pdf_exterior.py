@@ -344,6 +344,19 @@ def _repair_limit_px(
     return float(max(4, min(32, round(min(image_size) * 0.01))))
 
 
+def _gap_within_repair_limit(
+    width_px: float,
+    repair_limit_px: float,
+    scale_m_per_px: float | None,
+) -> bool:
+    if scale_m_per_px is None:
+        return width_px <= repair_limit_px
+    width_m = width_px * float(scale_m_per_px)
+    return width_m < 0.6 or math.isclose(
+        width_m, 0.6, rel_tol=1e-12, abs_tol=1e-12,
+    )
+
+
 def _strict_axis_segment(item: dict) -> dict:
     orientation = item.get("orientation")
     start = tuple(float(value) for value in item["start_px"])
@@ -617,6 +630,46 @@ def _face_footprint_mean(face: dict, footprint: np.ndarray) -> float:
     return _mean(footprint, mask > 0)
 
 
+def _vertex_components(adjacency: dict) -> dict[tuple[float, float], int]:
+    component_by_vertex = {}
+    for vertex in sorted(adjacency):
+        if vertex in component_by_vertex:
+            continue
+        component_id = len(set(component_by_vertex.values()))
+        pending = [vertex]
+        component_by_vertex[vertex] = component_id
+        while pending:
+            current = pending.pop()
+            for neighbour in adjacency[current]:
+                if neighbour in component_by_vertex:
+                    continue
+                component_by_vertex[neighbour] = component_id
+                pending.append(neighbour)
+    return component_by_vertex
+
+
+def _polygon_strictly_contains(
+    outer: list[tuple[float, float]],
+    inner: list[tuple[float, float]],
+) -> bool:
+    contour = np.asarray(outer, dtype=np.float32)
+    return all(
+        cv2.pointPolygonTest(contour, (float(x), float(y)), False) > 0
+        for x, y in inner
+    )
+
+
+def _has_nested_faces(faces: list[dict]) -> bool:
+    for index, first in enumerate(faces):
+        for second in faces[index + 1:]:
+            if (
+                _polygon_strictly_contains(first["polygon"], second["polygon"])
+                or _polygon_strictly_contains(second["polygon"], first["polygon"])
+            ):
+                return True
+    return False
+
+
 def _empty_exterior_topology(status: str, unresolved_gaps: list[dict], bridges: list[dict]) -> dict:
     return {
         "format": "pdf-exterior-topology/1",
@@ -707,7 +760,7 @@ def build_exterior_topology(
             opening_id = str(opening["opening_id"])
             confidence = float(opening.get("confidence", 0.0))
             reason_codes = ["accepted_opening_exact_gap_match"]
-        elif width_px <= repair_limit:
+        elif _gap_within_repair_limit(width_px, repair_limit, scale_m_per_px):
             bridge_type = "small_gap_repair"
             opening_id = None
             confidence = 1.0
@@ -741,10 +794,16 @@ def build_exterior_topology(
     graph_segments = [*wall_segments, *(_bridge_segment(bridge) for bridge in bridges)]
     merged = _merge_topology_segments(graph_segments)
     adjacency, edge_evidence = _split_at_intersections(merged)
-    faces = [
+    component_by_vertex = _vertex_components(adjacency)
+    roi_faces = [
         face for face in _enumerate_bounded_faces(adjacency, edge_evidence)
         if _face_inside_roi(face, roi)
-        and _face_footprint_mean(face, values[0]) >= ExteriorThresholds().footprint_inside_mean_min
+    ]
+    for face in roi_faces:
+        face["component_id"] = component_by_vertex[face["polygon"][0]]
+    faces = [
+        face for face in roi_faces
+        if _face_footprint_mean(face, values[0]) >= ExteriorThresholds().footprint_inside_mean_min
     ]
     used_bridge_ids = {
         bridge_id for face in faces for bridge_id in face["bridge_ids"]
@@ -754,6 +813,12 @@ def build_exterior_topology(
     )
     if not faces:
         return _empty_exterior_topology("exterior_not_closed", unresolved_gaps, bridges)
+
+    if (
+        len({face["component_id"] for face in faces}) > 1
+        or _has_nested_faces(roi_faces)
+    ):
+        return _empty_exterior_topology("ambiguous_exterior", unresolved_gaps, bridges)
 
     faces.sort(key=lambda face: (-face["area"], face["polygon"]))
     largest = faces[0]

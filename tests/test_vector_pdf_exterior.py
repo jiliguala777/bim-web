@@ -120,6 +120,13 @@ def supported_footprint(*polygons, image_size=(100, 100)):
     return probabilities
 
 
+def supported_courtyard(outer, inner, image_size=(100, 100)):
+    probabilities = supported_footprint(outer, image_size=image_size)
+    import cv2
+    cv2.fillPoly(probabilities[0], [np.asarray(inner, dtype=np.int32)], 0.0)
+    return probabilities
+
+
 class ExteriorWallSelectionTests(unittest.TestCase):
     def test_selects_wall_with_one_footprint_interior_side(self):
         from vector_pdf_exterior import select_exterior_walls
@@ -285,6 +292,36 @@ class ExteriorTopologyTests(unittest.TestCase):
             ["gap_exceeds_repair_limit"],
         )
 
+    def test_unknown_gap_repairs_at_decimal_metric_boundary(self):
+        from vector_pdf_exterior import build_exterior_topology
+
+        polygon = [(20, 20), (80, 20), (80, 80), (20, 80)]
+        topology = build_exterior_topology(
+            rectangle_with_bottom_gap(door_gap=(40, 46)),
+            [topology_gap(40, 80, 46, 80)], [], supported_footprint(polygon),
+            (100, 100), [0, 0, 100, 100], scale_m_per_px=0.1,
+        )
+
+        self.assertEqual(topology["bridges"][0]["bridge_type"], "small_gap_repair")
+        self.assertEqual(topology["area_px2"], 3600.0)
+
+    def test_unknown_gap_strictly_rejects_just_over_metric_boundary(self):
+        from vector_pdf_exterior import build_exterior_topology
+
+        polygon = [(20, 20), (80, 20), (80, 80), (20, 80)]
+        topology = build_exterior_topology(
+            rectangle_with_bottom_gap(door_gap=(40, 46.000001)),
+            [topology_gap(40, 80, 46.000001, 80)], [],
+            supported_footprint(polygon), (100, 100), [0, 0, 100, 100],
+            scale_m_per_px=0.1,
+        )
+
+        self.assertEqual(topology["bridges"], [])
+        self.assertEqual(
+            topology["unresolved_gaps"][0]["reason_codes"],
+            ["gap_exceeds_repair_limit"],
+        )
+
     def test_unknown_gap_repairs_at_unscaled_pixel_boundary_only(self):
         from vector_pdf_exterior import build_exterior_topology
 
@@ -362,6 +399,37 @@ class ExteriorTopologyTests(unittest.TestCase):
         self.assertEqual(topology["status"], "ambiguous_exterior")
         self.assertEqual(topology["polygon_px"], [])
         self.assertFalse(topology["confirmed"])
+
+    def test_unequal_disconnected_buildings_are_ambiguous(self):
+        from vector_pdf_exterior import build_exterior_topology
+
+        large = [(10, 10), (70, 10), (70, 70), (10, 70)]
+        small = [(75, 75), (95, 75), (95, 95), (75, 95)]
+        topology = build_exterior_topology(
+            walls_from_polygon(large, "large") + walls_from_polygon(small, "small"),
+            [], [], supported_footprint(large, small),
+            (100, 100), [0, 0, 100, 100],
+        )
+
+        self.assertEqual(topology["status"], "ambiguous_exterior")
+        self.assertEqual(topology["polygon_px"], [])
+        self.assertEqual(topology["area_px2"], 0.0)
+
+    def test_outer_ring_with_unsupported_courtyard_is_ambiguous(self):
+        from vector_pdf_exterior import build_exterior_topology
+
+        outer = [(10, 10), (90, 10), (90, 90), (10, 90)]
+        courtyard = [(40, 40), (60, 40), (60, 60), (40, 60)]
+        topology = build_exterior_topology(
+            walls_from_polygon(outer, "outer")
+            + walls_from_polygon(courtyard, "courtyard"),
+            [], [], supported_courtyard(outer, courtyard),
+            (100, 100), [0, 0, 100, 100],
+        )
+
+        self.assertEqual(topology["status"], "ambiguous_exterior")
+        self.assertEqual(topology["polygon_px"], [])
+        self.assertEqual(topology["perimeter_px"], 0.0)
 
     def test_corner_gap_remains_unresolved(self):
         from vector_pdf_exterior import build_exterior_topology

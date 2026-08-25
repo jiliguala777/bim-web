@@ -18,11 +18,15 @@ class OpeningThresholds:
 
 def _axis_line(gap: dict) -> tuple[str, tuple[int, int], tuple[int, int]]:
     orientation = gap.get("orientation")
-    start = tuple(int(round(value)) for value in gap["start_px"])
-    end = tuple(int(round(value)) for value in gap["end_px"])
-    if orientation == "horizontal" and start[1] == end[1]:
+    raw_start = tuple(gap["start_px"])
+    raw_end = tuple(gap["end_px"])
+    if orientation == "horizontal" and raw_start[1] == raw_end[1]:
+        start = tuple(int(round(value)) for value in raw_start)
+        end = tuple(int(round(value)) for value in raw_end)
         return orientation, start, end
-    if orientation == "vertical" and start[0] == end[0]:
+    if orientation == "vertical" and raw_start[0] == raw_end[0]:
+        start = tuple(int(round(value)) for value in raw_start)
+        end = tuple(int(round(value)) for value in raw_end)
         return orientation, start, end
     raise ValueError("gap orientation must match an axis-aligned segment")
 
@@ -49,8 +53,16 @@ def _line_mean(channel: np.ndarray, orientation: str, start: tuple[int, int], en
 def _endpoint_max(channel: np.ndarray, point: tuple[int, int], radius: int) -> float:
     height, width = channel.shape
     x, y = point
-    left, right = max(0, x - radius), min(width, x + radius + 1)
-    top, bottom = max(0, y - radius), min(height, y + radius + 1)
+    left, right = (
+        min(width, max(0, x - radius)),
+        min(width, max(0, x + radius + 1)),
+    )
+    top, bottom = (
+        min(height, max(0, y - radius)),
+        min(height, max(0, y + radius + 1)),
+    )
+    if left >= right or top >= bottom:
+        return 0.0
     samples = channel[top:bottom, left:right]
     return float(np.max(samples)) if samples.size else 0.0
 
@@ -115,6 +127,15 @@ def _unclassified(gap: dict, reason: str) -> dict:
     return record
 
 
+def _gap_width_px(gap: dict) -> float:
+    try:
+        return float(gap["width_px"])
+    except (KeyError, TypeError, ValueError):
+        raw_start = gap["start_px"]
+        raw_end = gap["end_px"]
+        return float(abs(raw_end[0] - raw_start[0]) + abs(raw_end[1] - raw_start[1]))
+
+
 def classify_exterior_openings(
     gaps: list[dict],
     probabilities: np.ndarray,
@@ -144,7 +165,7 @@ def classify_exterior_openings(
         door = _class_evidence(values, orientation, start, end, 5, 8, thresholds)
         window = _class_evidence(values, orientation, start, end, 6, 9, thresholds)
         evidence = {"door": door, "window": window}
-        width_px = float(abs(end[0] - start[0]) + abs(end[1] - start[1]))
+        width_px = _gap_width_px(gap)
         supported = [
             ("door", door),
             ("window", window),

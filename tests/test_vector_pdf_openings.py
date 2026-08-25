@@ -117,12 +117,58 @@ class ExteriorOpeningClassificationTests(unittest.TestCase):
         probabilities[8, 0:9, 15:26] = 0.9
 
         result = classify_exterior_openings(
-            [gap((-10, 2), (20, 2))], probabilities, (160, 100),
+            [gap((-6, 2), (20, 2))], probabilities, (160, 100),
         )
 
         opening = result["accepted_openings"][0]
-        self.assertEqual(opening["start_px"], [-10, 2])
+        self.assertEqual(opening["start_px"], [-6, 2])
         self.assertEqual(opening["end_px"], [20, 2])
+
+    def test_far_left_endpoint_cannot_sample_unrelated_in_image_evidence(self):
+        from vector_pdf_openings import classify_exterior_openings
+
+        probabilities = empty_probabilities()
+        probabilities[5, 2, 0:21] = 0.9
+        probabilities[8, 0:11, 55:66] = 0.9
+        probabilities[8, 0:11, 15:26] = 0.9
+
+        result = classify_exterior_openings(
+            [gap((-100, 2), (20, 2))], probabilities, (160, 100),
+        )
+
+        self.assertEqual(result["accepted_openings"], [])
+        self.assertEqual(result["unclassified_gaps"][0]["gap_id"], "gap-0001")
+
+    def test_far_above_endpoint_cannot_sample_unrelated_in_image_evidence(self):
+        from vector_pdf_openings import classify_exterior_openings
+
+        probabilities = empty_probabilities()
+        probabilities[5, 0:21, 2] = 0.9
+        probabilities[8, 5:16, 0:11] = 0.9
+        probabilities[8, 15:26, 0:11] = 0.9
+
+        result = classify_exterior_openings(
+            [gap((2, -100), (2, 20), "vertical")], probabilities, (160, 100),
+        )
+
+        self.assertEqual(result["accepted_openings"], [])
+        self.assertEqual(result["unclassified_gaps"][0]["gap_id"], "gap-0001")
+
+    def test_non_axis_aligned_decimal_gap_is_unclassified_before_rounding(self):
+        from vector_pdf_openings import classify_exterior_openings
+
+        probabilities = empty_probabilities()
+        probabilities[5, 48:53, 60:101] = 0.9
+        probabilities[8, 45:56, 55:66] = 0.9
+        probabilities[8, 45:56, 95:106] = 0.9
+
+        result = classify_exterior_openings(
+            [gap((60, 50.1), (100, 50.4))], probabilities, (160, 100),
+        )
+
+        self.assertEqual(result["accepted_openings"], [])
+        self.assertEqual(result["unclassified_gaps"][0]["gap_id"], "gap-0001")
+        self.assertIn("invalid_gap_geometry", result["unclassified_gaps"][0]["reason_codes"])
 
     def test_fully_out_of_image_gap_is_unclassified(self):
         from vector_pdf_openings import classify_exterior_openings

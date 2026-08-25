@@ -287,6 +287,145 @@ if (fetchCalls !== 0) throw new Error('stale REPORT-A was sent as REPORT-B');
         )
         self.assertEqual(completed.returncode, 0, completed.stderr)
 
+    def test_stale_energy_responses_cannot_land_after_report_identity_changes(self):
+        node_script = r'''
+const fs = require('fs');
+const vm = require('vm');
+const html = fs.readFileSync('templates/energy.html', 'utf8');
+const inlineScript = [...html.matchAll(/<script(?:[^>]*)>([\s\S]*?)<\/script>/g)]
+  .map(match => match[1]).find(Boolean);
+const elements = new Proxy({}, {
+  get(target, key) {
+    if (!target[key]) {
+      target[key] = {
+        value: '', checked: true, disabled: false, innerText: '', innerHTML: '',
+        style: {}, className: '',
+        classList: { add() {}, remove() {}, toggle() {} },
+        addEventListener() {}, setAttribute() {}, removeAttribute() {},
+        querySelectorAll() { return []; }
+      };
+    }
+    return target[key];
+  }
+});
+elements['current-report-number'].value = 'REPORT-A';
+elements['pdf-page-select'].value = '1';
+elements['param-floors'].value = '1';
+elements['param-window-repeat-count'].value = '';
+const requests = [];
+const tracking = { displays: [], steps: [], alerts: [], hideCount: 0 };
+const context = {
+  EnergyPdfRecognitionState: require('./static/energy/pdf_recognition_state.js'),
+  document: {
+    addEventListener() {}, getElementById(id) { return elements[id]; },
+    querySelectorAll() { return []; }, createElement() { return elements.created; }
+  },
+  window: { addEventListener() {}, scrollTo() {} },
+  console, AbortController, FormData,
+  alert(message) { tracking.alerts.push(message); },
+  fetch(url, options) {
+    if (url !== '/energy/ai_simulate') throw new Error(`unexpected fetch ${url}`);
+    let resolve;
+    const response = new Promise(done => { resolve = done; });
+    requests.push({
+      reportNumber: JSON.parse(options.body).report_number,
+      resolve
+    });
+    return response;
+  },
+  Chart: function Chart() {}, tracking
+};
+
+function acceptRecognition(reportNumber) {
+  elements['current-report-number'].value = reportNumber;
+  vm.runInContext(`
+    {
+      const accepted = pdfRecognitionRequests.begin(
+        currentPdfRecognitionSelection(), { abort() {} }
+      );
+      if (!pdfRecognitionRequests.accept(accepted.request, currentPdfRecognitionSelection())) {
+        throw new Error('could not accept recognition for ${reportNumber}');
+      }
+      pdfRecognitionRequests.finish(accepted.request, currentPdfRecognitionSelection());
+    }
+    acceptedRecognitionReportNumber = '${reportNumber}';
+    reportNumber = '${reportNumber}';
+    aiResultData = {
+      report_number: '${reportNumber}',
+      exterior_topology: { confirmed: true, load_geometry_ready: true }
+    };
+  `, context);
+}
+
+(async () => {
+  vm.createContext(context);
+  vm.runInContext(inlineScript, context);
+  vm.runInContext(`
+    displayResults = data => tracking.displays.push(data.marker);
+    gotoStep = step => tracking.steps.push(step);
+    showLoader = () => {};
+    hideLoader = () => { tracking.hideCount += 1; };
+  `, context);
+
+  vm.runInContext(`preparedPdf = { uploadToken: 'token' }; pdfUploadSessionId = 1;`, context);
+  acceptRecognition('REPORT-A');
+  const calculationA = vm.runInContext('calculateEnergy()', context);
+
+  elements['current-report-number'].value = 'REPORT-B';
+  vm.runInContext('handleReportNumberInputChange()', context);
+  if (tracking.hideCount !== 1) {
+    throw new Error('report invalidation did not retire the abandoned REPORT-A loader');
+  }
+  acceptRecognition('REPORT-B');
+  const calculationB = vm.runInContext('calculateEnergy()', context);
+
+  if (requests.map(item => item.reportNumber).join(',') !== 'REPORT-A,REPORT-B') {
+    throw new Error('calculation report numbers were not frozen per request');
+  }
+  requests[0].resolve({ json: async () => ({ marker: 'REPORT-A result' }) });
+  await calculationA;
+  if (vm.runInContext('energyResultData', context) !== null) {
+    throw new Error('stale REPORT-A response wrote energyResultData');
+  }
+  if (tracking.displays.length || tracking.steps.length || tracking.hideCount !== 1) {
+    throw new Error('stale REPORT-A response rendered, navigated, or hid REPORT-B loader: '
+      + JSON.stringify(tracking));
+  }
+
+  requests[1].resolve({ json: async () => ({ marker: 'REPORT-B result' }) });
+  await calculationB;
+  if (vm.runInContext('energyResultData.marker', context) !== 'REPORT-B result') {
+    throw new Error('current REPORT-B response did not land');
+  }
+  if (tracking.displays.join(',') !== 'REPORT-B result'
+      || tracking.steps.join(',') !== '4' || tracking.hideCount !== 2) {
+    throw new Error('current REPORT-B response did not render normally');
+  }
+
+  const staleError = vm.runInContext('calculateEnergy()', context);
+  elements['current-report-number'].value = 'REPORT-C';
+  vm.runInContext('handleReportNumberInputChange()', context);
+  if (tracking.hideCount !== 3) {
+    throw new Error('report invalidation did not retire the abandoned REPORT-B loader');
+  }
+  requests[2].resolve({ json: async () => ({ error: 'delayed REPORT-B failure' }) });
+  await staleError;
+  if (tracking.alerts.length || tracking.hideCount !== 3
+      || tracking.displays.join(',') !== 'REPORT-B result'
+      || tracking.steps.join(',') !== '4') {
+    throw new Error('stale error/finally mutated the newer report state');
+  }
+})().catch(error => { console.error(error); process.exitCode = 1; });
+'''
+        completed = subprocess.run(
+            ["node", "-e", node_script],
+            cwd=Path.cwd(),
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
     def test_pdf_region_recognition_ui_loads_preview_and_manages_crop_state(self):
         html = Path("templates/energy.html").read_text(encoding="utf-8")
 

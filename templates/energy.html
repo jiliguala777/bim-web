@@ -1713,6 +1713,8 @@
             EnergyPdfRecognitionState.createSelectionBoundRequestState();
         let calibrationPoints = [];
         let energyResultData = null;
+        let energyCalculationRequestGeneration = 0;
+        let activeEnergyCalculationRequestGeneration = null;
         let chartInstance = null;
         let wallAssemblyLibrary = [];
         let envelopeLibraries = {
@@ -2577,7 +2579,16 @@
             window.scrollTo({ top: 0, behavior: 'smooth' });
         }
 
+        function invalidateEnergyCalculationRequest() {
+            energyCalculationRequestGeneration += 1;
+            if (activeEnergyCalculationRequestGeneration !== null) {
+                activeEnergyCalculationRequestGeneration = null;
+                hideLoader();
+            }
+        }
+
         function invalidateEnergyResult() {
+            invalidateEnergyCalculationRequest();
             energyResultData = null;
         }
 
@@ -2636,6 +2647,23 @@
             );
         }
 
+        function isCurrentEnergyCalculationRequest(calculationRequest) {
+            return Boolean(
+                calculationRequest
+                && calculationRequest.generation === energyCalculationRequestGeneration
+                && calculationRequest.generation === activeEnergyCalculationRequestGeneration
+                && calculationRequest.reportNumber === acceptedRecognitionReportNumber
+                && calculationRequest.reportNumber === normalizedReportNumber(
+                    document.getElementById('current-report-number').value
+                )
+                && EnergyPdfRecognitionState.fingerprintsEqual(
+                    calculationRequest.selection,
+                    currentPdfRecognitionSelection()
+                )
+                && pdfRecognitionRequests.hasAccepted(calculationRequest.selection)
+            );
+        }
+
         function updateCalculateEnergyAvailability() {
             document.getElementById('calculate-energy-button').disabled =
                 !hasCurrentConfirmedGeometry();
@@ -2675,6 +2703,7 @@
             );
             aiResultData = derivedState.aiResultData;
             energyResultData = derivedState.energyResultData;
+            invalidateEnergyCalculationRequest();
             calibrationPoints = derivedState.calibrationPoints;
             acceptedRecognitionReportNumber = null;
             pendingExteriorFusion = null;
@@ -3723,14 +3752,25 @@
                 alert('至少选择供暖或制冷中的一种计算。');
                 return;
             }
-            showLoader("正在运用度日数负荷模型与机电 COP 耦合求解能耗...");
 
-            const calculationReportNumber = acceptedRecognitionReportNumber;
+            const calculationReportNumber = normalizedReportNumber(
+                acceptedRecognitionReportNumber
+            );
             if (!calculationReportNumber) {
-                hideLoader();
                 alert('当前报告没有已确认的识别结果。');
                 return;
             }
+            const calculationRequest = Object.freeze({
+                generation: energyCalculationRequestGeneration,
+                reportNumber: calculationReportNumber,
+                selection: currentPdfRecognitionSelection(calculationReportNumber)
+            });
+            activeEnergyCalculationRequestGeneration = calculationRequest.generation;
+            if (!isCurrentEnergyCalculationRequest(calculationRequest)) {
+                activeEnergyCalculationRequestGeneration = null;
+                return;
+            }
+            showLoader("正在运用度日数负荷模型与机电 COP 耦合求解能耗...");
             const windowShgc = parseFloat(document.getElementById('param-shgc').value);
             const curtainShading = parseFloat(document.getElementById('param-curtain-shading').value) || 1;
             const floors = parseInt(document.getElementById('param-floors').value);
@@ -3816,6 +3856,9 @@
                     body: JSON.stringify(params)
                 });
                 const data = await response.json();
+                if (!isCurrentEnergyCalculationRequest(calculationRequest)) {
+                    return false;
+                }
                 if (data.error) {
                     throw new Error(data.error);
                 }
@@ -3825,9 +3868,15 @@
                 gotoStep(4);
 
             } catch (error) {
+                if (!isCurrentEnergyCalculationRequest(calculationRequest)) {
+                    return false;
+                }
                 alert("能耗计算失败: " + error.message);
             } finally {
-                hideLoader();
+                if (isCurrentEnergyCalculationRequest(calculationRequest)) {
+                    activeEnergyCalculationRequestGeneration = null;
+                    hideLoader();
+                }
             }
         }
 

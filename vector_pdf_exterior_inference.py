@@ -20,6 +20,7 @@ class InferenceThresholds:
     footprint_side_difference_min: float = 0.25
     footprint_boundary_mean_min: float = 0.35
     max_edge_short_side_fraction: float = 0.10
+    max_corner_options_per_endpoint: int = 12
 
 
 def _axis_record(record: dict) -> dict:
@@ -286,6 +287,7 @@ def _group_candidates(bands: list[dict], thresholds: InferenceThresholds) -> lis
     horizontal = [item for item in dangling if item["band"]["orientation"] == "horizontal"]
     vertical = [item for item in dangling if item["band"]["orientation"] == "vertical"]
     for horizontal_endpoint in horizontal:
+        corner_options = []
         for vertical_endpoint in vertical:
             horizontal_band = horizontal_endpoint["band"]
             vertical_band = vertical_endpoint["band"]
@@ -295,6 +297,24 @@ def _group_candidates(bands: list[dict], thresholds: InferenceThresholds) -> lis
             if max(horizontal_length, vertical_length) <= thresholds.endpoint_connection_tolerance_px:
                 continue
             compatible = _corner_compatible(horizontal_endpoint, vertical_endpoint)
+            corner_options.append((
+                0 if compatible else 1,
+                max(horizontal_length, vertical_length),
+                horizontal_length + vertical_length,
+                str(vertical_band["band_id"]),
+                str(vertical_endpoint["side"]),
+                vertical_endpoint,
+                intersection,
+                horizontal_length,
+                vertical_length,
+                compatible,
+            ))
+        for (
+            _, _, _, _, _, vertical_endpoint, intersection,
+            horizontal_length, vertical_length, compatible,
+        ) in sorted(corner_options)[:thresholds.max_corner_options_per_endpoint]:
+            horizontal_band = horizontal_endpoint["band"]
+            vertical_band = vertical_endpoint["band"]
             reasons = [] if compatible else ["incompatible_corner_inside_directions"]
             anchors = horizontal_band["anchor_wall_ids"] | vertical_band["anchor_wall_ids"]
             edges = []

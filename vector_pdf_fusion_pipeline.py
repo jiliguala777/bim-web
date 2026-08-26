@@ -23,6 +23,7 @@ from vector_pdf_exterior import (
     select_exterior_walls,
 )
 from vector_pdf_door_recovery import recover_exterior_walls_from_door_arcs
+from vector_pdf_exterior_inference import generate_exterior_inference_candidates
 from vector_pdf_model import (
     VectorModelConfig,
     VectorModelContractError,
@@ -217,6 +218,22 @@ def _draw_exterior_overlay(
     for bridge in exterior_topology.get("bridges", []):
         colour = (255, 0, 0) if bridge.get("bridge_type") == "opening_bridge" else (0, 165, 255)
         _draw_dashed_line(overlay, bridge["start_px"], bridge["end_px"], colour)
+    selected_inference_ids = {
+        str(edge.get("inference_id"))
+        for edge in exterior_topology.get("inferred_edges", [])
+    }
+    for candidate in exterior_topology.get("inference_candidates", []):
+        if candidate.get("decision") != "accepted_candidate":
+            continue
+        inference_id = str(candidate.get("inference_id"))
+        if inference_id in selected_inference_ids:
+            continue
+        _draw_dashed_line(
+            overlay, candidate["start_px"], candidate["end_px"], (120, 200, 255),
+            thickness=1,
+        )
+    for edge in exterior_topology.get("inferred_edges", []):
+        _draw_dashed_line(overlay, edge["start_px"], edge["end_px"], (0, 165, 255))
     for gap in exterior_topology.get("unresolved_gaps", []):
         _draw_dashed_line(overlay, gap["start_px"], gap["end_px"], (0, 0, 255))
     return overlay
@@ -255,6 +272,12 @@ def _empty_exterior_topology(status: str) -> dict:
         "real_wall_segments": [],
         "bridges": [],
         "unresolved_gaps": [],
+        "closure_method": None,
+        "inferred_edges": [],
+        "inference_candidates": [],
+        "inferred_length_px": 0.0,
+        "inferred_perimeter_ratio": 0.0,
+        "inference_reason_codes": [],
         "load_geometry_ready": False,
     }
 
@@ -292,6 +315,8 @@ def _publish_exterior_artifacts(
         "pending_openings": copy.deepcopy(opening_result.get("pending_openings", [])),
         "unclassified_gaps": copy.deepcopy(opening_result["unclassified_gaps"]),
         "door_recovery": recovery,
+        "inference_candidates": copy.deepcopy(exterior.get("inference_candidates", [])),
+        "inferred_edges": copy.deepcopy(exterior.get("inferred_edges", [])),
     }
     exterior_topology = {
         **copy.deepcopy(exterior),
@@ -310,6 +335,12 @@ def _publish_exterior_artifacts(
         "recovered_wall_count": len(recovery["recovered_walls"]),
         "confirmed_door_arc_count": len(recovery["confirmed_door_arcs"]),
         "pending_door_arc_count": len(recovery["pending_door_arcs"]),
+        "closure_method": exterior_topology.get("closure_method"),
+        "inferred_edge_count": len(exterior_topology.get("inferred_edges", [])),
+        "inferred_length_px": float(exterior_topology.get("inferred_length_px") or 0.0),
+        "inferred_perimeter_ratio": float(
+            exterior_topology.get("inferred_perimeter_ratio") or 0.0
+        ),
         "unclassified_gap_count": len(opening_result["unclassified_gaps"]),
         "bridge_count": len(exterior_topology["bridges"]),
         "unresolved_gap_count": len(exterior_topology["unresolved"]),
@@ -576,6 +607,41 @@ def analyze_vector_pdf_page(
         roi,
         pending_openings=opening_result["pending_openings"],
     )
+    if exterior.get("status") == "exterior_not_closed":
+        inference_candidates = generate_exterior_inference_candidates(
+            exterior_walls,
+            model_result.probabilities,
+            (width, height),
+            roi,
+        )
+        if any(
+            candidate.get("decision") == "accepted_candidate"
+            for candidate in inference_candidates
+        ):
+            inferred_exterior = build_exterior_topology(
+                exterior_walls,
+                gaps,
+                opening_result["accepted_openings"],
+                model_result.probabilities,
+                (width, height),
+                roi,
+                pending_openings=opening_result["pending_openings"],
+                inference_candidates=inference_candidates,
+            )
+            if inferred_exterior.get("status") == "review_required":
+                exterior = inferred_exterior
+            else:
+                exterior["inference_candidates"] = copy.deepcopy(inference_candidates)
+                exterior["inference_reason_codes"] = copy.deepcopy(
+                    inferred_exterior.get("inference_reason_codes", [])
+                )
+        else:
+            exterior["inference_candidates"] = copy.deepcopy(inference_candidates)
+            exterior["inference_reason_codes"] = sorted({
+                str(reason)
+                for candidate in inference_candidates
+                for reason in candidate.get("reason_codes", [])
+            })
     exterior_openings, exterior_topology, exterior_summary = _publish_exterior_artifacts(
         output,
         render_bgr,

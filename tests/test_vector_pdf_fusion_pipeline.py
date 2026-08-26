@@ -269,6 +269,110 @@ class VectorPdfFusionPipelineTests(unittest.TestCase):
         )
         self.assertEqual(result["door_recovery"], recovery_result)
 
+    def test_inference_runs_only_after_normal_exterior_is_not_closed(self):
+        from vector_pdf_fusion_pipeline import analyze_vector_pdf_page
+
+        not_closed = {
+            "format": "pdf-exterior-topology/1",
+            "status": "exterior_not_closed",
+            "confirmed": False,
+            "polygon_px": [],
+            "area_px2": 0.0,
+            "perimeter_px": 0.0,
+            "area_m2": None,
+            "perimeter_m": None,
+            "source_wall_ids": [],
+            "bridge_ids": [],
+            "opening_ids": [],
+            "pending_opening_ids": [],
+            "real_wall_segments": [],
+            "bridges": [],
+            "unresolved_gaps": [],
+            "closure_method": None,
+            "inferred_edges": [],
+            "inference_candidates": [],
+            "inferred_length_px": 0.0,
+            "inferred_perimeter_ratio": 0.0,
+            "inference_reason_codes": [],
+            "load_geometry_ready": False,
+        }
+        candidate = {
+            "inference_id": "inferred-0001",
+            "edge_group_id": "group-0001",
+            "edge_group_size": 1,
+            "decision": "accepted_candidate",
+            "orientation": "horizontal",
+            "start_px": [100, 40],
+            "end_px": [130, 40],
+            "length_px": 30.0,
+            "inside_direction": "down",
+            "anchor_wall_ids": ["wall-a", "wall-b"],
+            "inside_outside_difference": 0.8,
+        }
+        inferred_topology = {
+            **not_closed,
+            "status": "review_required",
+            "polygon_px": [[40, 40], [360, 40], [360, 270], [40, 270]],
+            "area_px2": 73600.0,
+            "perimeter_px": 1100.0,
+            "closure_method": "footprint_guided_inference",
+            "inferred_edges": [candidate],
+            "inference_candidates": [candidate],
+            "inferred_length_px": 30.0,
+            "inferred_perimeter_ratio": 30.0 / 1100.0,
+            "inference_reason_codes": ["footprint_guided_inference_selected"],
+        }
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / "output"
+            with (
+                patch("vector_pdf_fusion_pipeline.convert_from_path", self._stub_render),
+                patch(
+                    "vector_pdf_fusion_pipeline.generate_exterior_inference_candidates",
+                    return_value=[candidate],
+                ) as candidate_mock,
+                patch(
+                    "vector_pdf_fusion_pipeline.build_exterior_topology",
+                    side_effect=[not_closed, inferred_topology],
+                ) as build_mock,
+            ):
+                result = analyze_vector_pdf_page(
+                    self._make_room_pdf(root), 1, output,
+                    model_config=object(), model_runner=self._supported_runner,
+                )
+
+        self.assertEqual(build_mock.call_count, 2)
+        candidate_mock.assert_called_once()
+        self.assertEqual(
+            result["exterior_topology"]["closure_method"],
+            "footprint_guided_inference",
+        )
+        self.assertEqual(result["exterior_summary"]["inferred_edge_count"], 1)
+
+    def test_exterior_overlay_draws_selected_inference_as_orange_dashes(self):
+        from vector_pdf_fusion_pipeline import _draw_exterior_overlay
+
+        image = np.full((80, 80, 3), 255, dtype=np.uint8)
+        overlay = _draw_exterior_overlay(
+            image,
+            [],
+            {"accepted_openings": []},
+            {
+                "polygon_px": [],
+                "bridges": [],
+                "unresolved_gaps": [],
+                "inferred_edges": [{
+                    "start_px": [10, 40],
+                    "end_px": [70, 40],
+                }],
+            },
+        )
+
+        centre_pixels = overlay[40, 10:71]
+        self.assertTrue(np.any(np.all(centre_pixels == (0, 165, 255), axis=1)))
+        self.assertTrue(np.any(np.all(centre_pixels == (255, 255, 255), axis=1)))
+
     def test_model_unavailable_never_confirms_exterior_artifact(self):
         """An unavailable model must publish only explicitly unconfirmed exterior state."""
         from vector_pdf_fusion_pipeline import analyze_vector_pdf_page

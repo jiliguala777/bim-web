@@ -58,6 +58,46 @@ class ExteriorOpeningClassificationTests(unittest.TestCase):
         self.assertEqual(result["accepted_openings"], [])
         self.assertEqual(result["unclassified_gaps"][0]["gap_id"], "gap-0001")
 
+    def test_native_door_arc_classifies_door_without_model_support(self):
+        from vector_pdf_openings import classify_exterior_openings
+
+        result = classify_exterior_openings(
+            [gap((60, 50), (100, 50))], empty_probabilities(), (160, 100),
+            native_opening_evidence={
+                "curve_edges": [{
+                    "curve_id": "curve-0001",
+                    "bbox_px": [58, 48, 102, 92],
+                    "start_px": [60, 50],
+                    "end_px": [100, 92],
+                }],
+                "short_segments": [],
+            },
+        )
+
+        opening = result["accepted_openings"][0]
+        self.assertEqual(opening["kind"], "door")
+        self.assertIn("native_door_arc_supported", opening["reason_codes"])
+
+    def test_weak_native_opening_is_pending_without_area_deduction(self):
+        from vector_pdf_openings import classify_exterior_openings
+
+        result = classify_exterior_openings(
+            [gap((60, 50), (100, 50))], empty_probabilities(), (160, 100),
+            native_opening_evidence={
+                "curve_edges": [],
+                "short_segments": [{
+                    "native_id": "native-window-mark",
+                    "orientation": "horizontal",
+                    "start_px": [64, 52],
+                    "end_px": [96, 52],
+                }],
+            },
+        )
+
+        self.assertEqual(result["accepted_openings"], [])
+        self.assertEqual(result["pending_openings"][0]["kind"], "pending_opening")
+        self.assertIn("native_short_line_supported", result["pending_openings"][0]["reason_codes"])
+
     def test_classifies_window_from_line_and_both_endpoints(self):
         from vector_pdf_openings import classify_exterior_openings
 

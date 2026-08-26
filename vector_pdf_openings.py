@@ -5,6 +5,8 @@ from __future__ import annotations
 import copy
 from dataclasses import dataclass
 
+import math
+
 import numpy as np
 
 
@@ -14,6 +16,7 @@ class OpeningThresholds:
     endpoint_max_min: float = 0.35
     endpoint_radius_px: int = 8
     ambiguity_margin: float = 0.08
+    native_tolerance_px: int = 12
 
 
 def _axis_line(gap: dict) -> tuple[str, tuple[int, int], tuple[int, int]]:
@@ -136,10 +139,94 @@ def _gap_width_px(gap: dict) -> float:
         return float(abs(raw_end[0] - raw_start[0]) + abs(raw_end[1] - raw_start[1]))
 
 
+def _point_distance(first: tuple[int, int], second: tuple[int, int]) -> float:
+    return math.dist(first, second)
+
+
+def _native_gap_evidence(
+    orientation: str,
+    start: tuple[int, int],
+    end: tuple[int, int],
+    native_opening_evidence: dict | None,
+    thresholds: OpeningThresholds,
+) -> dict:
+    evidence = {
+        "door_arc": False,
+        "window_short_line_count": 0,
+        "curve_ids": [],
+        "short_segment_ids": [],
+    }
+    if not isinstance(native_opening_evidence, dict):
+        return evidence
+    tolerance = thresholds.native_tolerance_px
+    min_x, max_x = sorted((start[0], end[0]))
+    min_y, max_y = sorted((start[1], end[1]))
+    for curve in native_opening_evidence.get("curve_edges", []):
+        try:
+            x0, y0, x1, y1 = (int(round(value)) for value in curve["bbox_px"])
+            curve_start = tuple(int(round(value)) for value in curve["start_px"])
+            curve_end = tuple(int(round(value)) for value in curve["end_px"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        overlaps_gap = (
+            x0 - tolerance <= min_x <= x1 + tolerance
+            and x0 - tolerance <= max_x <= x1 + tolerance
+            and y0 - tolerance <= min_y <= y1 + tolerance
+            and y0 - tolerance <= max_y <= y1 + tolerance
+        )
+        touches_endpoint = min(
+            _point_distance(curve_start, start),
+            _point_distance(curve_start, end),
+            _point_distance(curve_end, start),
+            _point_distance(curve_end, end),
+        ) <= tolerance
+        if overlaps_gap and touches_endpoint:
+            evidence["door_arc"] = True
+            evidence["curve_ids"].append(str(curve.get("curve_id", "curve")))
+    for segment in native_opening_evidence.get("short_segments", []):
+        try:
+            if segment["orientation"] != orientation:
+                continue
+            segment_start = tuple(int(round(value)) for value in segment["start_px"])
+            segment_end = tuple(int(round(value)) for value in segment["end_px"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if orientation == "horizontal":
+            same_axis = abs(segment_start[1] - start[1]) <= tolerance
+            first, second = sorted((segment_start[0], segment_end[0]))
+            overlaps = first <= max_x + tolerance and second >= min_x - tolerance
+        else:
+            same_axis = abs(segment_start[0] - start[0]) <= tolerance
+            first, second = sorted((segment_start[1], segment_end[1]))
+            overlaps = first <= max_y + tolerance and second >= min_y - tolerance
+        if same_axis and overlaps:
+            evidence["window_short_line_count"] += 1
+            evidence["short_segment_ids"].append(str(segment.get("native_id", "short-segment")))
+    return evidence
+
+
+def _pending_opening(gap: dict, width_px: float, evidence: dict, reason: str) -> dict:
+    return {
+        "pending_opening_id": f"pending-{gap['gap_id']}",
+        "kind": "pending_opening",
+        "orientation": gap["orientation"],
+        "start_px": copy.deepcopy(gap["start_px"]),
+        "end_px": copy.deepcopy(gap["end_px"]),
+        "width_px": width_px,
+        "width_m": None,
+        "host_wall_ids": copy.deepcopy(gap["host_wall_ids"]),
+        "exterior": True,
+        "confidence": 0.0,
+        "evidence": evidence,
+        "reason_codes": _reason_codes(gap, reason),
+    }
+
+
 def classify_exterior_openings(
     gaps: list[dict],
     probabilities: np.ndarray,
     image_size: tuple[int, int],
+    native_opening_evidence: dict | None = None,
 ) -> dict:
     """Classify only gap-anchored exterior door/window candidates."""
     width, height = (int(value) for value in image_size)
@@ -151,6 +238,7 @@ def classify_exterior_openings(
     result = {
         "accepted_openings": [],
         "ambiguous_openings": [],
+        "pending_openings": [],
         "unclassified_gaps": [],
     }
     for gap in gaps:
@@ -164,7 +252,10 @@ def classify_exterior_openings(
 
         door = _class_evidence(values, orientation, start, end, 5, 8, thresholds)
         window = _class_evidence(values, orientation, start, end, 6, 9, thresholds)
-        evidence = {"door": door, "window": window}
+        native = _native_gap_evidence(
+            orientation, start, end, native_opening_evidence, thresholds,
+        )
+        evidence = {"door": door, "window": window, "native": native}
         width_px = _gap_width_px(gap)
         supported = [
             ("door", door),
@@ -172,6 +263,24 @@ def classify_exterior_openings(
         ]
         supported = [candidate for candidate in supported if candidate[1]["supported"]]
         if not supported:
+            if native["door_arc"]:
+                result["accepted_openings"].append(_opening(
+                    gap,
+                    "door",
+                    width_px,
+                    0.70,
+                    evidence,
+                    "native_door_arc_supported",
+                ))
+                continue
+            if native["window_short_line_count"]:
+                result["pending_openings"].append(_pending_opening(
+                    gap,
+                    width_px,
+                    evidence,
+                    "native_short_line_supported",
+                ))
+                continue
             result["unclassified_gaps"].append(_unclassified(gap, "no_door_or_window_support"))
             continue
         if len(supported) == 2 and abs(door["confidence"] - window["confidence"]) < thresholds.ambiguity_margin:

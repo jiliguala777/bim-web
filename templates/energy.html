@@ -549,6 +549,30 @@
             object-fit: contain;
         }
 
+        .recognition-expandable { cursor: zoom-in; }
+
+        .recognition-image-card {
+            width: min(1200px, calc(100vw - 32px));
+            max-height: calc(100vh - 32px);
+            padding: 16px;
+        }
+
+        .recognition-image-viewport {
+            max-height: calc(100vh - 118px);
+            overflow: auto;
+            text-align: center;
+            background: #fff;
+            border-radius: 8px;
+        }
+
+        #recognition-image-modal-image {
+            display: block;
+            max-width: 100%;
+            max-height: calc(100vh - 130px);
+            margin: 0 auto;
+            transform-origin: top center;
+        }
+
         .preview-box-title {
             font-size: 14px;
             font-weight: 600;
@@ -957,8 +981,8 @@
                         <div class="preview-box-title">输入建筑图纸</div>
                     </div>
                     <div class="preview-box">
-                        <img id="imgOverlay" src="" alt="AI 构件语义识别">
-                        <div class="preview-box-title">AI 识别构件叠加图 (红墙、蓝窗、绿门)</div>
+                        <img id="imgOverlay" class="recognition-expandable" src="" alt="AI 构件语义识别" onclick="openRecognitionImageModal(this.src, '墙体、门窗综合识别图')">
+                        <div class="preview-box-title">墙体、门窗综合识别图（点击放大）</div>
                     </div>
                 </div>
 
@@ -967,8 +991,8 @@
                     <div class="param-group-title">外轮廓候选复核</div>
                     <p id="exterior-review-status" style="color:var(--warning); margin-bottom:12px;">该结果尚未确认，不能用于能耗计算。</p>
                     <div class="preview-box" style="max-width:720px; margin-bottom:14px;">
-                        <img id="exterior-review-overlay" src="" alt="外轮廓、门窗与修补叠加图">
-                        <div class="preview-box-title">外轮廓复核图</div>
+                        <img id="component-review-overlay" class="recognition-expandable" src="" alt="外轮廓、门窗与修补叠加图" onclick="openRecognitionImageModal(this.src, '外轮廓综合复核图')">
+                        <div class="preview-box-title">外轮廓综合复核图（绿墙、蓝门、青窗、橙补线、红色未解决缺口；点击放大）</div>
                     </div>
                     <div style="display:grid; grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); gap:8px; margin-bottom:14px; color:var(--text-muted); font-size:13px;">
                         <div>候选面积：<strong id="exterior-area-summary">--</strong></div>
@@ -1683,6 +1707,19 @@
         </div>
     </div>
 
+    <div class="loader-overlay" id="recognition-image-modal" style="background: rgba(15, 20, 28, 0.92);" onclick="closeRecognitionImageModal()">
+        <div class="modal-card recognition-image-card" onclick="event.stopPropagation()">
+            <div class="modal-header">
+                <div class="modal-title" id="recognition-image-modal-title">识别结果</div>
+                <button type="button" class="btn btn-secondary" onclick="closeRecognitionImageModal()" style="padding: 6px 10px;">关闭</button>
+            </div>
+            <div class="recognition-image-viewport" id="recognition-image-viewport">
+                <img id="recognition-image-modal-image" src="" alt="放大的识别结果">
+            </div>
+            <p style="color:var(--text-muted); margin-top:10px; font-size:13px;">滚轮可缩放，点击背景或按 Esc 关闭。</p>
+        </div>
+    </div>
+
     <script src="/energy/crop_region.js"></script>
     <script src="/energy/pdf_recognition_state.js"></script>
     <script>
@@ -1738,11 +1775,20 @@
         let activeOrientationKey = 'east';
         let activeModalType = 'wall';
         let detailedEnvelope = createDefaultDetailedEnvelope();
+        let recognitionImageScale = 1;
 
         // 初始化
         document.addEventListener('DOMContentLoaded', () => {
             generateReportNumber();
             setupUpload();
+            document.getElementById('recognition-image-viewport').addEventListener('wheel', event => {
+                event.preventDefault();
+                recognitionImageScale = Math.max(1, Math.min(4, recognitionImageScale + (event.deltaY < 0 ? 0.2 : -0.2)));
+                document.getElementById('recognition-image-modal-image').style.transform = `scale(${recognitionImageScale})`;
+            }, { passive: false });
+            document.addEventListener('keydown', event => {
+                if (event.key === 'Escape') closeRecognitionImageModal();
+            });
             setupScaleCalibrationCanvas();
             updateCalculationScopeControls();
             updateAnnualUsePreview();
@@ -2031,6 +2077,20 @@
 
         function closeOrientationModal() {
             document.getElementById('orientationModal').style.display = 'none';
+        }
+
+        function openRecognitionImageModal(source, title) {
+            if (!source) return;
+            recognitionImageScale = 1;
+            document.getElementById('recognition-image-modal-title').innerText = title || '识别结果';
+            const image = document.getElementById('recognition-image-modal-image');
+            image.src = source;
+            image.style.transform = 'scale(1)';
+            document.getElementById('recognition-image-modal').style.display = 'flex';
+        }
+
+        function closeRecognitionImageModal() {
+            document.getElementById('recognition-image-modal').style.display = 'none';
         }
 
         function saveOrientationModal() {
@@ -2673,7 +2733,7 @@
             pendingExteriorFusion = null;
             const panel = document.getElementById('exterior-review-panel');
             panel.classList.add('hidden');
-            document.getElementById('exterior-review-overlay').removeAttribute('src');
+            document.getElementById('component-review-overlay').removeAttribute('src');
             document.getElementById('exterior-confirm-scale').value = '';
             document.getElementById('confirm-exterior-button').disabled = false;
         }
@@ -3370,10 +3430,12 @@
                 String(Number(summary.small_repair_count || 0));
             document.getElementById('exterior-unresolved-summary').innerText =
                 String(Number(summary.unresolved_gap_count || 0));
-            document.getElementById('exterior-review-overlay').src =
-                data.images?.exterior_overlay
-                    ? 'data:image/png;base64,' + data.images.exterior_overlay
-                    : '';
+            document.getElementById('component-review-overlay').src =
+                data.images?.component_overlay
+                    ? 'data:image/png;base64,' + data.images.component_overlay
+                    : (data.images?.exterior_overlay
+                        ? 'data:image/png;base64,' + data.images.exterior_overlay
+                        : '');
             document.getElementById('exterior-review-status').innerText =
                 '该结果尚未确认，不能用于能耗计算。请核对轮廓、门窗、修补与未解决缺口，并确认比例尺。';
             document.getElementById('exterior-review-status').style.color = 'var(--warning)';
@@ -3578,9 +3640,11 @@
                     document.getElementById('imgOriginal').src = images.original
                         ? 'data:image/png;base64,' + images.original
                         : '';
-                    document.getElementById('imgOverlay').src = images.exterior_overlay
-                        ? 'data:image/png;base64,' + images.exterior_overlay
-                        : '';
+                    document.getElementById('imgOverlay').src = images.component_overlay
+                        ? 'data:image/png;base64,' + images.component_overlay
+                        : (images.exterior_overlay
+                            ? 'data:image/png;base64,' + images.exterior_overlay
+                            : '');
                     document.getElementById('aiRecognitionResults').classList.remove('hidden');
                     renderPendingExteriorReview(data);
                     updateCalculateEnergyAvailability();

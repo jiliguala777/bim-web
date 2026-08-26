@@ -19,6 +19,7 @@ from vector_pdf_fusion import FusionThresholds, build_line_candidates, fuse_line
 from vector_pdf_exterior import (
     build_exterior_topology,
     enumerate_exterior_gaps,
+    rescue_connected_exterior_walls,
     select_exterior_walls,
 )
 from vector_pdf_model import (
@@ -305,10 +306,11 @@ def _publish_exterior_artifacts(
     opening_raw = _write_json(output / "pdf_opening_candidates.json", opening_candidates)
     exterior_topology["opening_artifact_sha256"] = hashlib.sha256(opening_raw).hexdigest()
     _write_json(output / "pdf_exterior_topology.json", exterior_topology)
-    _write_image(
-        output / "pdf_exterior_overlay.png",
-        _draw_exterior_overlay(base_bgr, exterior_walls, opening_result, exterior_topology),
+    component_overlay = _draw_exterior_overlay(
+        base_bgr, exterior_walls, opening_result, exterior_topology,
     )
+    _write_image(output / "pdf_exterior_overlay.png", component_overlay)
+    _write_image(output / "pdf_component_overlay.png", component_overlay)
     return opening_candidates, exterior_topology, exterior_summary
 
 
@@ -509,6 +511,11 @@ def analyze_vector_pdf_page(
         (width, height),
         roi,
     )
+    exterior_walls.extend(rescue_connected_exterior_walls(
+        candidates,
+        exterior_walls,
+        (width, height),
+    ))
     gaps = enumerate_exterior_gaps(exterior_walls, (width, height), roi)
     opening_result = classify_exterior_openings(
         gaps,

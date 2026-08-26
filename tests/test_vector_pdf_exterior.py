@@ -160,6 +160,38 @@ class ExteriorWallSelectionTests(unittest.TestCase):
 
         self.assertEqual([wall["candidate_id"] for wall in result], ["valid"])
 
+    def test_rescues_native_wall_connected_to_two_exterior_anchors(self):
+        from vector_pdf_exterior import rescue_connected_exterior_walls
+
+        existing = [
+            exterior_wall("top", (20, 20), (80, 20), "horizontal", "down"),
+            exterior_wall("bottom", (20, 80), (80, 80), "horizontal", "up"),
+        ]
+        rescued = rescue_connected_exterior_walls(
+            [accepted_wall("missing-left", (20, 20), (20, 80), "vertical")],
+            existing,
+            (100, 100),
+        )
+
+        self.assertEqual(len(rescued), 1)
+        self.assertEqual(rescued[0]["candidate_id"], "missing-left")
+        self.assertEqual(rescued[0]["inside_direction"], "right")
+        self.assertIn("connected_exterior_continuity_rescue", rescued[0]["reason_codes"])
+
+    def test_does_not_rescue_wall_without_two_exterior_connections(self):
+        from vector_pdf_exterior import rescue_connected_exterior_walls
+
+        existing = [
+            exterior_wall("top", (20, 20), (80, 20), "horizontal", "down"),
+        ]
+        rescued = rescue_connected_exterior_walls(
+            [accepted_wall("unconnected", (20, 20), (20, 80), "vertical")],
+            existing,
+            (100, 100),
+        )
+
+        self.assertEqual(rescued, [])
+
 
 class ExteriorGapEnumerationTests(unittest.TestCase):
     def test_enumerates_only_unambiguous_collinear_gap(self):

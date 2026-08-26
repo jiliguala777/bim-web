@@ -157,8 +157,8 @@ class EnergyTemplateTests(unittest.TestCase):
         self.assertIn("/energy/vector_pdf_exterior_confirm", html)
         self.assertIn("确认外轮廓并用于能耗计算", html)
         self.assertIn('id="exterior-review-panel"', html)
-        self.assertIn('id="exterior-review-overlay"', html)
-        self.assertIn("images.exterior_overlay", html)
+        self.assertIn('id="component-review-overlay"', html)
+        self.assertIn("images.component_overlay", html)
         self.assertIn("area_px2", html)
         self.assertIn("perimeter_px", html)
         self.assertIn("door_count", html)
@@ -171,6 +171,14 @@ class EnergyTemplateTests(unittest.TestCase):
         self.assertIn("page_number: pending.pdf_page_number", html)
         self.assertIn("crop_bbox_page_px: pending.crop_bbox_page_px", html)
         self.assertIn("aiResultData = data.recognition;", html)
+
+    def test_exterior_debug_keeps_component_overlay_and_supports_image_enlargement(self):
+        html = Path("templates/energy.html").read_text(encoding="utf-8")
+
+        self.assertIn('id="component-review-overlay"', html)
+        self.assertIn("images.component_overlay", html)
+        self.assertIn('id="recognition-image-modal"', html)
+        self.assertIn("openRecognitionImageModal", html)
 
     def test_exterior_height_and_repeat_controls_are_sent_to_energy_route(self):
         html = Path("templates/energy.html").read_text(encoding="utf-8")

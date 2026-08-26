@@ -40,6 +40,7 @@ class VectorPdfFusionRouteTests(unittest.TestCase):
                 cv2.imwrite(str(output / "pdf_vector_model_input.png"), image)
                 cv2.imwrite(str(output / "pdf_vector_fusion_overlay.png"), image)
                 cv2.imwrite(str(output / "pdf_exterior_overlay.png"), image)
+                cv2.imwrite(str(output / "pdf_component_overlay.png"), image)
                 topology = {
                     "format": "pdf-exterior-topology/1",
                     "status": "review_required",
@@ -125,6 +126,7 @@ class VectorPdfFusionRouteTests(unittest.TestCase):
             self.assertEqual(payload["summary"]["accepted_wall_count"], 4)
             self.assertIn("overlay", payload["images"])
             self.assertIn("exterior_overlay", payload["images"])
+            self.assertIn("component_overlay", payload["images"])
             self.assertEqual(payload["exterior_summary"]["exterior_wall_count"], 4)
             self.assertEqual(
                 payload["topology_sha256"],
@@ -135,6 +137,10 @@ class VectorPdfFusionRouteTests(unittest.TestCase):
             self.assertEqual(
                 payload["artifacts"]["exterior_topology"],
                 "vector_pdf_fusion/pdf_exterior_topology.json",
+            )
+            self.assertEqual(
+                payload["artifacts"]["component_overlay"],
+                "vector_pdf_fusion/pdf_component_overlay.png",
             )
             self.assertFalse((report_dir / "recognition.json").exists())
             marker = json.loads(

@@ -2370,6 +2370,7 @@ def vector_pdf_fusion():
         original = cv2.imread(str(target_dir / 'pdf_vector_model_input.png'), cv2.IMREAD_COLOR)
         overlay = cv2.imread(str(target_dir / 'pdf_vector_fusion_overlay.png'), cv2.IMREAD_COLOR)
         exterior_overlay = cv2.imread(str(target_dir / 'pdf_exterior_overlay.png'), cv2.IMREAD_COLOR)
+        component_overlay = cv2.imread(str(target_dir / 'pdf_component_overlay.png'), cv2.IMREAD_COLOR)
         images = {}
         if original is not None:
             encoded, buffer = cv2.imencode('.png', original)
@@ -2383,6 +2384,10 @@ def vector_pdf_fusion():
             encoded, buffer = cv2.imencode('.png', exterior_overlay)
             if encoded:
                 images['exterior_overlay'] = base64.b64encode(buffer).decode('utf-8')
+        if component_overlay is not None:
+            encoded, buffer = cv2.imencode('.png', component_overlay)
+            if encoded:
+                images['component_overlay'] = base64.b64encode(buffer).decode('utf-8')
         topology_sha256 = _sha256_file(target_dir / 'pdf_exterior_topology.json')
     except ValueError as exc:
         _update_exterior_generation_if_current(
@@ -2452,6 +2457,7 @@ def vector_pdf_fusion():
             'opening_candidates': 'vector_pdf_fusion/pdf_opening_candidates.json',
             'exterior_topology': 'vector_pdf_fusion/pdf_exterior_topology.json',
             'exterior_overlay': 'vector_pdf_fusion/pdf_exterior_overlay.png',
+            'component_overlay': 'vector_pdf_fusion/pdf_component_overlay.png',
         },
         'images': images,
     })

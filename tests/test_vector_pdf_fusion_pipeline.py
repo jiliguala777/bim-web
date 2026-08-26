@@ -143,6 +143,7 @@ class VectorPdfFusionPipelineTests(unittest.TestCase):
             self.assertTrue((output / "pdf_native_candidates.json").is_file())
             self.assertTrue((output / "pdf_vector_fusion.json").is_file())
             self.assertTrue((output / "pdf_vector_fusion_overlay.png").is_file())
+            self.assertTrue((output / "pdf_component_overlay.png").is_file())
             payload = json.loads(
                 (output / "pdf_vector_fusion.json").read_text(encoding="utf-8")
             )
@@ -173,6 +174,7 @@ class VectorPdfFusionPipelineTests(unittest.TestCase):
             self.assertTrue((output / "pdf_opening_candidates.json").is_file())
             self.assertTrue((output / "pdf_exterior_topology.json").is_file())
             self.assertTrue((output / "pdf_exterior_overlay.png").is_file())
+            self.assertTrue((output / "pdf_component_overlay.png").is_file())
             openings_raw = (output / "pdf_opening_candidates.json").read_bytes()
             openings = json.loads(openings_raw)
             exterior = json.loads((output / "pdf_exterior_topology.json").read_text(encoding="utf-8"))

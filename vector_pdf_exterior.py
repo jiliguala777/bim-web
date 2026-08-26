@@ -20,6 +20,9 @@ class ExteriorThresholds:
     footprint_side_difference_min: float = 0.25
     footprint_boundary_mean_min: float = 0.35
     collinear_tolerance_px: int = 2
+    continuity_connection_tolerance_px: int = 36
+    continuity_boundary_band_px: int = 8
+    continuity_min_length_px: int = 40
 
 
 def _local_line_mask(
@@ -151,6 +154,117 @@ def select_exterior_walls(
         wall["footprint_outside_mean"] = outside[1]
         exterior.append(wall)
     return exterior
+
+
+def _point_near_segment(
+    point: tuple[int, int],
+    start: tuple[int, int],
+    end: tuple[int, int],
+    tolerance_px: int,
+) -> bool:
+    if start[0] == end[0]:
+        return (
+            abs(point[0] - start[0]) <= tolerance_px
+            and min(start[1], end[1]) - tolerance_px <= point[1] <= max(start[1], end[1]) + tolerance_px
+        )
+    return (
+        abs(point[1] - start[1]) <= tolerance_px
+        and min(start[0], end[0]) - tolerance_px <= point[0] <= max(start[0], end[0]) + tolerance_px
+    )
+
+
+def rescue_connected_exterior_walls(
+    candidates: list[dict],
+    exterior_walls: list[dict],
+    image_size: tuple[int, int],
+) -> list[dict]:
+    """Promote only native wall candidates that close a supported exterior side.
+
+    A candidate must already be a model-supported structural line and connect at
+    both endpoints to distinct exterior anchors.  This intentionally cannot
+    invent a long wall where the PDF itself supplies no line evidence.
+    """
+    if len(exterior_walls) < 2:
+        return []
+    width, height = (int(value) for value in image_size)
+    thresholds = ExteriorThresholds()
+    tolerance = thresholds.continuity_connection_tolerance_px
+    existing_ids = {str(wall.get("candidate_id")) for wall in exterior_walls}
+    anchors = []
+    for wall in exterior_walls:
+        try:
+            _, start, end = _axis_line(wall)
+        except (KeyError, TypeError, ValueError):
+            continue
+        anchors.append((str(wall.get("candidate_id")), start, end))
+    if len(anchors) < 2:
+        return []
+
+    midpoints = []
+    for _, start, end in anchors:
+        midpoints.append(((start[0] + end[0]) / 2.0, (start[1] + end[1]) / 2.0))
+    centre_x = float(np.mean([point[0] for point in midpoints]))
+    centre_y = float(np.mean([point[1] for point in midpoints]))
+
+    rescued = []
+    for candidate in candidates:
+        candidate_id = str(candidate.get("candidate_id"))
+        native = candidate.get("native_evidence") or {}
+        if (
+            candidate_id in existing_ids
+            or candidate.get("decision") != "accepted_wall_candidate"
+            or not native.get("native_structural")
+        ):
+            continue
+        try:
+            orientation, start, end = _axis_line(candidate)
+        except (KeyError, TypeError, ValueError):
+            continue
+        if not all(0 <= point[0] < width and 0 <= point[1] < height for point in (start, end)):
+            continue
+        if math.dist(start, end) < thresholds.continuity_min_length_px:
+            continue
+
+        # A rescued segment must lie on an already-supported outside band, not
+        # merely cross the building interior between two exterior walls.
+        fixed = start[0] if orientation == "vertical" else start[1]
+        anchor_fixed = [
+            anchor_start[0] if orientation == "vertical" else anchor_start[1]
+            for _, anchor_start, anchor_end in anchors
+            if (anchor_start[0] == anchor_end[0]) == (orientation == "vertical")
+        ]
+        if (
+            anchor_fixed
+            and min(abs(fixed - value) for value in anchor_fixed)
+            > thresholds.continuity_boundary_band_px
+        ):
+            continue
+
+        start_connections = {
+            anchor_id for anchor_id, anchor_start, anchor_end in anchors
+            if _point_near_segment(start, anchor_start, anchor_end, tolerance)
+        }
+        end_connections = {
+            anchor_id for anchor_id, anchor_start, anchor_end in anchors
+            if _point_near_segment(end, anchor_start, anchor_end, tolerance)
+        }
+        connected_anchor_ids = start_connections | end_connections
+        if not start_connections or not end_connections or len(connected_anchor_ids) < 2:
+            continue
+
+        wall = copy.deepcopy(candidate)
+        if orientation == "vertical":
+            wall["inside_direction"] = "right" if fixed <= centre_x else "left"
+        else:
+            wall["inside_direction"] = "down" if fixed <= centre_y else "up"
+        wall["footprint_inside_mean"] = None
+        wall["footprint_outside_mean"] = None
+        wall["reason_codes"] = [
+            *wall.get("reason_codes", []),
+            "connected_exterior_continuity_rescue",
+        ]
+        rescued.append(wall)
+    return rescued
 
 
 def _normalise_exterior_wall(item: dict) -> dict:

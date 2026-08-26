@@ -1857,7 +1857,10 @@ def _validated_inferred_exterior_edges(topology, polygon_edges, perimeter_px, im
         if inferred_edges:
             raise RuntimeError('Legacy exterior topology must not contain inferred edges')
         return [], 0.0, 0.0
-    if closure_method != 'footprint_guided_inference':
+    calculation_only = closure_method == 'calculation_only_endpoint_link'
+    if closure_method not in {
+        'footprint_guided_inference', 'calculation_only_endpoint_link',
+    }:
         raise RuntimeError('Exterior topology closure method is invalid')
     if not isinstance(inferred_edges, list) or not inferred_edges or any(
         not isinstance(edge, dict) for edge in inferred_edges
@@ -1886,7 +1889,10 @@ def _validated_inferred_exterior_edges(topology, polygon_edges, perimeter_px, im
         length = interval[1] - interval[0]
         if not _metric_matches(edge.get('length_px'), length):
             raise RuntimeError(f'inferred edge {inference_id} length does not match endpoints')
-        if length > math.nextafter(min(image_size) * 0.10, math.inf):
+        if (
+            not calculation_only
+            and length > math.nextafter(min(image_size) * 0.10, math.inf)
+        ):
             raise RuntimeError(f'inferred edge {inference_id} exceeds the short-side limit')
         anchors = _strict_string_ids(
             edge.get('anchor_wall_ids'), f'inferred edge {inference_id} anchor_wall_ids',
@@ -1904,7 +1910,10 @@ def _validated_inferred_exterior_edges(topology, polygon_edges, perimeter_px, im
             or group_size not in {1, 2}
         ):
             raise RuntimeError(f'inferred edge {inference_id} group is invalid')
-        expected_group_size = 1 if inference_type == 'collinear_extension' else 2
+        expected_group_size = (
+            group_size if calculation_only
+            else (1 if inference_type == 'collinear_extension' else 2)
+        )
         if group_size != expected_group_size:
             raise RuntimeError(f'inferred edge {inference_id} group is incomplete')
         if edge.get('decision') != 'accepted_candidate':
@@ -1916,34 +1925,35 @@ def _validated_inferred_exterior_edges(topology, polygon_edges, perimeter_px, im
         )
         if inside_direction not in expected_directions:
             raise RuntimeError(f'inferred edge {inference_id} inside direction is invalid')
-        try:
-            inside_mean = float(edge.get('inside_mean'))
-            outside_mean = float(edge.get('outside_mean'))
-            boundary_mean = float(edge.get('boundary_mean'))
-            difference = float(edge.get('inside_outside_difference'))
-            inside_support_fraction = float(edge.get('inside_support_fraction'))
-            outside_support_fraction = float(edge.get('outside_support_fraction'))
-        except (TypeError, ValueError, OverflowError) as exc:
-            raise RuntimeError(f'inferred edge {inference_id} footprint evidence is invalid') from exc
-        if not all(math.isfinite(value) for value in (
-            inside_mean, outside_mean, boundary_mean, difference,
-            inside_support_fraction, outside_support_fraction,
-        )) or not _metric_matches(difference, inside_mean - outside_mean):
-            raise RuntimeError(f'inferred edge {inference_id} footprint evidence is invalid')
-        if (
-            any(value < 0.0 or value > 1.0 for value in (
-                inside_mean, outside_mean, boundary_mean,
+        if not calculation_only:
+            try:
+                inside_mean = float(edge.get('inside_mean'))
+                outside_mean = float(edge.get('outside_mean'))
+                boundary_mean = float(edge.get('boundary_mean'))
+                difference = float(edge.get('inside_outside_difference'))
+                inside_support_fraction = float(edge.get('inside_support_fraction'))
+                outside_support_fraction = float(edge.get('outside_support_fraction'))
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise RuntimeError(f'inferred edge {inference_id} footprint evidence is invalid') from exc
+            if not all(math.isfinite(value) for value in (
+                inside_mean, outside_mean, boundary_mean, difference,
                 inside_support_fraction, outside_support_fraction,
-            ))
-            or difference < -1.0 or difference > 1.0
-        ):
-            raise RuntimeError(f'inferred edge {inference_id} footprint evidence is invalid')
-        if inside_mean < 0.50 or difference < 0.25 or boundary_mean < 0.35:
-            raise RuntimeError(f'inferred edge {inference_id} footprint support is insufficient')
-        if inside_support_fraction < 0.80:
-            raise RuntimeError(f'inferred edge {inference_id} footprint support is discontinuous')
-        if outside_support_fraction >= 0.50:
-            raise RuntimeError(f'inferred edge {inference_id} crosses building interior')
+            )) or not _metric_matches(difference, inside_mean - outside_mean):
+                raise RuntimeError(f'inferred edge {inference_id} footprint evidence is invalid')
+            if (
+                any(value < 0.0 or value > 1.0 for value in (
+                    inside_mean, outside_mean, boundary_mean,
+                    inside_support_fraction, outside_support_fraction,
+                ))
+                or difference < -1.0 or difference > 1.0
+            ):
+                raise RuntimeError(f'inferred edge {inference_id} footprint evidence is invalid')
+            if inside_mean < 0.50 or difference < 0.25 or boundary_mean < 0.35:
+                raise RuntimeError(f'inferred edge {inference_id} footprint support is insufficient')
+            if inside_support_fraction < 0.80:
+                raise RuntimeError(f'inferred edge {inference_id} footprint support is discontinuous')
+            if outside_support_fraction >= 0.50:
+                raise RuntimeError(f'inferred edge {inference_id} crosses building interior')
         item = copy.deepcopy(edge)
         item['start_px'] = start
         item['end_px'] = end
@@ -1953,7 +1963,11 @@ def _validated_inferred_exterior_edges(topology, polygon_edges, perimeter_px, im
 
     for group_id, members in groups.items():
         inference_type = members[0]['inference_type']
-        expected_size = 1 if inference_type == 'collinear_extension' else 2
+        expected_size = (
+            int(members[0]['edge_group_size'])
+            if calculation_only
+            else (1 if inference_type == 'collinear_extension' else 2)
+        )
         if len(members) != expected_size or any(
             member['inference_type'] != inference_type for member in members
         ):
@@ -1971,7 +1985,7 @@ def _validated_inferred_exterior_edges(topology, polygon_edges, perimeter_px, im
 
     total_length = math.fsum(edge['length_px'] for edge in normalized)
     ratio = total_length / perimeter_px
-    if ratio > math.nextafter(0.12, math.inf):
+    if not calculation_only and ratio > math.nextafter(0.12, math.inf):
         raise RuntimeError('Inferred exterior length exceeds 12% of perimeter')
     if not _metric_matches(topology.get('inferred_length_px'), total_length) or not _metric_matches(
         topology.get('inferred_perimeter_ratio'), ratio,

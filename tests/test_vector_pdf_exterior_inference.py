@@ -406,5 +406,34 @@ class FootprintGuidedTopologyTests(unittest.TestCase):
         self.assertEqual(result["score"][3], -0.8)
 
 
+class CalculationOnlyClosureTests(unittest.TestCase):
+    def test_closes_long_endpoint_gap_only_for_area_calculation(self):
+        from vector_pdf_exterior import build_calculation_only_exterior_topology
+        from vector_pdf_exterior_inference import generate_exterior_inference_candidates
+
+        walls = [
+            wall("top", (20, 20), (120, 20), "horizontal", "down"),
+            wall("right", (180, 30), (180, 120), "vertical", "left"),
+            wall("bottom", (20, 120), (180, 120), "horizontal", "up"),
+            wall("left", (20, 20), (20, 120), "vertical", "right"),
+        ]
+        probabilities = rectangular_footprint()
+        candidates = generate_exterior_inference_candidates(
+            walls, probabilities, (200, 140), [0, 0, 200, 140],
+        )
+
+        topology = build_calculation_only_exterior_topology(
+            walls, [], [], probabilities, (200, 140), [0, 0, 200, 140],
+            endpoint_candidates=candidates,
+        )
+
+        self.assertEqual(topology["status"], "review_required")
+        self.assertEqual(topology["closure_method"], "calculation_only_endpoint_link")
+        self.assertEqual(topology["area_px2"], 16000.0)
+        self.assertEqual(topology["inferred_length_px"], 70.0)
+        self.assertGreater(topology["inferred_perimeter_ratio"], 0.12)
+        self.assertFalse(topology["load_geometry_ready"])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -202,6 +202,8 @@ class EnergyTemplateTests(unittest.TestCase):
         self.assertIn("inferred_edge_count", html)
         self.assertIn("inferred_length_px", html)
         self.assertIn("inferred_perimeter_ratio", html)
+        self.assertIn("calculation_only_endpoint_link", html)
+        self.assertIn("仅用于面积和周长计算", html)
 
     def test_exterior_height_and_repeat_controls_are_sent_to_energy_route(self):
         html = Path("templates/energy.html").read_text(encoding="utf-8")

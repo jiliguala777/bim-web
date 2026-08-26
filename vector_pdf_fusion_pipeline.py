@@ -17,6 +17,7 @@ from pdf2image import convert_from_path
 
 from vector_pdf_fusion import FusionThresholds, build_line_candidates, fuse_line_candidates
 from vector_pdf_exterior import (
+    build_calculation_only_exterior_topology,
     build_exterior_topology,
     enumerate_exterior_gaps,
     rescue_connected_exterior_walls,
@@ -607,6 +608,7 @@ def analyze_vector_pdf_page(
         roi,
         pending_openings=opening_result["pending_openings"],
     )
+    inference_candidates = []
     if exterior.get("status") == "exterior_not_closed":
         inference_candidates = generate_exterior_inference_candidates(
             exterior_walls,
@@ -642,6 +644,19 @@ def analyze_vector_pdf_page(
                 for candidate in inference_candidates
                 for reason in candidate.get("reason_codes", [])
             })
+    if exterior.get("status") == "exterior_not_closed":
+        calculation_only = build_calculation_only_exterior_topology(
+            exterior_walls,
+            gaps,
+            opening_result["accepted_openings"],
+            model_result.probabilities,
+            (width, height),
+            roi,
+            pending_openings=opening_result["pending_openings"],
+            endpoint_candidates=inference_candidates,
+        )
+        if calculation_only.get("status") == "review_required":
+            exterior = calculation_only
     exterior_openings, exterior_topology, exterior_summary = _publish_exterior_artifacts(
         output,
         render_bgr,

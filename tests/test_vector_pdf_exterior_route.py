@@ -577,6 +577,35 @@ class VectorPdfExteriorConfirmRouteTests(unittest.TestCase):
         self.assertEqual(len(validated[3]), 2)
         self.assertEqual(len(real_walls), 4)
 
+    def test_confirm_accepts_calculation_only_endpoint_link_over_inference_limits(self):
+        with tempfile.TemporaryDirectory() as directory:
+            upload_root = Path(directory)
+            report_dir = upload_root / "energy" / "EXT-1"
+            topology, openings, topology_path = self._artifacts(report_dir)
+            inferred = self._add_inferred_boundary_segment(topology)
+            topology["closure_method"] = "calculation_only_endpoint_link"
+            inferred.update(start_px=[50, 0], end_px=[90, 0], length_px=40.0)
+            topology["real_wall_segments"][1].update(
+                start_px=[90, 0], end_px=[100, 0], length_px=10.0,
+            )
+            topology["inferred_length_px"] = 40.0
+            topology["inferred_perimeter_ratio"] = 40.0 / 300.0
+            topology["inference_candidates"] = [dict(inferred)]
+
+            response = self._post_artifacts(
+                upload_root, topology, openings, topology_path,
+            )
+
+            self.assertEqual(response.status_code, 200, response.get_json())
+            saved = json.loads((report_dir / "recognition.json").read_text("utf-8"))
+            self.assertEqual(
+                saved["exterior_topology"]["closure_method"],
+                "calculation_only_endpoint_link",
+            )
+            self.assertEqual(sum(
+                wall["length_px"] for wall in saved["geometry"]["walls"]
+            ), 225.0)
+
     def test_confirm_rejects_tampered_or_unsafe_inferred_boundary(self):
         cases = (
             "forged total", "too much perimeter", "outside boundary",

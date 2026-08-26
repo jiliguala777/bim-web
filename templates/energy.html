@@ -3444,8 +3444,12 @@
                 String(Number(summary.pending_door_arc_count || 0));
             const footprintGuidedInference =
                 summary.closure_method === 'footprint_guided_inference';
+            const calculationOnlyClosure =
+                summary.closure_method === 'calculation_only_endpoint_link';
             document.getElementById('exterior-closure-method-summary').innerText =
-                footprintGuidedInference ? '足迹引导推断（需人工确认）' : '墙体/门窗常规闭合';
+                calculationOnlyClosure
+                    ? '端点兜底闭合（仅计算）'
+                    : (footprintGuidedInference ? '足迹引导推断（需人工确认）' : '墙体/门窗常规闭合');
             document.getElementById('exterior-inferred-edge-summary').innerText =
                 `${Number(summary.inferred_edge_count || 0)} 条`;
             document.getElementById('exterior-inferred-length-summary').innerText =
@@ -3462,9 +3466,11 @@
                     : (data.images?.exterior_overlay
                         ? 'data:image/png;base64,' + data.images.exterior_overlay
                         : '');
-            document.getElementById('exterior-review-status').innerText = footprintGuidedInference
-                ? '外轮廓使用了橙色虚线推断边，必须人工核对后确认；确认前不能用于能耗计算。'
-                : '该结果尚未确认，不能用于能耗计算。请核对轮廓、门窗、修补与未解决缺口，并确认比例尺。';
+            document.getElementById('exterior-review-status').innerText = calculationOnlyClosure
+                ? '橙色虚线为识别完成后的端点兜底连接，仅用于面积和周长计算；请人工核对闭合轮廓后确认。'
+                : (footprintGuidedInference
+                    ? '外轮廓使用了橙色虚线推断边，必须人工核对后确认；确认前不能用于能耗计算。'
+                    : '该结果尚未确认，不能用于能耗计算。请核对轮廓、门窗、修补与未解决缺口，并确认比例尺。');
             document.getElementById('exterior-review-status').style.color = 'var(--warning)';
             document.getElementById('exterior-review-panel').classList.remove('hidden');
             document.getElementById('confirm-exterior-button').disabled = false;

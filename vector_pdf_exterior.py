@@ -886,6 +886,8 @@ def _empty_exterior_topology(
 def _evaluate_inferred_face(
     face: dict,
     candidates_by_id: dict[str, dict],
+    *,
+    allow_excessive_length: bool = False,
 ) -> dict:
     """Recompute inference usage and reject incomplete or excessive repairs."""
     used_ids = {str(value) for value in face.get("inferred_edge_ids", set())}
@@ -925,7 +927,7 @@ def _evaluate_inferred_face(
     inferred_length = float(sum(lengths))
     perimeter = float(face.get("perimeter") or 0.0)
     ratio = inferred_length / perimeter if perimeter > 0 else math.inf
-    if not math.isfinite(ratio) or ratio > 0.12:
+    if not math.isfinite(ratio) or (ratio > 0.12 and not allow_excessive_length):
         reasons.append("inferred_perimeter_ratio_exceeded")
     reasons = list(dict.fromkeys(reasons))
     average_difference = float(np.mean(differences)) if differences else 0.0
@@ -949,12 +951,14 @@ def _evaluate_inferred_face(
     }
 
 
-def _select_inferred_face(faces: list[dict]) -> tuple[dict | None, list[str]]:
+def _select_inferred_face(
+    faces: list[dict], *, allow_competing: bool = False,
+) -> tuple[dict | None, list[str]]:
     if not faces:
         return None, []
     ordered = sorted(faces, key=lambda face: face["inference_metrics"]["score"])
     selected = ordered[0]
-    if len(ordered) == 1:
+    if len(ordered) == 1 or allow_competing:
         return selected, []
     competitor = ordered[1]
     best_length = selected["inference_metrics"]["inferred_length_px"]
@@ -1089,6 +1093,7 @@ def build_exterior_topology(
     scale_m_per_px: float | None = None,
     pending_openings: list[dict] | None = None,
     inference_candidates: list[dict] | None = None,
+    calculation_only: bool = False,
 ) -> dict:
     """Build traceable bridges and select the largest supported orthogonal footprint."""
     width, height = (int(value) for value in image_size)
@@ -1244,7 +1249,10 @@ def build_exterior_topology(
     if inference_mode:
         evaluated_faces = []
         for face in faces:
-            metrics = _evaluate_inferred_face(face, candidates_by_id)
+            metrics = _evaluate_inferred_face(
+                face, candidates_by_id,
+                allow_excessive_length=calculation_only,
+            )
             if metrics["accepted"]:
                 face["inference_metrics"] = metrics
                 evaluated_faces.append(face)
@@ -1265,7 +1273,9 @@ def build_exterior_topology(
         )
 
     if inference_mode:
-        largest, selection_reasons = _select_inferred_face(faces)
+        largest, selection_reasons = _select_inferred_face(
+            faces, allow_competing=calculation_only,
+        )
         if largest is None:
             return _empty_exterior_topology(
                 "ambiguous_exterior", unresolved_gaps, bridges,
@@ -1303,7 +1313,11 @@ def build_exterior_topology(
         "real_wall_segments": real_wall_segments,
         "bridges": bridges,
         "unresolved_gaps": unresolved_gaps,
-        "closure_method": "footprint_guided_inference" if inference_mode else None,
+        "closure_method": (
+            "calculation_only_endpoint_link"
+            if calculation_only and inference_mode
+            else ("footprint_guided_inference" if inference_mode else None)
+        ),
         "inferred_edges": copy.deepcopy(inference_metrics["selected_edges"]),
         "inference_candidates": inference_candidates,
         "inferred_length_px": inference_metrics["inferred_length_px"],
@@ -1313,3 +1327,47 @@ def build_exterior_topology(
         ),
         "load_geometry_ready": False,
     }
+
+
+def build_calculation_only_exterior_topology(
+    exterior_walls: list[dict],
+    gaps: list[dict],
+    openings: list[dict],
+    probabilities: np.ndarray,
+    image_size: tuple[int, int],
+    building_roi: list[int] | None,
+    *,
+    pending_openings: list[dict] | None = None,
+    endpoint_candidates: list[dict] | None = None,
+) -> dict:
+    """Close endpoint gaps for area/perimeter only after recognition has failed."""
+    blocked_reasons = {
+        "inferred_edge_outside_roi",
+        "inferred_intersection_outside_roi",
+        "incompatible_corner_inside_directions",
+        "inferred_edge_crosses_nearer_wall_band",
+    }
+    grouped: dict[str, list[dict]] = defaultdict(list)
+    for candidate in copy.deepcopy(endpoint_candidates or []):
+        group_id = candidate.get("edge_group_id")
+        if isinstance(group_id, str) and group_id:
+            grouped[group_id].append(candidate)
+    relaxed = []
+    for group_id in sorted(grouped):
+        members = grouped[group_id]
+        if any(blocked_reasons.intersection(member.get("reason_codes", [])) for member in members):
+            continue
+        for member in members:
+            member["decision"] = "accepted_candidate"
+            member["edge_group_size"] = len(members)
+            member["reason_codes"] = ["calculation_only_endpoint_link"]
+            relaxed.append(member)
+    topology = build_exterior_topology(
+        exterior_walls, gaps, openings, probabilities, image_size, building_roi,
+        pending_openings=pending_openings,
+        inference_candidates=relaxed,
+        calculation_only=True,
+    )
+    if topology.get("status") == "review_required":
+        topology["inference_reason_codes"] = ["calculation_only_endpoint_link"]
+    return topology

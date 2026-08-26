@@ -184,6 +184,7 @@ class VectorPdfFusionPipelineTests(unittest.TestCase):
             )
             self.assertIn("accepted_openings", openings)
             self.assertIn("ambiguous_openings", openings)
+            self.assertIn("pending_openings", openings)
             self.assertIn("unclassified_gaps", openings)
             self.assertIn("bridges", exterior)
             self.assertIn("real_wall_segments", exterior)

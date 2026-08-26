@@ -318,6 +318,37 @@ class ExteriorTopologyTests(unittest.TestCase):
         self.assertFalse(topology["confirmed"])
         self.assertFalse(topology["load_geometry_ready"])
 
+    def test_pending_opening_bridges_rectangle_without_becoming_area_opening(self):
+        from vector_pdf_exterior import build_exterior_topology
+
+        polygon = [(20, 20), (80, 20), (80, 80), (20, 80)]
+        topology = build_exterior_topology(
+            rectangle_with_bottom_gap(door_gap=(40, 60)),
+            [topology_gap(40, 80, 60, 80)],
+            [],
+            supported_footprint(polygon),
+            (100, 100),
+            [0, 0, 100, 100],
+            pending_openings=[{
+                "pending_opening_id": "pending-gap-0001",
+                "kind": "pending_opening",
+                "orientation": "horizontal",
+                "start_px": [40, 80],
+                "end_px": [60, 80],
+                "host_wall_ids": ["bottom-left", "bottom-right"],
+                "exterior": True,
+            }],
+        )
+
+        self.assertEqual(topology["status"], "review_required")
+        self.assertEqual(topology["bridges"][0]["bridge_type"], "pending_opening_bridge")
+        self.assertEqual(topology["opening_ids"], [])
+        self.assertEqual(topology["pending_opening_ids"], ["pending-gap-0001"])
+        self.assertEqual(
+            sum(segment["length_px"] for segment in topology["real_wall_segments"]),
+            220.0,
+        )
+
     def test_unknown_gap_repairs_at_metric_boundary_only(self):
         from vector_pdf_exterior import build_exterior_topology
 

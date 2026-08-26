@@ -523,6 +523,20 @@ def _opening_matches_gap(opening: dict, gap: dict) -> bool:
         return False
 
 
+def _pending_opening_matches_gap(pending: dict, gap: dict) -> bool:
+    try:
+        return (
+            pending.get("exterior") is True
+            and pending.get("kind") == "pending_opening"
+            and pending.get("orientation") == gap.get("orientation")
+            and _canonical_endpoints(pending) == _canonical_endpoints(gap)
+            and sorted(str(value) for value in pending.get("host_wall_ids", []))
+            == sorted(str(value) for value in gap.get("host_wall_ids", []))
+        )
+    except (KeyError, TypeError, ValueError):
+        return False
+
+
 def _unresolved_gap(gap: dict, reason: str | None = None) -> dict:
     unresolved = copy.deepcopy(gap)
     if reason is not None:
@@ -538,6 +552,10 @@ def _bridge_segment(bridge: dict) -> dict:
         "opening_ids": (
             {bridge["opening_id"]} if bridge.get("opening_id") is not None else set()
         ),
+        "pending_opening_ids": (
+            {bridge["pending_opening_id"]}
+            if bridge.get("pending_opening_id") is not None else set()
+        ),
     })
     return segment
 
@@ -551,6 +569,7 @@ def _wall_segment(wall: dict) -> dict:
         "source_wall_ids": {candidate_id},
         "bridge_ids": set(),
         "opening_ids": set(),
+        "pending_opening_ids": set(),
     })
     return segment
 
@@ -566,7 +585,7 @@ def _merge_topology_segments(segments: list[dict]) -> list[dict]:
         for member in members[1:]:
             if member["axis_start"] <= current["axis_end"]:
                 current["axis_end"] = max(current["axis_end"], member["axis_end"])
-                for field in ("source_wall_ids", "bridge_ids", "opening_ids"):
+                for field in ("source_wall_ids", "bridge_ids", "opening_ids", "pending_opening_ids"):
                     current[field].update(member[field])
                 continue
             merged.append(current)
@@ -621,6 +640,7 @@ def _split_at_intersections(
                 "source_wall_ids": set(),
                 "bridge_ids": set(),
                 "opening_ids": set(),
+                "pending_opening_ids": set(),
             })
             for field in evidence:
                 evidence[field].update(segment[field])
@@ -714,6 +734,7 @@ def _enumerate_bounded_faces(adjacency: dict, edge_evidence: dict) -> list[dict]
             "source_wall_ids": set(),
             "bridge_ids": set(),
             "opening_ids": set(),
+            "pending_opening_ids": set(),
         }
         for face_edge in face_edges:
             for field in evidence:
@@ -798,6 +819,7 @@ def _empty_exterior_topology(status: str, unresolved_gaps: list[dict], bridges: 
         "source_wall_ids": [],
         "bridge_ids": [],
         "opening_ids": [],
+        "pending_opening_ids": [],
         "real_wall_segments": [],
         "bridges": bridges,
         "unresolved_gaps": unresolved_gaps,
@@ -899,13 +921,16 @@ def _discard_unused_small_gap_repairs(
     kept = []
     for bridge in bridges:
         if (
-            bridge["bridge_type"] == "small_gap_repair"
+            bridge["bridge_type"] in {"small_gap_repair", "pending_opening_bridge"}
             and bridge["bridge_id"] not in used_bridge_ids
         ):
             gap = gaps_by_id.get(bridge["gap_id"])
             if gap is not None:
                 unresolved_gaps.append(_unresolved_gap(
-                    gap, "gap_does_not_close_supported_exterior",
+                    gap,
+                    "pending_opening_does_not_close_supported_exterior"
+                    if bridge["bridge_type"] == "pending_opening_bridge"
+                    else "gap_does_not_close_supported_exterior",
                 ))
             continue
         kept.append(bridge)
@@ -922,6 +947,7 @@ def build_exterior_topology(
     building_roi: list[int] | None,
     *,
     scale_m_per_px: float | None = None,
+    pending_openings: list[dict] | None = None,
 ) -> dict:
     """Build traceable bridges and select the largest supported orthogonal footprint."""
     width, height = (int(value) for value in image_size)
@@ -930,6 +956,7 @@ def build_exterior_topology(
         raise ValueError("probabilities must have shape (10, height, width)")
     roi = [0, 0, width, height] if building_roi is None else [int(value) for value in building_roi]
     repair_limit = _repair_limit_px((width, height), scale_m_per_px)
+    pending_openings = [] if pending_openings is None else pending_openings
 
     wall_segments = []
     for wall in exterior_walls:
@@ -950,6 +977,10 @@ def build_exterior_topology(
             unresolved_gaps.append(_unresolved_gap(gap, "corner_gap_requires_turn"))
             continue
         matching_openings = [opening for opening in openings if _opening_matches_gap(opening, gap)]
+        matching_pending = [
+            pending for pending in pending_openings
+            if _pending_opening_matches_gap(pending, gap)
+        ]
         if len(matching_openings) > 1:
             unresolved_gaps.append(_unresolved_gap(gap, "multiple_matching_openings"))
             continue
@@ -960,9 +991,21 @@ def build_exterior_topology(
             opening_id = str(opening["opening_id"])
             confidence = float(opening.get("confidence", 0.0))
             reason_codes = ["accepted_opening_exact_gap_match"]
+            pending_opening_id = None
+        elif len(matching_pending) == 1:
+            pending = matching_pending[0]
+            bridge_type = "pending_opening_bridge"
+            opening_id = None
+            pending_opening_id = str(pending["pending_opening_id"])
+            confidence = float(pending.get("confidence", 0.0))
+            reason_codes = ["pending_opening_exact_gap_match"]
+        elif len(matching_pending) > 1:
+            unresolved_gaps.append(_unresolved_gap(gap, "multiple_matching_pending_openings"))
+            continue
         elif _gap_within_repair_limit(width_px, repair_limit, scale_m_per_px):
             bridge_type = "small_gap_repair"
             opening_id = None
+            pending_opening_id = None
             confidence = 1.0
             reason_codes = ["gap_within_repair_limit"]
         else:
@@ -980,6 +1023,7 @@ def build_exterior_topology(
             "gap_id": str(gap["gap_id"]),
             "host_wall_ids": sorted(str(value) for value in gap.get("host_wall_ids", [])),
             "opening_id": opening_id,
+            "pending_opening_id": pending_opening_id,
             "confidence": confidence,
             "reason_codes": reason_codes,
         }
@@ -1041,6 +1085,7 @@ def build_exterior_topology(
         "source_wall_ids": sorted(largest["source_wall_ids"]),
         "bridge_ids": sorted(largest["bridge_ids"]),
         "opening_ids": sorted(largest["opening_ids"]),
+        "pending_opening_ids": sorted(largest["pending_opening_ids"]),
         "real_wall_segments": real_wall_segments,
         "bridges": bridges,
         "unresolved_gaps": unresolved_gaps,

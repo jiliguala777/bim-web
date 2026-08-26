@@ -281,6 +281,7 @@ def _publish_exterior_artifacts(
         "gaps": copy.deepcopy(gaps),
         "accepted_openings": copy.deepcopy(opening_result["accepted_openings"]),
         "ambiguous_openings": copy.deepcopy(opening_result["ambiguous_openings"]),
+        "pending_openings": copy.deepcopy(opening_result.get("pending_openings", [])),
         "unclassified_gaps": copy.deepcopy(opening_result["unclassified_gaps"]),
     }
     exterior_topology = {
@@ -296,6 +297,7 @@ def _publish_exterior_artifacts(
         "rejected_gap_count": sum(gap.get("decision") != "accepted_gap" for gap in gaps),
         "accepted_opening_count": len(opening_result["accepted_openings"]),
         "ambiguous_opening_count": len(opening_result["ambiguous_openings"]),
+        "pending_opening_count": len(opening_result.get("pending_openings", [])),
         "unclassified_gap_count": len(opening_result["unclassified_gaps"]),
         "bridge_count": len(exterior_topology["bridges"]),
         "unresolved_gap_count": len(exterior_topology["unresolved"]),
@@ -341,7 +343,12 @@ def analyze_vector_pdf_page(
             None,
             [],
             [],
-            {"accepted_openings": [], "ambiguous_openings": [], "unclassified_gaps": []},
+            {
+                "accepted_openings": [],
+                "ambiguous_openings": [],
+                "pending_openings": [],
+                "unclassified_gaps": [],
+            },
             _empty_exterior_topology("not_vector_pdf"),
         )
         rejected = {
@@ -521,6 +528,10 @@ def analyze_vector_pdf_page(
         gaps,
         model_result.probabilities,
         (width, height),
+        native_opening_evidence={
+            "curve_edges": page_data.get("opening_curve_edges", []),
+            "short_segments": page_data.get("opening_short_segments", []),
+        },
     )
     exterior = build_exterior_topology(
         exterior_walls,
@@ -529,6 +540,7 @@ def analyze_vector_pdf_page(
         model_result.probabilities,
         (width, height),
         roi,
+        pending_openings=opening_result["pending_openings"],
     )
     exterior_openings, exterior_topology, exterior_summary = _publish_exterior_artifacts(
         output,

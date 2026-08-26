@@ -163,6 +163,8 @@ class EnergyTemplateTests(unittest.TestCase):
         self.assertIn("perimeter_px", html)
         self.assertIn("door_count", html)
         self.assertIn("window_count", html)
+        self.assertIn("pending_opening_count", html)
+        self.assertIn("待确认开口", html)
         self.assertIn("small_repair_count", html)
         self.assertIn("unresolved_gap_count", html)
         self.assertIn("topology_sha256: pending.topology_sha256", html)

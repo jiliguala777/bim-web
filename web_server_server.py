@@ -2403,6 +2403,7 @@ def vector_pdf_fusion():
     exterior_topology = result.get('exterior_topology') or {}
     opening_candidates = result.get('opening_candidates') or {}
     accepted_openings = opening_candidates.get('accepted_openings') or []
+    pending_openings = opening_candidates.get('pending_openings') or []
     exterior_summary = dict(result.get('exterior_summary') or {})
     exterior_summary.update({
         'area_px2': exterior_topology.get('area_px2'),
@@ -2423,6 +2424,7 @@ def vector_pdf_fusion():
             for opening in accepted_openings
             if opening.get('kind') == 'window'
         ),
+        'pending_opening_count': len(pending_openings),
         'small_repair_count': sum(
             bridge.get('bridge_type') == 'small_gap_repair'
             for bridge in (exterior_topology.get('bridges') or [])

@@ -992,13 +992,14 @@
                     <p id="exterior-review-status" style="color:var(--warning); margin-bottom:12px;">该结果尚未确认，不能用于能耗计算。</p>
                     <div class="preview-box" style="max-width:720px; margin-bottom:14px;">
                         <img id="component-review-overlay" class="recognition-expandable" src="" alt="外轮廓、门窗与修补叠加图" onclick="openRecognitionImageModal(this.src, '外轮廓综合复核图')">
-                        <div class="preview-box-title">外轮廓综合复核图（绿墙、蓝门、青窗、橙补线、红色未解决缺口；点击放大）</div>
+                        <div class="preview-box-title">外轮廓综合复核图（绿墙、蓝门、青窗、橙色待确认开口/补线、红色未解决缺口；点击放大）</div>
                     </div>
                     <div style="display:grid; grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); gap:8px; margin-bottom:14px; color:var(--text-muted); font-size:13px;">
                         <div>候选面积：<strong id="exterior-area-summary">--</strong></div>
                         <div>候选周长：<strong id="exterior-perimeter-summary">--</strong></div>
                         <div>门：<strong id="exterior-door-summary">--</strong></div>
                         <div>窗：<strong id="exterior-window-summary">--</strong></div>
+                        <div>待确认开口：<strong id="exterior-pending-opening-summary">--</strong></div>
                         <div>small repairs：<strong id="exterior-small-repair-summary">--</strong></div>
                         <div>unresolved：<strong id="exterior-unresolved-summary">--</strong></div>
                     </div>
@@ -3426,6 +3427,8 @@
                 `${Number(summary.door_count || 0)} 个 / ${formatValue(summary.door_total_width_px)} px`;
             document.getElementById('exterior-window-summary').innerText =
                 `${Number(summary.window_count || 0)} 个 / ${formatValue(summary.window_total_width_px)} px`;
+            document.getElementById('exterior-pending-opening-summary').innerText =
+                String(Number(summary.pending_opening_count || 0));
             document.getElementById('exterior-small-repair-summary').innerText =
                 String(Number(summary.small_repair_count || 0));
             document.getElementById('exterior-unresolved-summary').innerText =

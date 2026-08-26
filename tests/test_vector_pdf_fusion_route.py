@@ -128,6 +128,7 @@ class VectorPdfFusionRouteTests(unittest.TestCase):
             self.assertIn("exterior_overlay", payload["images"])
             self.assertIn("component_overlay", payload["images"])
             self.assertEqual(payload["exterior_summary"]["exterior_wall_count"], 4)
+            self.assertEqual(payload["exterior_summary"]["pending_opening_count"], 0)
             self.assertEqual(
                 payload["topology_sha256"],
                 hashlib.sha256(

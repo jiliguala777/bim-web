@@ -22,6 +22,7 @@ from vector_pdf_exterior import (
     rescue_connected_exterior_walls,
     select_exterior_walls,
 )
+from vector_pdf_door_recovery import recover_exterior_walls_from_door_arcs
 from vector_pdf_model import (
     VectorModelConfig,
     VectorModelContractError,
@@ -269,9 +270,16 @@ def _publish_exterior_artifacts(
     gaps: list[dict],
     opening_result: dict,
     exterior: dict,
+    door_recovery: dict | None = None,
 ) -> tuple[dict, dict, dict]:
     """Atomically publish all unconfirmed exterior-review artifacts."""
     provenance = _exterior_provenance(page_data, page_number, image_size, roi)
+    recovery = copy.deepcopy(door_recovery or {
+        "recovered_walls": [],
+        "confirmed_door_arcs": [],
+        "pending_door_arcs": [],
+        "recovery_components": [],
+    })
     opening_candidates = {
         "format": "pdf-opening-candidates/1",
         "status": exterior["status"],
@@ -283,6 +291,7 @@ def _publish_exterior_artifacts(
         "ambiguous_openings": copy.deepcopy(opening_result["ambiguous_openings"]),
         "pending_openings": copy.deepcopy(opening_result.get("pending_openings", [])),
         "unclassified_gaps": copy.deepcopy(opening_result["unclassified_gaps"]),
+        "door_recovery": recovery,
     }
     exterior_topology = {
         **copy.deepcopy(exterior),
@@ -298,6 +307,9 @@ def _publish_exterior_artifacts(
         "accepted_opening_count": len(opening_result["accepted_openings"]),
         "ambiguous_opening_count": len(opening_result["ambiguous_openings"]),
         "pending_opening_count": len(opening_result.get("pending_openings", [])),
+        "recovered_wall_count": len(recovery["recovered_walls"]),
+        "confirmed_door_arc_count": len(recovery["confirmed_door_arcs"]),
+        "pending_door_arc_count": len(recovery["pending_door_arcs"]),
         "unclassified_gap_count": len(opening_result["unclassified_gaps"]),
         "bridge_count": len(exterior_topology["bridges"]),
         "unresolved_gap_count": len(exterior_topology["unresolved"]),
@@ -351,6 +363,12 @@ def analyze_vector_pdf_page(
             },
             _empty_exterior_topology("not_vector_pdf"),
         )
+        door_recovery = {
+            "recovered_walls": [],
+            "confirmed_door_arcs": [],
+            "pending_door_arcs": [],
+            "recovery_components": [],
+        }
         rejected = {
             "format": "pdf-vector-fusion/1",
             "status": "rejected",
@@ -368,6 +386,7 @@ def analyze_vector_pdf_page(
             "topology": {"merged_lines": [], "snaps": []},
             "room_candidates": [],
             "opening_candidates": exterior_openings,
+            "door_recovery": door_recovery,
             "exterior_topology": exterior_topology,
             "exterior_summary": exterior_summary,
             "summary": {
@@ -453,6 +472,12 @@ def analyze_vector_pdf_page(
             "suspicious_room_count": 0,
             "ignored_diagonal_count": int(page_data.get("ignored_diagonal_count") or 0),
         }
+        door_recovery = {
+            "recovered_walls": [],
+            "confirmed_door_arcs": [],
+            "pending_door_arcs": [],
+            "recovery_components": [],
+        }
         diagnostic = {
             "format": "pdf-vector-fusion/1",
             "status": status,
@@ -474,6 +499,7 @@ def analyze_vector_pdf_page(
             "room_candidates": [],
             "summary": summary,
             "reason_codes": [reason],
+            "door_recovery": door_recovery,
         }
         exterior_openings, exterior_topology, exterior_summary = _publish_exterior_artifacts(
             output,
@@ -523,13 +549,21 @@ def analyze_vector_pdf_page(
         exterior_walls,
         (width, height),
     ))
+    door_recovery = recover_exterior_walls_from_door_arcs(
+        candidates,
+        exterior_walls,
+        page_data.get("opening_curve_edges", []),
+        (width, height),
+        roi,
+    )
+    exterior_walls.extend(door_recovery["recovered_walls"])
     gaps = enumerate_exterior_gaps(exterior_walls, (width, height), roi)
     opening_result = classify_exterior_openings(
         gaps,
         model_result.probabilities,
         (width, height),
         native_opening_evidence={
-            "curve_edges": page_data.get("opening_curve_edges", []),
+            "curve_edges": door_recovery["confirmed_door_arcs"],
             "short_segments": page_data.get("opening_short_segments", []),
         },
     )
@@ -553,6 +587,7 @@ def analyze_vector_pdf_page(
         gaps,
         opening_result,
         exterior,
+        door_recovery,
     )
     summary = {
         "accepted_wall_count": sum(item["decision"] == "accepted_wall_candidate" for item in candidates),
@@ -590,6 +625,7 @@ def analyze_vector_pdf_page(
         },
         "room_candidates": topology["room_candidates"],
         "opening_candidates": exterior_openings,
+        "door_recovery": door_recovery,
         "exterior_topology": exterior_topology,
         "exterior_summary": exterior_summary,
         "summary": summary,

@@ -199,6 +199,76 @@ class VectorPdfFusionPipelineTests(unittest.TestCase):
                 exterior["perimeter_px"],
             )
 
+    def test_door_recovery_runs_before_gap_enumeration(self):
+        from vector_pdf_fusion_pipeline import analyze_vector_pdf_page
+
+        seed_wall = {
+            "candidate_id": "seed-wall",
+            "orientation": "horizontal",
+            "start_px": [40, 40],
+            "end_px": [100, 40],
+            "inside_direction": "down",
+        }
+        recovered_wall = {
+            "candidate_id": "recovered-wall",
+            "orientation": "horizontal",
+            "start_px": [100, 40],
+            "end_px": [140, 40],
+            "inside_direction": "down",
+            "recovery_method": "exterior_door_arc_chain",
+        }
+        approved_arc = {
+            "curve_id": "approved-arc",
+            "bbox_px": [100, 40, 130, 70],
+            "start_px": [100, 40],
+            "end_px": [130, 70],
+            "path_start_px": [100, 40],
+            "path_end_px": [130, 70],
+            "exterior_recovery_approved": True,
+        }
+        recovery_result = {
+            "recovered_walls": [recovered_wall],
+            "confirmed_door_arcs": [approved_arc],
+            "pending_door_arcs": [],
+            "recovery_components": [],
+        }
+        opening_result = {
+            "accepted_openings": [],
+            "ambiguous_openings": [],
+            "pending_openings": [],
+            "unclassified_gaps": [],
+        }
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / "output"
+            with (
+                patch("vector_pdf_fusion_pipeline.convert_from_path", self._stub_render),
+                patch("vector_pdf_fusion_pipeline.select_exterior_walls", return_value=[seed_wall]),
+                patch("vector_pdf_fusion_pipeline.rescue_connected_exterior_walls", return_value=[]),
+                patch(
+                    "vector_pdf_fusion_pipeline.recover_exterior_walls_from_door_arcs",
+                    return_value=recovery_result,
+                ) as recovery_mock,
+                patch("vector_pdf_fusion_pipeline.enumerate_exterior_gaps", return_value=[]) as gap_mock,
+                patch(
+                    "vector_pdf_fusion_pipeline.classify_exterior_openings",
+                    return_value=opening_result,
+                ) as opening_mock,
+            ):
+                result = analyze_vector_pdf_page(
+                    self._make_room_pdf(root), 1, output,
+                    model_config=object(), model_runner=self._supported_runner,
+                )
+
+        self.assertTrue(recovery_mock.called)
+        self.assertEqual(gap_mock.call_args.args[0][-1]["candidate_id"], "recovered-wall")
+        self.assertEqual(
+            opening_mock.call_args.kwargs["native_opening_evidence"]["curve_edges"][0]["curve_id"],
+            "approved-arc",
+        )
+        self.assertEqual(result["door_recovery"], recovery_result)
+
     def test_model_unavailable_never_confirms_exterior_artifact(self):
         """An unavailable model must publish only explicitly unconfirmed exterior state."""
         from vector_pdf_fusion_pipeline import analyze_vector_pdf_page

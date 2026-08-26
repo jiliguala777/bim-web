@@ -361,6 +361,13 @@ def _opening_curve_edges(page, page_size, render_size, thresholds) -> list[dict]
     curves = []
     page_width, page_height = page_size
     for item in getattr(page, "curves", []):
+        path_ops = tuple(str(command[0]).lower() for command in item.get("path", []))
+        has_bezier = "c" in path_ops
+        is_closed = "h" in path_ops
+        # Door swing arcs are open Bezier paths. Closed outlines are commonly
+        # columns, furniture or glyph shapes and must not become door evidence.
+        if not has_bezier or is_closed:
+            continue
         bbox_pt = [
             float(item["x0"]), float(item["top"]),
             float(item["x1"]), float(item["bottom"]),
@@ -381,6 +388,9 @@ def _opening_curve_edges(page, page_size, render_size, thresholds) -> list[dict]
             "end_px": _point_to_pixel([bbox_pt[2], bbox_pt[3]], page_size, render_size),
             "stroke_rgb": _stroke_rgb(item.get("stroking_color")),
             "width_pt": float(item.get("linewidth") or 0.0),
+            "path_ops": list(path_ops),
+            "has_bezier": has_bezier,
+            "is_closed": is_closed,
         })
     curves.sort(key=lambda item: tuple(item["bbox_pt"]))
     for index, curve in enumerate(curves, 1):

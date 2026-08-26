@@ -78,6 +78,27 @@ class ExteriorOpeningClassificationTests(unittest.TestCase):
         self.assertEqual(opening["kind"], "door")
         self.assertIn("native_door_arc_supported", opening["reason_codes"])
 
+    def test_closed_native_shape_cannot_classify_as_door_arc(self):
+        from vector_pdf_openings import classify_exterior_openings
+
+        result = classify_exterior_openings(
+            [gap((60, 50), (100, 50))], empty_probabilities(), (160, 100),
+            native_opening_evidence={
+                "curve_edges": [{
+                    "curve_id": "column-outline",
+                    "bbox_px": [58, 48, 102, 92],
+                    "start_px": [60, 50],
+                    "end_px": [100, 92],
+                    "has_bezier": True,
+                    "is_closed": True,
+                }],
+                "short_segments": [],
+            },
+        )
+
+        self.assertEqual(result["accepted_openings"], [])
+        self.assertEqual(result["unclassified_gaps"][0]["gap_id"], "gap-0001")
+
     def test_weak_native_opening_is_pending_without_area_deduction(self):
         from vector_pdf_openings import classify_exterior_openings
 

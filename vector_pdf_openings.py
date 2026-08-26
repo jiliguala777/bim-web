@@ -162,6 +162,8 @@ def _native_gap_evidence(
     min_x, max_x = sorted((start[0], end[0]))
     min_y, max_y = sorted((start[1], end[1]))
     for curve in native_opening_evidence.get("curve_edges", []):
+        if curve.get("has_bezier") is False or curve.get("is_closed") is True:
+            continue
         try:
             x0, y0, x1, y1 = (int(round(value)) for value in curve["bbox_px"])
             curve_start = tuple(int(round(value)) for value in curve["start_px"])

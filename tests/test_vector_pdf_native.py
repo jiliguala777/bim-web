@@ -44,6 +44,22 @@ class NativePdfExtractionTests(unittest.TestCase):
         pdf.save()
         return path
 
+    @staticmethod
+    def _make_door_arc_and_closed_curve_pdf(directory: str) -> Path:
+        path = Path(directory) / "door-arc-and-closed-curve.pdf"
+        pdf = canvas.Canvas(str(path), pagesize=(240, 180))
+        pdf.setStrokeColorRGB(0, 0, 0)
+        pdf.setLineWidth(1.0)
+        pdf.arc(70, 30, 130, 90, startAng=0, extent=90)
+        closed = pdf.beginPath()
+        closed.moveTo(160, 60)
+        closed.curveTo(180, 40, 200, 40, 210, 60)
+        closed.curveTo(200, 80, 180, 80, 160, 60)
+        closed.close()
+        pdf.drawPath(closed, stroke=1, fill=0)
+        pdf.save()
+        return path
+
     def test_extracts_only_orthogonal_candidates_and_counts_diagonals(self):
         from vector_pdf_native import extract_native_pdf_page
 
@@ -89,7 +105,21 @@ class NativePdfExtractionTests(unittest.TestCase):
         curve = page["opening_curve_edges"][0]
         self.assertEqual(curve["curve_id"], "curve-0001")
         self.assertTrue(all(isinstance(value, int) for value in curve["bbox_px"]))
+        self.assertTrue(curve["has_bezier"])
+        self.assertFalse(curve["is_closed"])
         self.assertTrue(page["opening_short_segments"])
+
+    def test_keeps_open_bezier_arc_but_excludes_closed_curve_shape(self):
+        from vector_pdf_native import extract_native_pdf_page
+
+        with tempfile.TemporaryDirectory() as directory:
+            page = extract_native_pdf_page(
+                self._make_door_arc_and_closed_curve_pdf(directory), dpi=100,
+            )
+
+        self.assertEqual(len(page["opening_curve_edges"]), 1)
+        self.assertTrue(page["opening_curve_edges"][0]["has_bezier"])
+        self.assertFalse(page["opening_curve_edges"][0]["is_closed"])
 
     def test_crop_translates_analysis_coordinates_and_preserves_page_coordinates(self):
         from vector_pdf_native import crop_native_page_data, extract_native_pdf_page

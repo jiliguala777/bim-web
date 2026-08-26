@@ -1850,6 +1850,110 @@ def _validate_opening_bindings(topology, opening_artifact):
     return accepted
 
 
+def _validated_inferred_exterior_edges(topology, polygon_edges, perimeter_px, image_size):
+    closure_method = topology.get('closure_method')
+    inferred_edges = topology.get('inferred_edges') or []
+    if closure_method in (None, ''):
+        if inferred_edges:
+            raise RuntimeError('Legacy exterior topology must not contain inferred edges')
+        return [], 0.0, 0.0
+    if closure_method != 'footprint_guided_inference':
+        raise RuntimeError('Exterior topology closure method is invalid')
+    if not isinstance(inferred_edges, list) or not inferred_edges or any(
+        not isinstance(edge, dict) for edge in inferred_edges
+    ):
+        raise RuntimeError('Footprint-guided closure has no inferred edges')
+
+    source_ids = set(_strict_string_ids(
+        topology.get('source_wall_ids'), 'source_wall_ids',
+    ))
+    opening_ids = set(_strict_string_ids(
+        topology.get('opening_ids') or [], 'opening_ids',
+    ))
+    inference_ids = _strict_string_ids(
+        [edge.get('inference_id') for edge in inferred_edges], 'inferred edge IDs',
+    )
+    if opening_ids.intersection(inference_ids):
+        raise RuntimeError('Inferred edge IDs must not collide with opening IDs')
+
+    groups = {}
+    normalized = []
+    for inference_id, edge in zip(inference_ids, inferred_edges):
+        edge_index, interval, start, end = _boundary_edge_index(
+            edge, f'inferred edge {inference_id}', polygon_edges,
+        )
+        del edge_index
+        length = interval[1] - interval[0]
+        if not _metric_matches(edge.get('length_px'), length):
+            raise RuntimeError(f'inferred edge {inference_id} length does not match endpoints')
+        if length > math.nextafter(min(image_size) * 0.10, math.inf):
+            raise RuntimeError(f'inferred edge {inference_id} exceeds the short-side limit')
+        anchors = _strict_string_ids(
+            edge.get('anchor_wall_ids'), f'inferred edge {inference_id} anchor_wall_ids',
+        )
+        if not anchors or not set(anchors).issubset(source_ids):
+            raise RuntimeError(f'inferred edge {inference_id} anchors are invalid')
+        inference_type = edge.get('inference_type')
+        if inference_type not in {'collinear_extension', 'orthogonal_corner'}:
+            raise RuntimeError(f'inferred edge {inference_id} type is invalid')
+        group_id = edge.get('edge_group_id')
+        group_size = edge.get('edge_group_size')
+        if (
+            not isinstance(group_id, str) or not group_id
+            or isinstance(group_size, bool) or not isinstance(group_size, int)
+            or group_size not in {1, 2}
+        ):
+            raise RuntimeError(f'inferred edge {inference_id} group is invalid')
+        expected_group_size = 1 if inference_type == 'collinear_extension' else 2
+        if group_size != expected_group_size:
+            raise RuntimeError(f'inferred edge {inference_id} group is incomplete')
+        if edge.get('decision') != 'accepted_candidate':
+            raise RuntimeError(f'inferred edge {inference_id} was not accepted')
+        inside_direction = edge.get('inside_direction')
+        expected_directions = (
+            {'up', 'down'} if edge.get('orientation') == 'horizontal'
+            else {'left', 'right'}
+        )
+        if inside_direction not in expected_directions:
+            raise RuntimeError(f'inferred edge {inference_id} inside direction is invalid')
+        try:
+            inside_mean = float(edge.get('inside_mean'))
+            outside_mean = float(edge.get('outside_mean'))
+            boundary_mean = float(edge.get('boundary_mean'))
+            difference = float(edge.get('inside_outside_difference'))
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise RuntimeError(f'inferred edge {inference_id} footprint evidence is invalid') from exc
+        if not all(math.isfinite(value) for value in (
+            inside_mean, outside_mean, boundary_mean, difference,
+        )) or not _metric_matches(difference, inside_mean - outside_mean):
+            raise RuntimeError(f'inferred edge {inference_id} footprint evidence is invalid')
+        if difference < 0.25 or (inside_mean < 0.50 and boundary_mean < 0.35):
+            raise RuntimeError(f'inferred edge {inference_id} footprint support is insufficient')
+        groups.setdefault(group_id, []).append((inference_type, edge.get('orientation')))
+        item = copy.deepcopy(edge)
+        item['start_px'] = start
+        item['end_px'] = end
+        item['length_px'] = float(length)
+        normalized.append(item)
+
+    for group_id, members in groups.items():
+        expected_size = 1 if members[0][0] == 'collinear_extension' else 2
+        if len(members) != expected_size or any(member[0] != members[0][0] for member in members):
+            raise RuntimeError(f'inference group {group_id} is incomplete')
+        if expected_size == 2 and {member[1] for member in members} != {'horizontal', 'vertical'}:
+            raise RuntimeError(f'inference group {group_id} is not an orthogonal corner')
+
+    total_length = math.fsum(edge['length_px'] for edge in normalized)
+    ratio = total_length / perimeter_px
+    if ratio > math.nextafter(0.12, math.inf):
+        raise RuntimeError('Inferred exterior length exceeds 12% of perimeter')
+    if not _metric_matches(topology.get('inferred_length_px'), total_length) or not _metric_matches(
+        topology.get('inferred_perimeter_ratio'), ratio,
+    ):
+        raise RuntimeError('Inferred exterior metrics do not match selected edges')
+    return normalized, total_length, ratio
+
+
 def _validate_confirmable_topology(topology, opening_artifact, scale, image_size):
     if (
         topology.get('format') != 'pdf-exterior-topology/1'
@@ -1922,6 +2026,9 @@ def _validate_confirmable_topology(topology, opening_artifact, scale, image_size
         raise RuntimeError('Exterior topology still has unresolved gaps')
     if not isinstance(topology.get('source_wall_ids'), list) or not topology['source_wall_ids']:
         raise RuntimeError('Exterior topology has no real exterior wall evidence')
+    inferred_edges, inferred_length_px, inferred_perimeter_ratio = (
+        _validated_inferred_exterior_edges(topology, edges, perimeter_px, image_size)
+    )
     if opening_artifact.get('format') != 'pdf-opening-candidates/1':
         raise RuntimeError('Opening artifact format is invalid')
     if (
@@ -1942,7 +2049,10 @@ def _validate_confirmable_topology(topology, opening_artifact, scale, image_size
             length_m = (interval[1] - interval[0]) * scale
             if not math.isfinite(length_m) or length_m > math.nextafter(0.6, math.inf):
                 raise RuntimeError('Small gap repair exceeds 0.6 m')
-    return polygon_points, area_px2, perimeter_px
+    return (
+        polygon_points, area_px2, perimeter_px,
+        inferred_edges, inferred_length_px, inferred_perimeter_ratio,
+    )
 
 
 def _boundary_edge_index(item, name, edges):
@@ -1959,7 +2069,7 @@ def _boundary_edge_index(item, name, edges):
     return matches[0], interval, start, end
 
 
-def _validated_real_exterior_wall_geometry(polygon_points, topology):
+def _validated_real_exterior_wall_geometry(polygon_points, topology, inferred_edges=None):
     edges = [
         _axis_segment({'start_px': start, 'end_px': end}, f'polygon edge {index}')[:3]
         for index, (start, end) in enumerate(
@@ -2004,6 +2114,15 @@ def _validated_real_exterior_wall_geometry(polygon_points, topology):
             raise RuntimeError(f'bridge {bridge_id} repair must not reference an opening')
         edge_parts[edge_index].append((interval[0], interval[1], f'bridge {bridge_id}'))
 
+    for inferred in inferred_edges or []:
+        inference_id = inferred['inference_id']
+        edge_index, interval, _, _ = _boundary_edge_index(
+            inferred, f'inferred edge {inference_id}', edges,
+        )
+        edge_parts[edge_index].append((
+            interval[0], interval[1], f'inferred edge {inference_id}',
+        ))
+
     real_segments = topology.get('real_wall_segments')
     if not isinstance(real_segments, list) or not real_segments or any(
         not isinstance(item, dict) for item in real_segments
@@ -2045,7 +2164,9 @@ def _validated_real_exterior_wall_geometry(polygon_points, topology):
                 raise RuntimeError(f'{label} {condition} the polygon boundary partition')
             cursor = interval_end
         if cursor != edge[2][1]:
-            raise RuntimeError('Real walls and selected bridges do not cover the polygon boundary')
+            raise RuntimeError(
+                'Real walls, selected bridges and inferred edges do not cover the polygon boundary'
+            )
     return walls
 
 
@@ -2434,6 +2555,17 @@ def vector_pdf_fusion():
     exterior_summary.setdefault('recovered_wall_count', 0)
     exterior_summary.setdefault('confirmed_door_arc_count', 0)
     exterior_summary.setdefault('pending_door_arc_count', 0)
+    exterior_summary.setdefault('closure_method', exterior_topology.get('closure_method'))
+    exterior_summary.setdefault(
+        'inferred_edge_count', len(exterior_topology.get('inferred_edges') or []),
+    )
+    exterior_summary.setdefault(
+        'inferred_length_px', float(exterior_topology.get('inferred_length_px') or 0.0),
+    )
+    exterior_summary.setdefault(
+        'inferred_perimeter_ratio',
+        float(exterior_topology.get('inferred_perimeter_ratio') or 0.0),
+    )
 
     _update_exterior_generation_if_current(
         report_dir,
@@ -2534,15 +2666,19 @@ def vector_pdf_exterior_confirm():
         )
         if request_page != artifact_page or request_crop != artifact_crop:
             raise RuntimeError('Confirmed page or crop does not match current artifacts')
-        polygon_points, area_px2, perimeter_px = _validate_confirmable_topology(
-            topology, opening_artifact, scale, image_size,
-        )
+        (
+            polygon_points, area_px2, perimeter_px,
+            inferred_edges, inferred_length_px, inferred_perimeter_ratio,
+        ) = _validate_confirmable_topology(topology, opening_artifact, scale, image_size)
         openings = _validate_opening_bindings(topology, opening_artifact)
 
         from vector_pdf_energy_geometry import apply_scale_to_exterior
         normalized_topology = copy.deepcopy(topology)
         normalized_topology['area_px2'] = area_px2
         normalized_topology['perimeter_px'] = perimeter_px
+        normalized_topology['inferred_edges'] = inferred_edges
+        normalized_topology['inferred_length_px'] = inferred_length_px
+        normalized_topology['inferred_perimeter_ratio'] = inferred_perimeter_ratio
         scaled_topology, scaled_openings = apply_scale_to_exterior(
             normalized_topology, openings, scale,
         )
@@ -2550,7 +2686,9 @@ def vector_pdf_exterior_confirm():
         scaled_topology['load_geometry_ready'] = True
         scaled_topology['status'] = 'confirmed'
 
-        walls = _validated_real_exterior_wall_geometry(polygon_points, topology)
+        walls = _validated_real_exterior_wall_geometry(
+            polygon_points, topology, inferred_edges,
+        )
         doors = []
         windows = []
         for opening in scaled_openings:

@@ -135,6 +135,10 @@ class VectorPdfFusionRouteTests(unittest.TestCase):
             self.assertEqual(payload["exterior_summary"]["recovered_wall_count"], 2)
             self.assertEqual(payload["exterior_summary"]["confirmed_door_arc_count"], 1)
             self.assertEqual(payload["exterior_summary"]["pending_door_arc_count"], 1)
+            self.assertIsNone(payload["exterior_summary"]["closure_method"])
+            self.assertEqual(payload["exterior_summary"]["inferred_edge_count"], 0)
+            self.assertEqual(payload["exterior_summary"]["inferred_length_px"], 0.0)
+            self.assertEqual(payload["exterior_summary"]["inferred_perimeter_ratio"], 0.0)
             self.assertEqual(
                 payload["topology_sha256"],
                 hashlib.sha256(

@@ -145,6 +145,40 @@ class VectorPdfExteriorConfirmRouteTests(unittest.TestCase):
             self.server.app.config["UPLOAD_FOLDER"] = previous
 
     @staticmethod
+    def _add_inferred_boundary_segment(topology):
+        """Replace 10 px of real wall with one traceable inferred boundary edge."""
+        topology["real_wall_segments"][1].update(
+            start_px=[55, 0], end_px=[100, 0], length_px=45.0,
+        )
+        inferred = {
+            "inference_id": "inferred-0001-01",
+            "edge_group_id": "inference-group-0001",
+            "edge_group_size": 1,
+            "inference_type": "collinear_extension",
+            "orientation": "horizontal",
+            "start_px": [50, 0],
+            "end_px": [55, 0],
+            "length_px": 5.0,
+            "inside_direction": "down",
+            "anchor_wall_ids": ["line-1"],
+            "inside_mean": 0.9,
+            "outside_mean": 0.1,
+            "boundary_mean": 0.8,
+            "inside_outside_difference": 0.8,
+            "decision": "accepted_candidate",
+            "reason_codes": ["footprint_guided_exterior_edge"],
+        }
+        topology.update({
+            "closure_method": "footprint_guided_inference",
+            "inferred_edges": [inferred],
+            "inference_candidates": [dict(inferred)],
+            "inferred_length_px": 5.0,
+            "inferred_perimeter_ratio": 5.0 / 300.0,
+            "inference_reason_codes": ["footprint_guided_exterior_edge"],
+        })
+        return inferred
+
+    @staticmethod
     def _payload(topology_path, **overrides):
         payload = {
             "report_number": "EXT-1",
@@ -467,6 +501,74 @@ class VectorPdfExteriorConfirmRouteTests(unittest.TestCase):
             saved = json.loads((report_dir / "recognition.json").read_text("utf-8"))
             self.assertEqual(saved["exterior_topology"]["area_px2"], 5000.0)
             self.assertEqual(saved["exterior_topology"]["perimeter_px"], 300.0)
+
+    def test_confirm_accepts_supported_inferred_boundary_without_persisting_it_as_real_wall(self):
+        with tempfile.TemporaryDirectory() as directory:
+            upload_root = Path(directory)
+            report_dir = upload_root / "energy" / "EXT-1"
+            topology, openings, topology_path = self._artifacts(report_dir)
+            inferred = self._add_inferred_boundary_segment(topology)
+
+            response = self._post_artifacts(
+                upload_root, topology, openings, topology_path,
+            )
+
+            self.assertEqual(response.status_code, 200, response.get_json())
+            saved = json.loads((report_dir / "recognition.json").read_text("utf-8"))
+            saved_topology = saved["exterior_topology"]
+            self.assertEqual(saved_topology["closure_method"], "footprint_guided_inference")
+            self.assertEqual(saved_topology["inferred_edges"], [inferred])
+            self.assertEqual(saved_topology["inferred_length_px"], 5.0)
+            self.assertAlmostEqual(saved_topology["inferred_perimeter_ratio"], 1 / 60)
+            self.assertNotIn(
+                inferred["inference_id"],
+                [wall["id"] for wall in saved["geometry"]["walls"]],
+            )
+            self.assertEqual(
+                sum(wall["length_px"] for wall in saved["geometry"]["walls"]),
+                260.0,
+            )
+
+    def test_confirm_rejects_tampered_or_unsafe_inferred_boundary(self):
+        cases = (
+            "forged total", "too much perimeter", "outside boundary",
+            "missing anchor", "incomplete group", "opening id collision",
+        )
+        for label in cases:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
+                upload_root = Path(directory)
+                report_dir = upload_root / "energy" / "EXT-1"
+                topology, openings, topology_path = self._artifacts(report_dir)
+                inferred = self._add_inferred_boundary_segment(topology)
+                if label == "forged total":
+                    topology["inferred_length_px"] = 9.0
+                elif label == "too much perimeter":
+                    inferred.update(start_px=[50, 0], end_px=[90, 0], length_px=40.0)
+                    topology["inferred_length_px"] = 40.0
+                    topology["inferred_perimeter_ratio"] = 40.0 / 300.0
+                    topology["real_wall_segments"][1].update(
+                        start_px=[90, 0], end_px=[100, 0], length_px=10.0,
+                    )
+                elif label == "outside boundary":
+                    inferred.update(start_px=[50, 1], end_px=[60, 1])
+                elif label == "missing anchor":
+                    inferred["anchor_wall_ids"] = []
+                elif label == "incomplete group":
+                    inferred.update(
+                        edge_group_size=2, inference_type="orthogonal_corner",
+                    )
+                else:
+                    inferred["inference_id"] = "opening-door"
+                topology["inference_candidates"] = [dict(inferred)]
+                recognition_path = report_dir / "recognition.json"
+                recognition_path.write_bytes(b"preserve")
+
+                response = self._post_artifacts(
+                    upload_root, topology, openings, topology_path,
+                )
+
+                self.assertEqual(response.status_code, 409, response.get_json())
+                self.assertEqual(recognition_path.read_bytes(), b"preserve")
 
     def test_confirm_rejects_missing_duplicate_or_unknown_selected_bridge(self):
         cases = (

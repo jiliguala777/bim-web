@@ -2618,11 +2618,13 @@ def vector_pdf_fusion():
         'report_number': report_number,
         'fusion_debug': True,
         'status': result['status'],
+        'exterior_status': exterior_topology.get('status'),
         'load_geometry_ready': False,
         'pdf_page_number': page_number,
         'pdf_page_count': page_count,
         'recognition_mode': region_request['mode'],
         'crop_bbox_page_px': crop_bbox_page_px,
+        'image_size': (result.get('page') or {}).get('analysis_size_px'),
         'summary': result.get('summary') or {},
         'exterior_summary': exterior_summary,
         'topology_sha256': topology_sha256,
@@ -2651,6 +2653,11 @@ def vector_pdf_exterior_confirm():
     if payload.get('confirmed') is not True:
         return jsonify({'error': 'confirmed must be boolean true'}), 400
     try:
+        calibration_method = payload.get(
+            'calibration_method', 'manual_exterior_confirmation',
+        )
+        if calibration_method not in {'manual_two_point', 'manual_exterior_confirmation'}:
+            raise ValueError('calibration_method is invalid')
         scale = _positive_finite_number(payload.get('scale_m_per_px'), 'scale_m_per_px')
         request_page = payload.get('page_number')
         if isinstance(request_page, bool) or not isinstance(request_page, int) or request_page < 1:
@@ -2789,7 +2796,7 @@ def vector_pdf_exterior_confirm():
             },
             'scale_calibration': {
                 'status': 'confirmed',
-                'method': 'manual_exterior_confirmation',
+                'method': calibration_method,
                 'scale_m_per_px': scale,
                 'confidence': 1.0,
                 'evidence': [{'topology_sha256': current_hash}],

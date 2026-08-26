@@ -140,37 +140,26 @@ class EnergyTemplateTests(unittest.TestCase):
         self.assertIn("async function prepareVectorRasterCrop(file)", html)
         self.assertIn("vectorRasterRecognitionMode", html)
 
-    def test_vector_pdf_backend_uses_isolated_debug_route_and_blocks_energy_geometry(self):
+    def test_vector_pdf_backend_waits_only_for_two_point_scale(self):
         html = Path("templates/energy.html").read_text(encoding="utf-8")
 
         self.assertIn("新矢量模型（矢量 PDF/图片试验版）", html)
         self.assertIn("const vectorPdfFusion = Boolean(!file && preparedPdf && vectorBackend);", html)
         self.assertIn("'/energy/vector_pdf_fusion'", html)
         self.assertIn("if (data.fusion_debug)", html)
-        self.assertIn("aiResultData = null;", html)
-        self.assertIn("调试结果，尚不可用于能耗计算", html)
+        self.assertIn("aiResultData = data;", html)
+        self.assertIn("请在原图上选择两个点并保存比例尺", html)
 
-    def test_exterior_debug_requires_confirmation_before_energy_state(self):
+    def test_vector_pdf_page_has_no_separate_exterior_review_step(self):
         html = Path("templates/energy.html").read_text(encoding="utf-8")
 
         self.assertIn("pendingExteriorFusion", html)
         self.assertIn("/energy/vector_pdf_exterior_confirm", html)
-        self.assertIn("确认外轮廓并用于能耗计算", html)
-        self.assertIn('id="exterior-review-panel"', html)
-        self.assertIn('id="component-review-overlay"', html)
+        self.assertIn("confirmPendingExteriorWithScale", html)
+        self.assertNotIn("确认外轮廓并用于能耗计算", html)
+        self.assertNotIn('id="exterior-review-panel"', html)
+        self.assertNotIn('id="component-review-overlay"', html)
         self.assertIn("images.component_overlay", html)
-        self.assertIn("area_px2", html)
-        self.assertIn("perimeter_px", html)
-        self.assertIn("door_count", html)
-        self.assertIn("window_count", html)
-        self.assertIn("pending_opening_count", html)
-        self.assertIn("待确认开口", html)
-        self.assertIn("recovered_wall_count", html)
-        self.assertIn("confirmed_door_arc_count", html)
-        self.assertIn("pending_door_arc_count", html)
-        self.assertIn("门弧恢复墙段", html)
-        self.assertIn("small_repair_count", html)
-        self.assertIn("unresolved_gap_count", html)
         self.assertIn("topology_sha256: pending.topology_sha256", html)
         self.assertIn("scale_m_per_px: scale", html)
         self.assertIn("confirmed: true", html)
@@ -178,32 +167,12 @@ class EnergyTemplateTests(unittest.TestCase):
         self.assertIn("crop_bbox_page_px: pending.crop_bbox_page_px", html)
         self.assertIn("aiResultData = data.recognition;", html)
 
-    def test_exterior_debug_keeps_component_overlay_and_supports_image_enlargement(self):
+    def test_exterior_result_keeps_component_overlay_and_supports_image_enlargement(self):
         html = Path("templates/energy.html").read_text(encoding="utf-8")
 
-        self.assertIn('id="component-review-overlay"', html)
         self.assertIn("images.component_overlay", html)
         self.assertIn('id="recognition-image-modal"', html)
         self.assertIn("openRecognitionImageModal", html)
-
-    def test_exterior_review_explains_footprint_guided_inference(self):
-        html = Path("templates/energy.html").read_text(encoding="utf-8")
-
-        for element_id in (
-            "exterior-closure-method-summary",
-            "exterior-inferred-edge-summary",
-            "exterior-inferred-length-summary",
-            "exterior-inferred-ratio-summary",
-        ):
-            with self.subTest(element_id=element_id):
-                self.assertIn(f'id="{element_id}"', html)
-        self.assertIn("footprint_guided_inference", html)
-        self.assertIn("橙色虚线", html)
-        self.assertIn("inferred_edge_count", html)
-        self.assertIn("inferred_length_px", html)
-        self.assertIn("inferred_perimeter_ratio", html)
-        self.assertIn("calculation_only_endpoint_link", html)
-        self.assertIn("仅用于面积和周长计算", html)
 
     def test_exterior_height_and_repeat_controls_are_sent_to_energy_route(self):
         html = Path("templates/energy.html").read_text(encoding="utf-8")
@@ -447,6 +416,115 @@ function acceptRecognition(reportNumber) {
       || tracking.displays.join(',') !== 'REPORT-B result'
       || tracking.steps.join(',') !== '4') {
     throw new Error('stale error/finally mutated the newer report state');
+  }
+})().catch(error => { console.error(error); process.exitCode = 1; });
+'''
+        completed = subprocess.run(
+            ["node", "-e", node_script],
+            cwd=Path.cwd(),
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
+    def test_vector_pdf_two_point_scale_directly_confirms_exterior(self):
+        node_script = r'''
+const fs = require('fs');
+const vm = require('vm');
+const html = fs.readFileSync('templates/energy.html', 'utf8');
+const inlineScript = [...html.matchAll(/<script(?:[^>]*)>([\s\S]*?)<\/script>/g)]
+  .map(match => match[1]).find(Boolean);
+const elements = new Proxy({}, {
+  get(target, key) {
+    if (!target[key]) {
+      target[key] = {
+        value: '', checked: true, disabled: false, innerText: '', innerHTML: '',
+        src: '', style: {}, className: '',
+        classList: { add() {}, remove() {}, toggle() {} },
+        addEventListener() {}, setAttribute() {}, removeAttribute() {},
+        querySelectorAll() { return []; },
+        getContext() { return { clearRect() {} }; }
+      };
+    }
+    return target[key];
+  }
+});
+elements['current-report-number'].value = 'REPORT-A';
+elements['pdf-page-select'].value = '1';
+elements['manual-scale-length'].value = '1000';
+elements['manual-scale-unit'].value = 'mm';
+const requests = [];
+const context = {
+  EnergyPdfRecognitionState: require('./static/energy/pdf_recognition_state.js'),
+  document: {
+    addEventListener() {}, getElementById(id) { return elements[id]; },
+    querySelectorAll() { return []; }, createElement() { return elements.created; }
+  },
+  window: { addEventListener() {}, scrollTo() {} },
+  console, AbortController, FormData, Chart: function Chart() {},
+  requestAnimationFrame(callback) { callback(); }, alert(message) { throw new Error(message); },
+  fetch: async (url, options) => {
+    requests.push({ url, body: JSON.parse(options.body) });
+    if (url !== '/energy/vector_pdf_exterior_confirm') {
+      throw new Error(`unexpected fetch ${url}`);
+    }
+    return {
+      ok: true,
+      json: async () => ({
+        success: true,
+        report_number: 'REPORT-A',
+        recognition: {
+          report_number: 'REPORT-A',
+          exterior_topology: {
+            confirmed: true, load_geometry_ready: true,
+            area_m2: 80, perimeter_m: 36
+          },
+          opening_widths: { window_total_width_m: 4 },
+          room_topology: { load_geometry_ready: false },
+          scale_calibration: {
+            status: 'confirmed', method: 'manual_two_point', scale_m_per_px: 0.01
+          },
+          pixel_lengths: { wall_px: 3600, window_px: 400 }
+        }
+      })
+    };
+  }
+};
+
+(async () => {
+  vm.createContext(context);
+  vm.runInContext(inlineScript, context);
+  vm.runInContext(`
+    updateAnnualUsePreview = () => {};
+    gotoStep = () => {};
+    preparedPdf = { uploadToken: 'token-a' };
+    pdfUploadSessionId = 1;
+    const started = pdfRecognitionRequests.begin(
+      currentPdfRecognitionSelection(), { abort() {} }
+    );
+    if (!pdfRecognitionRequests.accept(started.request, currentPdfRecognitionSelection())) {
+      throw new Error('recognition was not accepted');
+    }
+    acceptedRecognitionReportNumber = 'REPORT-A';
+    pendingExteriorFusion = {
+      report_number: 'REPORT-A', topology_sha256: '${'a'.repeat(64)}',
+      pdf_page_number: 1, crop_bbox_page_px: null
+    };
+    aiResultData = { report_number: 'REPORT-A', image_size: [1000, 800] };
+    calibrationPoints = [[10, 20], [110, 20]];
+  `, context);
+  const saved = await vm.runInContext('saveManualScaleCalibration()', context);
+  if (!saved) throw new Error('two-point calibration did not complete');
+  if (requests.length !== 1) throw new Error(`expected one request, got ${requests.length}`);
+  if (Math.abs(requests[0].body.scale_m_per_px - 0.01) > 1e-12) {
+    throw new Error(`wrong scale ${requests[0].body.scale_m_per_px}`);
+  }
+  if (vm.runInContext('pendingExteriorFusion', context) !== null) {
+    throw new Error('pending exterior state remained after calibration');
+  }
+  if (!vm.runInContext('hasCurrentConfirmedGeometry()', context)) {
+    throw new Error('calibrated exterior did not enable calculation');
   }
 })().catch(error => { console.error(error); process.exitCode = 1; });
 '''

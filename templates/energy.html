@@ -987,37 +987,6 @@
                 </div>
 
                 <p id="room-closure-summary" style="color: var(--text-muted); margin-top: 12px; font-size: 14px;"></p>
-                <div id="exterior-review-panel" class="hidden" style="margin-top:16px; padding:16px; border:1px solid var(--border); border-radius:10px;">
-                    <div class="param-group-title">外轮廓候选复核</div>
-                    <p id="exterior-review-status" style="color:var(--warning); margin-bottom:12px;">该结果尚未确认，不能用于能耗计算。</p>
-                    <div class="preview-box" style="max-width:720px; margin-bottom:14px;">
-                        <img id="component-review-overlay" class="recognition-expandable" src="" alt="外轮廓、门窗与修补叠加图" onclick="openRecognitionImageModal(this.src, '外轮廓综合复核图')">
-                        <div class="preview-box-title">外轮廓综合复核图（绿墙、蓝门、青窗、橙色待确认开口/补线、红色未解决缺口；点击放大）</div>
-                    </div>
-                    <div style="display:grid; grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); gap:8px; margin-bottom:14px; color:var(--text-muted); font-size:13px;">
-                        <div>候选面积：<strong id="exterior-area-summary">--</strong></div>
-                        <div>候选周长：<strong id="exterior-perimeter-summary">--</strong></div>
-                        <div>门：<strong id="exterior-door-summary">--</strong></div>
-                        <div>窗：<strong id="exterior-window-summary">--</strong></div>
-                        <div>待确认开口：<strong id="exterior-pending-opening-summary">--</strong></div>
-                        <div>门弧恢复墙段：<strong id="exterior-recovered-wall-summary">--</strong></div>
-                        <div>确认门弧：<strong id="exterior-confirmed-door-arc-summary">--</strong></div>
-                        <div>待确认门弧：<strong id="exterior-pending-door-arc-summary">--</strong></div>
-                        <div>闭合方式：<strong id="exterior-closure-method-summary">--</strong></div>
-                        <div>推断边：<strong id="exterior-inferred-edge-summary">--</strong></div>
-                        <div>推断总长度：<strong id="exterior-inferred-length-summary">--</strong></div>
-                        <div>推断占周长：<strong id="exterior-inferred-ratio-summary">--</strong></div>
-                        <div>small repairs：<strong id="exterior-small-repair-summary">--</strong></div>
-                        <div>unresolved：<strong id="exterior-unresolved-summary">--</strong></div>
-                    </div>
-                    <div style="display:flex; gap:10px; flex-wrap:wrap; align-items:end;">
-                        <div class="form-group" style="margin:0; min-width:240px;">
-                            <label class="form-label" for="exterior-confirm-scale">确认比例尺（米/像素）</label>
-                            <input id="exterior-confirm-scale" type="number" class="form-control" min="0.000001" step="0.000001" value="">
-                        </div>
-                        <button type="button" id="confirm-exterior-button" class="btn btn-primary" onclick="confirmPendingExterior()">确认外轮廓并用于能耗计算</button>
-                    </div>
-                </div>
                 <div id="scale-calibration-panel" class="hidden" style="margin-top:12px; padding:14px; border:1px solid var(--border); border-radius:10px;">
                     <p id="scale-calibration-status" style="color:var(--text-muted); margin-bottom:10px;"></p>
                     <div style="display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
@@ -2541,6 +2510,27 @@
             );
 
             try {
+                if (pendingExteriorFusion) {
+                    const [pointA, pointB] = calibrationPoints;
+                    const pixelDistance = Math.hypot(
+                        pointB[0] - pointA[0], pointB[1] - pointA[1]
+                    );
+                    const actualLengthM = document.getElementById('manual-scale-unit').value === 'mm'
+                        ? actualLength / 1000
+                        : actualLength;
+                    const scale = actualLengthM / pixelDistance;
+                    if (!Number.isFinite(scale) || scale <= 0) {
+                        throw new Error('两点距离无效，请重新选择。');
+                    }
+                    const confirmed = await confirmPendingExteriorWithScale(
+                        scale,
+                        calibrationSelection,
+                        requestController.signal
+                    );
+                    if (!confirmed) return false;
+                    document.getElementById('scale-calibration-canvas').style.pointerEvents = 'none';
+                    return true;
+                }
                 const response = await fetch('/energy/scale_calibration', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
@@ -2739,11 +2729,6 @@
 
         function clearExteriorReviewState() {
             pendingExteriorFusion = null;
-            const panel = document.getElementById('exterior-review-panel');
-            panel.classList.add('hidden');
-            document.getElementById('component-review-overlay').removeAttribute('src');
-            document.getElementById('exterior-confirm-scale').value = '';
-            document.getElementById('confirm-exterior-button').disabled = false;
         }
 
         function clearPdfRecognitionDerivedState() {
@@ -3421,65 +3406,13 @@
             }
         }
 
-        function renderPendingExteriorReview(data) {
-            const summary = data.exterior_summary || {};
-            const formatValue = value => Number.isFinite(Number(value))
-                ? Number(value).toFixed(1)
-                : '--';
-            document.getElementById('exterior-area-summary').innerText =
-                `${formatValue(summary.area_px2)} px²`;
-            document.getElementById('exterior-perimeter-summary').innerText =
-                `${formatValue(summary.perimeter_px)} px`;
-            document.getElementById('exterior-door-summary').innerText =
-                `${Number(summary.door_count || 0)} 个 / ${formatValue(summary.door_total_width_px)} px`;
-            document.getElementById('exterior-window-summary').innerText =
-                `${Number(summary.window_count || 0)} 个 / ${formatValue(summary.window_total_width_px)} px`;
-            document.getElementById('exterior-pending-opening-summary').innerText =
-                String(Number(summary.pending_opening_count || 0));
-            document.getElementById('exterior-recovered-wall-summary').innerText =
-                String(Number(summary.recovered_wall_count || 0));
-            document.getElementById('exterior-confirmed-door-arc-summary').innerText =
-                String(Number(summary.confirmed_door_arc_count || 0));
-            document.getElementById('exterior-pending-door-arc-summary').innerText =
-                String(Number(summary.pending_door_arc_count || 0));
-            const footprintGuidedInference =
-                summary.closure_method === 'footprint_guided_inference';
-            const calculationOnlyClosure =
-                summary.closure_method === 'calculation_only_endpoint_link';
-            document.getElementById('exterior-closure-method-summary').innerText =
-                calculationOnlyClosure
-                    ? '端点兜底闭合（仅计算）'
-                    : (footprintGuidedInference ? '足迹引导推断（需人工确认）' : '墙体/门窗常规闭合');
-            document.getElementById('exterior-inferred-edge-summary').innerText =
-                `${Number(summary.inferred_edge_count || 0)} 条`;
-            document.getElementById('exterior-inferred-length-summary').innerText =
-                `${formatValue(summary.inferred_length_px || 0)} px`;
-            document.getElementById('exterior-inferred-ratio-summary').innerText =
-                `${formatValue(Number(summary.inferred_perimeter_ratio || 0) * 100)}%`;
-            document.getElementById('exterior-small-repair-summary').innerText =
-                String(Number(summary.small_repair_count || 0));
-            document.getElementById('exterior-unresolved-summary').innerText =
-                String(Number(summary.unresolved_gap_count || 0));
-            document.getElementById('component-review-overlay').src =
-                data.images?.component_overlay
-                    ? 'data:image/png;base64,' + data.images.component_overlay
-                    : (data.images?.exterior_overlay
-                        ? 'data:image/png;base64,' + data.images.exterior_overlay
-                        : '');
-            document.getElementById('exterior-review-status').innerText = calculationOnlyClosure
-                ? '橙色虚线为识别完成后的端点兜底连接，仅用于面积和周长计算；请人工核对闭合轮廓后确认。'
-                : (footprintGuidedInference
-                    ? '外轮廓使用了橙色虚线推断边，必须人工核对后确认；确认前不能用于能耗计算。'
-                    : '该结果尚未确认，不能用于能耗计算。请核对轮廓、门窗、修补与未解决缺口，并确认比例尺。');
-            document.getElementById('exterior-review-status').style.color = 'var(--warning)';
-            document.getElementById('exterior-review-panel').classList.remove('hidden');
-            document.getElementById('confirm-exterior-button').disabled = false;
-        }
-
-        async function confirmPendingExterior() {
+        async function confirmPendingExteriorWithScale(
+            scale,
+            confirmationSelection,
+            signal
+        ) {
             const pending = pendingExteriorFusion;
             const pendingReportNumber = normalizedReportNumber(pending?.report_number);
-            const confirmationSelection = currentPdfRecognitionSelection(pendingReportNumber);
             if (
                 !pending
                 || !pendingReportNumber
@@ -3489,76 +3422,63 @@
                 )
                 || !pdfRecognitionRequests.hasAccepted(confirmationSelection)
             ) {
-                alert('当前页码或识别区域已变化，请重新识别并复核外轮廓。');
-                return false;
+                throw new Error('当前页码或识别区域已变化，请重新识别。');
             }
-            const scale = Number(document.getElementById('exterior-confirm-scale').value);
-            if (!Number.isFinite(scale) || scale <= 0) {
-                alert('请输入有效的外轮廓比例尺。');
-                return false;
+            const response = await fetch('/energy/vector_pdf_exterior_confirm', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    report_number: pendingReportNumber,
+                    topology_sha256: pending.topology_sha256,
+                    scale_m_per_px: scale,
+                    calibration_method: 'manual_two_point',
+                    confirmed: true,
+                    page_number: pending.pdf_page_number,
+                    crop_bbox_page_px: pending.crop_bbox_page_px
+                }),
+                signal
+            });
+            const data = await response.json();
+            if (
+                pendingExteriorFusion !== pending
+                || !pdfRecognitionRequests.hasAccepted(confirmationSelection)
+                || !EnergyPdfRecognitionState.fingerprintsEqual(
+                    confirmationSelection,
+                    currentPdfRecognitionSelection()
+                )
+            ) return false;
+            if (!response.ok || data.error) {
+                throw new Error(data.error || response.statusText);
             }
-            const button = document.getElementById('confirm-exterior-button');
-            button.disabled = true;
-            try {
-                const response = await fetch('/energy/vector_pdf_exterior_confirm', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        report_number: pendingReportNumber,
-                        topology_sha256: pending.topology_sha256,
-                        scale_m_per_px: scale,
-                        confirmed: true,
-                        page_number: pending.pdf_page_number,
-                        crop_bbox_page_px: pending.crop_bbox_page_px
-                    })
-                });
-                const data = await response.json();
-                if (
-                    pendingExteriorFusion !== pending
-                    || !pdfRecognitionRequests.hasAccepted(confirmationSelection)
-                    || !EnergyPdfRecognitionState.fingerprintsEqual(
-                        confirmationSelection,
-                        currentPdfRecognitionSelection()
-                    )
-                ) return false;
-                if (!response.ok || data.error) {
-                    throw new Error(data.error || response.statusText);
-                }
-                if (
-                    !data.recognition
-                    || data.report_number !== pendingReportNumber
-                    || data.recognition.report_number !== pendingReportNumber
-                    || data.recognition.exterior_topology?.confirmed !== true
-                    || data.recognition.exterior_topology?.load_geometry_ready !== true
-                ) {
-                    throw new Error('服务器未返回已确认的外轮廓识别结果');
-                }
+            if (
+                !data.recognition
+                || data.report_number !== pendingReportNumber
+                || data.recognition.report_number !== pendingReportNumber
+                || data.recognition.exterior_topology?.confirmed !== true
+                || data.recognition.exterior_topology?.load_geometry_ready !== true
+            ) {
+                throw new Error('服务器未返回可计算的外轮廓识别结果');
+            }
 
-                aiResultData = data.recognition;
-                acceptedRecognitionReportNumber = data.report_number;
-                reportNumber = data.report_number;
-                pendingExteriorFusion = null;
-                const exterior = aiResultData.exterior_topology;
-                document.getElementById('param-scale').value = scale.toFixed(8);
-                document.getElementById('param-floor-area').value = Number(exterior.area_m2).toFixed(2);
-                document.getElementById('param-wall-length').value = Number(exterior.perimeter_m).toFixed(2);
-                document.getElementById('param-window-length').value = Number(
-                    aiResultData.opening_widths?.window_total_width_m || 0
-                ).toFixed(2);
-                document.getElementById('exterior-review-status').innerText =
-                    '外轮廓与比例尺已由服务器确认，可用于能耗计算。门窗高度与重复层数仅在计算时应用。';
-                document.getElementById('exterior-review-status').style.color = 'var(--success)';
-                button.disabled = true;
-                updateCalculateEnergyAvailability();
-                gotoStep(2);
-                return true;
-            } catch (error) {
-                invalidatePdfRecognitionSelection({ returnToUpload: false });
-                alert('确认外轮廓失败：' + error.message + '。请重新识别后复核。');
-                return false;
-            } finally {
-                if (pendingExteriorFusion === pending) button.disabled = false;
-            }
+            aiResultData = data.recognition;
+            acceptedRecognitionReportNumber = data.report_number;
+            reportNumber = data.report_number;
+            pendingExteriorFusion = null;
+            const exterior = aiResultData.exterior_topology;
+            applyScaleCalibrationResult(
+                aiResultData.scale_calibration,
+                aiResultData.room_topology
+            );
+            document.getElementById('param-floor-area').value = Number(exterior.area_m2).toFixed(2);
+            document.getElementById('param-wall-length').value = Number(exterior.perimeter_m).toFixed(2);
+            document.getElementById('param-window-length').value = Number(
+                aiResultData.opening_widths?.window_total_width_m || 0
+            ).toFixed(2);
+            document.getElementById('room-closure-summary').innerText =
+                '识别结果和两点比例尺已保存，可以进行能耗计算。';
+            document.getElementById('room-closure-summary').style.color = 'var(--success)';
+            updateCalculateEnergyAvailability();
+            return true;
         }
 
         // 发送图片或已暂存 PDF 的指定页到后台进行 AI 构件分割
@@ -3632,7 +3552,7 @@
                 ? '/energy/vector_pdf_fusion'
                 : '/energy/ai_recognize';
             showLoader(vectorPdfFusion
-                ? "正在融合 PDF 原生线条与矢量模型概率（调试模式）..."
+                ? "正在融合 PDF 原生线条与模型识别结果..."
                 : vectorBackend
                 ? "矢量模型正在识别房间、墙、门窗（试验版）..."
                 : "ONNX 引擎正在提取空间构件 (红墙/蓝窗/绿门)...");
@@ -3667,7 +3587,7 @@
                 acceptedRecognitionReportNumber = requestReportNumber;
 
                 if (data.fusion_debug) {
-                    aiResultData = null;
+                    aiResultData = data;
                     pendingExteriorFusion = data;
                     const images = data.images || {};
                     document.getElementById('imgOriginal').src = images.original
@@ -3679,14 +3599,27 @@
                             ? 'data:image/png;base64,' + images.exterior_overlay
                             : '');
                     document.getElementById('aiRecognitionResults').classList.remove('hidden');
-                    renderPendingExteriorReview(data);
+                    const closureSummary = document.getElementById('room-closure-summary');
+                    if (data.exterior_status !== 'review_required') {
+                        pendingExteriorFusion = null;
+                        document.getElementById('scale-calibration-panel').classList.add('hidden');
+                        closureSummary.innerText = '识别完成，但外轮廓仍无法闭合，暂时不能计算建筑面积。';
+                        closureSummary.style.color = 'var(--warning)';
+                        updateCalculateEnergyAvailability();
+                        return true;
+                    }
+                    calibrationPoints = [];
+                    applyScaleCalibrationResult(
+                        { status: 'unconfirmed' },
+                        { load_geometry_ready: false }
+                    );
                     updateCalculateEnergyAvailability();
 
                     const summary = data.summary || {};
-                    const closureSummary = document.getElementById('room-closure-summary');
-                    closureSummary.innerText = `调试结果，尚不可用于能耗计算：墙候选 ${Number(summary.accepted_wall_count || 0)} 条，其他线 ${Number(summary.rejected_line_count || 0)} 条，不确定 ${Number(summary.uncertain_line_count || 0)} 条，闭合房间候选 ${Number(summary.accepted_room_count || 0)} 个。`;
-                    closureSummary.style.color = 'var(--warning)';
+                    closureSummary.innerText = `识别完成：墙体 ${Number(summary.accepted_wall_count || 0)} 条。请在原图上选择两个点并保存比例尺。`;
+                    closureSummary.style.color = 'var(--success)';
                     document.getElementById('param-floor-area').value = '';
+                    requestAnimationFrame(() => resizeScaleCalibrationCanvas());
                     return true;
                 }
 
@@ -3839,7 +3772,7 @@
         async function calculateEnergy() {
             invalidateEnergyResult();
             if (!hasCurrentConfirmedGeometry()) {
-                alert('外轮廓尚未确认，或房间尚未闭合/比例尺尚未确认，暂时不能进行负荷计算。');
+                alert('请先完成图纸识别和两点比例尺标定。');
                 return;
             }
             const calculateHeating = document.getElementById('calculate-heating').checked;

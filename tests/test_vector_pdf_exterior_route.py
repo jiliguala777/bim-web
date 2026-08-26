@@ -189,6 +189,7 @@ class VectorPdfExteriorConfirmRouteTests(unittest.TestCase):
             "confirmed": True,
             "page_number": 2,
             "crop_bbox_page_px": [10, 20, 110, 70],
+            "calibration_method": "manual_two_point",
             "polygon_px": [[999, 999], [1000, 999], [1000, 1000]],
             "area_px2": 1,
             "opening_widths": {"door_total_width_m": 999},
@@ -225,6 +226,7 @@ class VectorPdfExteriorConfirmRouteTests(unittest.TestCase):
             self.assertEqual(saved["pdf_page_number"], 2)
             self.assertEqual(saved["crop_bbox_page_px"], [10, 20, 110, 70])
             self.assertFalse(saved["room_topology"]["load_geometry_ready"])
+            self.assertEqual(saved["scale_calibration"]["method"], "manual_two_point")
             self.assertEqual(saved["report_number"], "EXT-1")
             self.assertEqual(saved["exterior_generation"]["generation"], "generation-a")
             self.assertEqual(

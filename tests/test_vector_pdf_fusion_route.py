@@ -76,6 +76,7 @@ class VectorPdfFusionRouteTests(unittest.TestCase):
                     "format": "pdf-vector-fusion/1",
                     "status": "evaluable",
                     "load_geometry_ready": False,
+                    "page": {"analysis_size_px": [30, 20]},
                     "summary": {
                         "accepted_wall_count": 4,
                         "rejected_line_count": 2,
@@ -84,6 +85,7 @@ class VectorPdfFusionRouteTests(unittest.TestCase):
                         "suspicious_room_count": 0,
                     },
                     "reason_codes": [],
+                    "exterior_topology": topology,
                     "exterior_summary": {
                         "exterior_wall_count": 4,
                         "accepted_opening_count": 0,
@@ -126,6 +128,8 @@ class VectorPdfFusionRouteTests(unittest.TestCase):
             self.assertEqual(payload["report_number"], "FUSION-1")
             self.assertTrue(payload["fusion_debug"])
             self.assertFalse(payload["load_geometry_ready"])
+            self.assertEqual(payload["image_size"], [30, 20])
+            self.assertEqual(payload["exterior_status"], "review_required")
             self.assertEqual(payload["summary"]["accepted_wall_count"], 4)
             self.assertIn("overlay", payload["images"])
             self.assertIn("exterior_overlay", payload["images"])

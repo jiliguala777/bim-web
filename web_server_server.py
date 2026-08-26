@@ -1921,27 +1921,53 @@ def _validated_inferred_exterior_edges(topology, polygon_edges, perimeter_px, im
             outside_mean = float(edge.get('outside_mean'))
             boundary_mean = float(edge.get('boundary_mean'))
             difference = float(edge.get('inside_outside_difference'))
+            inside_support_fraction = float(edge.get('inside_support_fraction'))
+            outside_support_fraction = float(edge.get('outside_support_fraction'))
         except (TypeError, ValueError, OverflowError) as exc:
             raise RuntimeError(f'inferred edge {inference_id} footprint evidence is invalid') from exc
         if not all(math.isfinite(value) for value in (
             inside_mean, outside_mean, boundary_mean, difference,
+            inside_support_fraction, outside_support_fraction,
         )) or not _metric_matches(difference, inside_mean - outside_mean):
             raise RuntimeError(f'inferred edge {inference_id} footprint evidence is invalid')
-        if difference < 0.25 or (inside_mean < 0.50 and boundary_mean < 0.35):
+        if (
+            any(value < 0.0 or value > 1.0 for value in (
+                inside_mean, outside_mean, boundary_mean,
+                inside_support_fraction, outside_support_fraction,
+            ))
+            or difference < -1.0 or difference > 1.0
+        ):
+            raise RuntimeError(f'inferred edge {inference_id} footprint evidence is invalid')
+        if inside_mean < 0.50 or difference < 0.25 or boundary_mean < 0.35:
             raise RuntimeError(f'inferred edge {inference_id} footprint support is insufficient')
-        groups.setdefault(group_id, []).append((inference_type, edge.get('orientation')))
+        if inside_support_fraction < 0.80:
+            raise RuntimeError(f'inferred edge {inference_id} footprint support is discontinuous')
+        if outside_support_fraction >= 0.50:
+            raise RuntimeError(f'inferred edge {inference_id} crosses building interior')
         item = copy.deepcopy(edge)
         item['start_px'] = start
         item['end_px'] = end
         item['length_px'] = float(length)
+        groups.setdefault(group_id, []).append(item)
         normalized.append(item)
 
     for group_id, members in groups.items():
-        expected_size = 1 if members[0][0] == 'collinear_extension' else 2
-        if len(members) != expected_size or any(member[0] != members[0][0] for member in members):
+        inference_type = members[0]['inference_type']
+        expected_size = 1 if inference_type == 'collinear_extension' else 2
+        if len(members) != expected_size or any(
+            member['inference_type'] != inference_type for member in members
+        ):
             raise RuntimeError(f'inference group {group_id} is incomplete')
-        if expected_size == 2 and {member[1] for member in members} != {'horizontal', 'vertical'}:
-            raise RuntimeError(f'inference group {group_id} is not an orthogonal corner')
+        if expected_size == 2:
+            if {member['orientation'] for member in members} != {'horizontal', 'vertical'}:
+                raise RuntimeError(f'inference group {group_id} is not an orthogonal corner')
+            shared_endpoints = set(map(tuple, (
+                members[0]['start_px'], members[0]['end_px'],
+            ))).intersection(map(tuple, (
+                members[1]['start_px'], members[1]['end_px'],
+            )))
+            if len(shared_endpoints) != 1:
+                raise RuntimeError(f'inference group {group_id} does not meet at one corner')
 
     total_length = math.fsum(edge['length_px'] for edge in normalized)
     ratio = total_length / perimeter_px

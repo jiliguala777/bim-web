@@ -19,6 +19,8 @@ class InferenceThresholds:
     footprint_inside_mean_min: float = 0.50
     footprint_side_difference_min: float = 0.25
     footprint_boundary_mean_min: float = 0.35
+    footprint_inside_support_fraction_min: float = 0.80
+    footprint_outside_support_fraction_max: float = 0.50
     max_edge_short_side_fraction: float = 0.10
     max_corner_options_per_endpoint: int = 12
 
@@ -120,11 +122,11 @@ def _dangling_endpoints(bands: list[dict], tolerance: int) -> list[dict]:
     return endpoints
 
 
-def _line_samples(
+def _line_sample_values(
     footprint: np.ndarray,
     start: tuple[int, int],
     end: tuple[int, int],
-) -> float:
+) -> np.ndarray:
     length = max(abs(end[0] - start[0]), abs(end[1] - start[1]))
     count = max(2, length + 1)
     xs = np.rint(np.linspace(start[0], end[0], count)).astype(np.int32)
@@ -134,8 +136,17 @@ def _line_samples(
         & (ys >= 0) & (ys < footprint.shape[0])
     )
     if not np.any(valid):
-        return 0.0
-    return float(np.mean(footprint[ys[valid], xs[valid]]))
+        return np.empty(0, dtype=np.float32)
+    return np.asarray(footprint[ys[valid], xs[valid]], dtype=np.float32)
+
+
+def _line_samples(
+    footprint: np.ndarray,
+    start: tuple[int, int],
+    end: tuple[int, int],
+) -> float:
+    values = _line_sample_values(footprint, start, end)
+    return float(np.mean(values)) if values.size else 0.0
 
 
 def _shifted_edge(
@@ -176,26 +187,38 @@ def _edge_evidence(
     outside = _shifted_edge(
         edge["orientation"], start, end, _opposite(edge["inside_direction"]), offset,
     )
-    inside_mean = _line_samples(footprint, *inside)
-    outside_mean = _line_samples(footprint, *outside)
+    inside_values = _line_sample_values(footprint, *inside)
+    outside_values = _line_sample_values(footprint, *outside)
+    inside_mean = float(np.mean(inside_values)) if inside_values.size else 0.0
+    outside_mean = float(np.mean(outside_values)) if outside_values.size else 0.0
     boundary_mean = _line_samples(footprint, start, end)
     difference = inside_mean - outside_mean
-    direct_support = (
-        inside_mean >= thresholds.footprint_inside_mean_min
-        and difference >= thresholds.footprint_side_difference_min
+    inside_support_fraction = (
+        float(np.mean(inside_values >= thresholds.footprint_inside_mean_min))
+        if inside_values.size else 0.0
     )
-    boundary_support = (
-        boundary_mean >= thresholds.footprint_boundary_mean_min
-        and difference >= thresholds.footprint_side_difference_min
+    outside_support_fraction = (
+        float(np.mean(outside_values >= thresholds.footprint_inside_mean_min))
+        if outside_values.size else 0.0
     )
     reasons = []
-    if not (direct_support or boundary_support):
+    if (
+        inside_mean < thresholds.footprint_inside_mean_min
+        or difference < thresholds.footprint_side_difference_min
+        or boundary_mean < thresholds.footprint_boundary_mean_min
+    ):
         reasons.append("insufficient_inside_footprint_support")
+    if inside_support_fraction < thresholds.footprint_inside_support_fraction_min:
+        reasons.append("discontinuous_inside_footprint_support")
+    if outside_support_fraction >= thresholds.footprint_outside_support_fraction_max:
+        reasons.append("inferred_edge_crosses_building_interior")
     return {
         "inside_mean": inside_mean,
         "outside_mean": outside_mean,
         "boundary_mean": boundary_mean,
         "inside_outside_difference": difference,
+        "inside_support_fraction": inside_support_fraction,
+        "outside_support_fraction": outside_support_fraction,
     }, reasons
 
 
@@ -226,6 +249,36 @@ def _edge(
         "inside_direction": inside_direction,
         "anchor_wall_ids": sorted(anchors),
     }
+
+
+def _edge_crosses_unanchored_band(
+    edge: dict,
+    bands: list[dict],
+    tolerance: int,
+) -> bool:
+    anchors = set(edge["anchor_wall_ids"])
+    start = tuple(edge["start_px"])
+    end = tuple(edge["end_px"])
+    axis_start = start[0] if edge["orientation"] == "horizontal" else start[1]
+    axis_end = end[0] if edge["orientation"] == "horizontal" else end[1]
+    fixed = start[1] if edge["orientation"] == "horizontal" else start[0]
+    for band in bands:
+        if anchors.intersection(band["anchor_wall_ids"]):
+            continue
+        if band["orientation"] == edge["orientation"]:
+            if abs(band["fixed"] - fixed) > tolerance:
+                continue
+            overlap_start = max(axis_start, band["axis_start"])
+            overlap_end = min(axis_end, band["axis_end"])
+            if overlap_end - overlap_start > tolerance:
+                return True
+            continue
+        crossing_axis = band["fixed"]
+        if not axis_start + tolerance < crossing_axis < axis_end - tolerance:
+            continue
+        if band["axis_start"] - tolerance <= fixed <= band["axis_end"] + tolerance:
+            return True
+    return False
 
 
 def _corner_compatible(horizontal: dict, vertical: dict) -> bool:
@@ -328,6 +381,8 @@ def _group_candidates(bands: list[dict], thresholds: InferenceThresholds) -> lis
                     intersection, vertical_endpoint["point"], "vertical",
                     vertical_band["inside_direction"], "orthogonal_corner", anchors,
                 ))
+            if len(edges) != 2:
+                reasons.append("incomplete_orthogonal_corner")
             groups.append({
                 "inference_type": "orthogonal_corner",
                 "intersection": intersection,
@@ -395,6 +450,10 @@ def generate_exterior_inference_candidates(
                 edge_reasons.append("inferred_edge_outside_roi")
             if edge["length_px"] > max_edge_length:
                 edge_reasons.append("inferred_edge_exceeds_short_side_limit")
+            if _edge_crosses_unanchored_band(
+                edge, bands, thresholds.endpoint_connection_tolerance_px,
+            ):
+                edge_reasons.append("inferred_edge_crosses_nearer_wall_band")
             evidence, evidence_reasons = _edge_evidence(edge, values[0], offset, thresholds)
             enriched_edges.append((dict(edge, **evidence), edge_reasons + evidence_reasons))
             reasons.extend(edge_reasons)

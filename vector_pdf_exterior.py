@@ -773,9 +773,14 @@ def _enumerate_bounded_faces(adjacency: dict, edge_evidence: dict) -> list[dict]
             "inferred_edge_ids": set(),
             "edge_group_ids": set(),
         }
+        real_wall_length_px = 0.0
         for face_edge in face_edges:
             for field in evidence:
                 evidence[field].update(edge_evidence[face_edge][field])
+            if edge_evidence[face_edge]["source_wall_ids"]:
+                real_wall_length_px += abs(
+                    face_edge[0][0] - face_edge[1][0]
+                ) + abs(face_edge[0][1] - face_edge[1][1])
         faces.append({
             "polygon": polygon,
             "area": float(area),
@@ -783,6 +788,7 @@ def _enumerate_bounded_faces(adjacency: dict, edge_evidence: dict) -> list[dict]
                 abs(start[0] - end[0]) + abs(start[1] - end[1])
                 for start, end in zip(polygon, polygon[1:] + polygon[:1])
             )),
+            "real_wall_length_px": float(real_wall_length_px),
             **evidence,
         })
     return faces
@@ -923,18 +929,21 @@ def _evaluate_inferred_face(
         reasons.append("inferred_perimeter_ratio_exceeded")
     reasons = list(dict.fromkeys(reasons))
     average_difference = float(np.mean(differences)) if differences else 0.0
+    real_wall_length = float(face.get("real_wall_length_px") or 0.0)
+    real_wall_length_ratio = real_wall_length / perimeter if perimeter > 0 else 0.0
     return {
         "accepted": bool(selected) and not reasons,
         "selected_edges": selected,
         "inferred_length_px": inferred_length,
         "inferred_perimeter_ratio": ratio,
         "average_inside_outside_difference": average_difference,
+        "real_wall_length_ratio": real_wall_length_ratio,
         "reason_codes": reasons,
         "score": (
             inferred_length,
             len(selected),
             -average_difference,
-            -(1.0 - ratio if math.isfinite(ratio) else 0.0),
+            -real_wall_length_ratio,
             face.get("polygon", []),
         ),
     }

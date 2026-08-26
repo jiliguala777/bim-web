@@ -165,6 +165,8 @@ class VectorPdfExteriorConfirmRouteTests(unittest.TestCase):
             "outside_mean": 0.1,
             "boundary_mean": 0.8,
             "inside_outside_difference": 0.8,
+            "inside_support_fraction": 1.0,
+            "outside_support_fraction": 0.0,
             "decision": "accepted_candidate",
             "reason_codes": ["footprint_guided_exterior_edge"],
         }
@@ -529,10 +531,58 @@ class VectorPdfExteriorConfirmRouteTests(unittest.TestCase):
                 260.0,
             )
 
+    def test_generated_corner_topology_round_trips_through_confirmation_validation(self):
+        import numpy as np
+        from vector_pdf_exterior import build_exterior_topology, enumerate_exterior_gaps
+        from vector_pdf_exterior_inference import generate_exterior_inference_candidates
+
+        def wall(candidate_id, start, end, orientation, inside_direction):
+            return {
+                "candidate_id": candidate_id, "start_px": list(start),
+                "end_px": list(end), "orientation": orientation,
+                "inside_direction": inside_direction,
+            }
+
+        walls = [
+            wall("top", (20, 20), (170, 20), "horizontal", "down"),
+            wall("right", (180, 30), (180, 120), "vertical", "left"),
+            wall("bottom", (20, 120), (180, 120), "horizontal", "up"),
+            wall("left", (20, 20), (20, 120), "vertical", "right"),
+        ]
+        probabilities = np.zeros((10, 140, 200), dtype=np.float32)
+        probabilities[0, 20:121, 20:181] = 1.0
+        candidates = generate_exterior_inference_candidates(
+            walls, probabilities, (200, 140), [0, 0, 200, 140],
+        )
+        topology = build_exterior_topology(
+            walls,
+            enumerate_exterior_gaps(walls, (200, 140), [0, 0, 200, 140]),
+            [], probabilities, (200, 140), [0, 0, 200, 140],
+            inference_candidates=candidates,
+        )
+        opening_artifact = {
+            "format": "pdf-opening-candidates/1", "confirmed": False,
+            "load_geometry_ready": False, "accepted_openings": [],
+            "ambiguous_openings": [],
+        }
+
+        validated = self.server._validate_confirmable_topology(
+            topology, opening_artifact, 0.02, [200, 140],
+        )
+        real_walls = self.server._validated_real_exterior_wall_geometry(
+            validated[0], topology, validated[3],
+        )
+
+        self.assertEqual(topology["closure_method"], "footprint_guided_inference")
+        self.assertEqual(len(validated[3]), 2)
+        self.assertEqual(len(real_walls), 4)
+
     def test_confirm_rejects_tampered_or_unsafe_inferred_boundary(self):
         cases = (
             "forged total", "too much perimeter", "outside boundary",
             "missing anchor", "incomplete group", "opening id collision",
+            "weak boundary", "discontinuous inside", "interior shortcut",
+            "invalid support fraction",
         )
         for label in cases:
             with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
@@ -558,7 +608,16 @@ class VectorPdfExteriorConfirmRouteTests(unittest.TestCase):
                         edge_group_size=2, inference_type="orthogonal_corner",
                     )
                 else:
-                    inferred["inference_id"] = "opening-door"
+                    if label == "opening id collision":
+                        inferred["inference_id"] = "opening-door"
+                    elif label == "weak boundary":
+                        inferred["boundary_mean"] = 0.2
+                    elif label == "discontinuous inside":
+                        inferred["inside_support_fraction"] = 0.79
+                    elif label == "interior shortcut":
+                        inferred["outside_support_fraction"] = 0.5
+                    else:
+                        inferred["outside_support_fraction"] = -0.1
                 topology["inference_candidates"] = [dict(inferred)]
                 recognition_path = report_dir / "recognition.json"
                 recognition_path.write_bytes(b"preserve")

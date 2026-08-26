@@ -15,7 +15,7 @@ def wall(candidate_id, start, end, orientation, inside_direction):
 
 def rectangular_footprint(width=200, height=140):
     values = np.zeros((10, height, width), dtype=np.float32)
-    values[0, 20:120, 20:180] = 1.0
+    values[0, 20:121, 20:181] = 1.0
     return values
 
 
@@ -205,6 +205,82 @@ class ExteriorInferenceCandidateTests(unittest.TestCase):
             {reason for item in candidates for reason in item["reason_codes"]},
         )
 
+    def test_rejects_one_leg_corner_instead_of_emitting_unconfirmable_group(self):
+        from vector_pdf_exterior_inference import generate_exterior_inference_candidates
+
+        walls = [
+            wall("top", (20, 20), (180, 20), "horizontal", "down"),
+            wall("right", (180, 30), (180, 120), "vertical", "left"),
+        ]
+
+        candidates = generate_exterior_inference_candidates(
+            walls, rectangular_footprint(), (200, 140), [0, 0, 200, 140],
+        )
+
+        self.assertFalse(any(
+            item["decision"] == "accepted_candidate"
+            and item["inference_type"] == "orthogonal_corner"
+            for item in candidates
+        ))
+
+    def test_requires_inside_boundary_difference_and_continuous_support_together(self):
+        from vector_pdf_exterior_inference import InferenceThresholds, _edge_evidence
+
+        edge = {
+            "orientation": "horizontal", "inside_direction": "down",
+            "start_px": [20, 20], "end_px": [80, 20],
+        }
+        thresholds = InferenceThresholds()
+        weak_inside = np.zeros((100, 100), dtype=np.float32)
+        weak_inside[20, 20:81] = 0.40
+        weak_inside[24, 20:81] = 0.40
+        weak_inside[16, 20:81] = 0.10
+        _, weak_reasons = _edge_evidence(edge, weak_inside, 4, thresholds)
+        self.assertIn("insufficient_inside_footprint_support", weak_reasons)
+
+        discontinuous = np.zeros((100, 100), dtype=np.float32)
+        discontinuous[20, 20:81] = 1.0
+        discontinuous[24, 20:56] = 1.0
+        _, discontinuous_reasons = _edge_evidence(edge, discontinuous, 4, thresholds)
+        self.assertIn("discontinuous_inside_footprint_support", discontinuous_reasons)
+
+    def test_rejects_corner_edge_that_crosses_a_nearer_unanchored_wall_band(self):
+        from vector_pdf_exterior_inference import generate_exterior_inference_candidates
+
+        walls = [
+            wall("top", (20, 20), (170, 20), "horizontal", "down"),
+            wall("right", (180, 30), (180, 120), "vertical", "left"),
+            wall("nearer", (175, 15), (175, 25), "vertical", "left"),
+        ]
+
+        candidates = generate_exterior_inference_candidates(
+            walls, rectangular_footprint(), (200, 140), [0, 0, 200, 140],
+        )
+        target = [
+            item for item in candidates
+            if item["start_px"] == [170, 20] and item["end_px"] == [180, 20]
+        ]
+        self.assertTrue(target)
+        self.assertTrue(all(item["decision"] == "rejected_candidate" for item in target))
+        self.assertTrue(all(
+            "inferred_edge_crosses_nearer_wall_band" in item["reason_codes"]
+            for item in target
+        ))
+
+    def test_rejects_candidate_that_has_high_probability_on_both_sides(self):
+        from vector_pdf_exterior_inference import InferenceThresholds, _edge_evidence
+
+        footprint = np.zeros((100, 100), dtype=np.float32)
+        footprint[20, 20:81] = 0.9
+        footprint[24, 20:81] = 0.9
+        footprint[16, 20:81] = 0.8
+        _, reasons = _edge_evidence({
+            "orientation": "horizontal", "inside_direction": "down",
+            "start_px": [20, 20], "end_px": [80, 20],
+        }, footprint, 4, InferenceThresholds())
+
+        self.assertIn("inferred_edge_crosses_building_interior", reasons)
+
 
 class FootprintGuidedTopologyTests(unittest.TestCase):
     def test_two_edge_corner_group_closes_supported_exterior(self):
@@ -312,6 +388,22 @@ class FootprintGuidedTopologyTests(unittest.TestCase):
 
         self.assertIsNone(selected)
         self.assertEqual(reasons, ["competing_inferred_exterior"])
+
+    def test_face_score_uses_actual_real_wall_length_ratio(self):
+        from vector_pdf_exterior import _evaluate_inferred_face
+
+        candidate = inferred(
+            "edge", "group", (80, 20), (90, 20), "horizontal", "down",
+        )
+        result = _evaluate_inferred_face({
+            "perimeter": 300.0,
+            "real_wall_length_px": 240.0,
+            "inferred_edge_ids": {"edge"},
+            "edge_group_ids": {"group"},
+        }, {"edge": candidate})
+
+        self.assertEqual(result["real_wall_length_ratio"], 0.8)
+        self.assertEqual(result["score"][3], -0.8)
 
 
 if __name__ == "__main__":

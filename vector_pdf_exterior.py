@@ -1371,3 +1371,335 @@ def build_calculation_only_exterior_topology(
     if topology.get("status") == "review_required":
         topology["inference_reason_codes"] = ["calculation_only_endpoint_link"]
     return topology
+
+
+def _dominant_axis_clusters(
+    exterior_walls: list[dict],
+    orientation: str,
+    inside_direction: str,
+    span_length: int,
+    axis_tolerance: int,
+) -> list[dict]:
+    axes = []
+    for wall in exterior_walls:
+        if (
+            wall.get("orientation") != orientation
+            or wall.get("inside_direction") != inside_direction
+        ):
+            continue
+        try:
+            segment = _strict_axis_segment(wall)
+        except (KeyError, TypeError, ValueError):
+            continue
+        mask = np.zeros(span_length + 1, dtype=np.uint8)
+        start = max(0, min(span_length, int(round(segment["axis_start"]))))
+        end = max(0, min(span_length, int(round(segment["axis_end"]))))
+        if start < end:
+            mask[start:end + 1] = 1
+            axes.append((int(round(segment["fixed"])), mask))
+    axes.sort(key=lambda item: item[0])
+    clusters = []
+    for axis, mask in axes:
+        if not clusters or axis - clusters[-1]["axes"][-1] > axis_tolerance:
+            clusters.append({"axes": [axis], "mask": mask.copy()})
+        else:
+            clusters[-1]["axes"].append(axis)
+            clusters[-1]["mask"] |= mask
+    minimum_coverage = max(8, int(round(span_length * 0.04)))
+    return [
+        cluster for cluster in clusters
+        if int(np.count_nonzero(cluster["mask"])) >= minimum_coverage
+    ]
+
+
+def _nearest_filled_profile(values: list[int | None]) -> list[int] | None:
+    known = [index for index, value in enumerate(values) if value is not None]
+    if not known:
+        return None
+    result = []
+    for index, value in enumerate(values):
+        if value is None:
+            nearest = min(known, key=lambda candidate: (abs(candidate - index), candidate))
+            value = values[nearest]
+        result.append(int(value))
+    return result
+
+
+def _smooth_short_profile_runs(values: list[int], minimum_run: int) -> list[int]:
+    result = list(values)
+    while True:
+        runs = []
+        start = 0
+        for index in range(1, len(result) + 1):
+            if index == len(result) or result[index] != result[start]:
+                runs.append((start, index, result[start]))
+                start = index
+        replacement = None
+        for index in range(1, len(runs) - 1):
+            run_start, run_end, _ = runs[index]
+            if (
+                run_end - run_start < minimum_run
+                and runs[index - 1][2] == runs[index + 1][2]
+            ):
+                replacement = (run_start, run_end, runs[index - 1][2])
+                break
+        if replacement is None:
+            return result
+        run_start, run_end, value = replacement
+        result[run_start:run_end] = [value] * (run_end - run_start)
+
+
+def _profile_polygon(
+    top: int,
+    bottom: int,
+    left_profile: list[int],
+    right_profile: list[int],
+) -> list[tuple[float, float]]:
+    points: list[tuple[float, float]] = [
+        (left_profile[0], top), (right_profile[0], top),
+    ]
+    current = right_profile[0]
+    for offset in range(1, len(right_profile)):
+        if right_profile[offset] != current:
+            y = top + offset
+            points.extend(((current, y), (right_profile[offset], y)))
+            current = right_profile[offset]
+    points.append((current, bottom))
+    current = left_profile[-1]
+    points.append((current, bottom))
+    for offset in range(len(left_profile) - 2, -1, -1):
+        if left_profile[offset] != current:
+            y = top + offset
+            points.extend(((current, y), (left_profile[offset], y)))
+            current = left_profile[offset]
+    points.append((current, top))
+    compact = []
+    for point in points:
+        point = (float(point[0]), float(point[1]))
+        if not compact or compact[-1] != point:
+            compact.append(point)
+    if compact and compact[0] == compact[-1]:
+        compact.pop()
+    return _simplify_polygon(compact)
+
+
+def _segment_on_polygon(segment: dict, polygon: list[tuple[float, float]]) -> bool:
+    for start, end in zip(polygon, polygon[1:] + polygon[:1]):
+        edge = _strict_axis_segment({
+            "orientation": "horizontal" if start[1] == end[1] else "vertical",
+            "start_px": start,
+            "end_px": end,
+        })
+        if (
+            segment["orientation"] == edge["orientation"]
+            and segment["fixed"] == edge["fixed"]
+            and edge["axis_start"] <= segment["axis_start"]
+            and segment["axis_end"] <= edge["axis_end"]
+        ):
+            return True
+    return False
+
+
+def _calculation_inside_direction(
+    orientation: str,
+    start: tuple[float, float],
+    end: tuple[float, float],
+    polygon: list[tuple[float, float]],
+) -> str:
+    contour = np.asarray(polygon, dtype=np.float32).reshape((-1, 1, 2))
+    midpoint = ((start[0] + end[0]) / 2.0, (start[1] + end[1]) / 2.0)
+    choices = (
+        (("up", (midpoint[0], midpoint[1] - 1.0)),
+         ("down", (midpoint[0], midpoint[1] + 1.0)))
+        if orientation == "horizontal" else
+        (("left", (midpoint[0] - 1.0, midpoint[1])),
+         ("right", (midpoint[0] + 1.0, midpoint[1])))
+    )
+    return max(choices, key=lambda item: cv2.pointPolygonTest(contour, item[1], False))[0]
+
+
+def build_calculation_only_exterior_envelope(
+    exterior_walls: list[dict],
+    gaps: list[dict],
+    openings: list[dict],
+    image_size: tuple[int, int],
+    building_roi: list[int] | None,
+) -> dict:
+    """Build a dominant, closed orthogonal envelope only for area calculation."""
+    del gaps, building_roi
+    width, height = (int(value) for value in image_size)
+    tolerance = max(2, int(round(min(width, height) * 0.006)))
+    top_clusters = _dominant_axis_clusters(
+        exterior_walls, "horizontal", "down", width, tolerance,
+    )
+    bottom_clusters = _dominant_axis_clusters(
+        exterior_walls, "horizontal", "up", width, tolerance,
+    )
+    left_clusters = _dominant_axis_clusters(
+        exterior_walls, "vertical", "right", height, tolerance,
+    )
+    right_clusters = _dominant_axis_clusters(
+        exterior_walls, "vertical", "left", height, tolerance,
+    )
+    if not all((top_clusters, bottom_clusters, left_clusters, right_clusters)):
+        return _empty_exterior_topology("exterior_not_closed", [], [])
+    top_cluster = min(top_clusters, key=lambda cluster: min(cluster["axes"]))
+    bottom_cluster = max(bottom_clusters, key=lambda cluster: max(cluster["axes"]))
+    top = min(top_cluster["axes"])
+    bottom = max(bottom_cluster["axes"])
+    if top >= bottom:
+        return _empty_exterior_topology("exterior_not_closed", [], [])
+
+    left_values: list[int | None] = []
+    right_values: list[int | None] = []
+    for y in range(top, bottom + 1):
+        left_axes = [
+            min(cluster["axes"]) for cluster in left_clusters
+            if 0 <= y < len(cluster["mask"]) and cluster["mask"][y]
+        ]
+        right_axes = [
+            max(cluster["axes"]) for cluster in right_clusters
+            if 0 <= y < len(cluster["mask"]) and cluster["mask"][y]
+        ]
+        left_values.append(min(left_axes) if left_axes else None)
+        right_values.append(max(right_axes) if right_axes else None)
+    left_profile = _nearest_filled_profile(left_values)
+    right_profile = _nearest_filled_profile(right_values)
+    if (
+        left_profile is None or right_profile is None
+        or any(left >= right for left, right in zip(left_profile, right_profile))
+    ):
+        return _empty_exterior_topology("exterior_not_closed", [], [])
+    minimum_profile_run = max(3, int(round((bottom - top) * 0.01)))
+    left_profile = _smooth_short_profile_runs(left_profile, minimum_profile_run)
+    right_profile = _smooth_short_profile_runs(right_profile, minimum_profile_run)
+    polygon = _profile_polygon(top, bottom, left_profile, right_profile)
+    if len(polygon) < 4:
+        return _empty_exterior_topology("exterior_not_closed", [], [])
+    area = abs(_signed_area(polygon))
+    perimeter = float(sum(
+        abs(end[0] - start[0]) + abs(end[1] - start[1])
+        for start, end in zip(polygon, polygon[1:] + polygon[:1])
+    ))
+    if area <= 0.0 or perimeter <= 0.0:
+        return _empty_exterior_topology("exterior_not_closed", [], [])
+
+    real_segments = _real_wall_segments_for_face(exterior_walls, polygon, [], set())
+    source_ids = sorted({
+        source_id for segment in real_segments
+        for source_id in segment["source_wall_ids"]
+    })
+    if not source_ids:
+        return _empty_exterior_topology("exterior_not_closed", [], [])
+
+    bridges = []
+    selected_opening_ids = []
+    for opening in openings:
+        try:
+            segment = _strict_axis_segment(opening)
+        except (KeyError, TypeError, ValueError):
+            continue
+        host_ids = sorted(str(value) for value in opening.get("host_wall_ids", []))
+        if (
+            opening.get("exterior") is not True
+            or opening.get("kind") not in {"door", "window"}
+            or not _segment_on_polygon(segment, polygon)
+            or not host_ids
+            or not set(host_ids).issubset(source_ids)
+        ):
+            continue
+        opening_id = str(opening.get("opening_id", ""))
+        if not opening_id:
+            continue
+        start, end = _segment_points(segment)
+        bridges.append({
+            "bridge_id": f"bridge-{len(bridges) + 1:04d}",
+            "bridge_type": "opening_bridge",
+            "orientation": segment["orientation"],
+            "start_px": list(start),
+            "end_px": list(end),
+            "source_endpoints_px": [list(start), list(end)],
+            "width_px": float(segment["axis_end"] - segment["axis_start"]),
+            "gap_id": str(opening.get("gap_id", "")),
+            "host_wall_ids": host_ids,
+            "opening_id": opening_id,
+            "pending_opening_id": None,
+            "confidence": float(opening.get("confidence", 0.0)),
+            "reason_codes": ["accepted_opening_on_calculation_envelope"],
+        })
+        selected_opening_ids.append(opening_id)
+
+    covered = []
+    for item in real_segments + bridges:
+        segment = _strict_axis_segment(item)
+        covered.append(segment)
+    inferred = []
+    anchors = source_ids[:2] if len(source_ids) > 1 else source_ids
+    for edge_start, edge_end in zip(polygon, polygon[1:] + polygon[:1]):
+        orientation = "horizontal" if edge_start[1] == edge_end[1] else "vertical"
+        edge = _strict_axis_segment({
+            "orientation": orientation, "start_px": edge_start, "end_px": edge_end,
+        })
+        intervals = sorted(
+            (max(edge["axis_start"], item["axis_start"]),
+             min(edge["axis_end"], item["axis_end"]))
+            for item in covered
+            if item["orientation"] == orientation and item["fixed"] == edge["fixed"]
+            and max(edge["axis_start"], item["axis_start"])
+            < min(edge["axis_end"], item["axis_end"])
+        )
+        cursor = edge["axis_start"]
+        merged = []
+        for interval_start, interval_end in intervals:
+            if interval_start > cursor:
+                merged.append((cursor, interval_start))
+            cursor = max(cursor, interval_end)
+        if cursor < edge["axis_end"]:
+            merged.append((cursor, edge["axis_end"]))
+        for interval_start, interval_end in merged:
+            segment = dict(edge, axis_start=interval_start, axis_end=interval_end)
+            start, end = _segment_points(segment)
+            index = len(inferred) + 1
+            inferred.append({
+                "inference_id": f"calculation-edge-{index:04d}",
+                "edge_group_id": f"calculation-group-{index:04d}",
+                "edge_group_size": 1,
+                "inference_type": "collinear_extension",
+                "orientation": orientation,
+                "start_px": list(start),
+                "end_px": list(end),
+                "length_px": float(interval_end - interval_start),
+                "anchor_wall_ids": anchors,
+                "inside_direction": _calculation_inside_direction(
+                    orientation, start, end, polygon,
+                ),
+                "decision": "accepted_candidate",
+                "reason_codes": ["calculation_only_dominant_envelope"],
+            })
+    inferred_length = float(sum(item["length_px"] for item in inferred))
+    if not inferred:
+        return _empty_exterior_topology("exterior_not_closed", [], [])
+    return {
+        "format": "pdf-exterior-topology/1",
+        "status": "review_required",
+        "confirmed": False,
+        "polygon_px": [list(point) for point in polygon],
+        "area_px2": float(area),
+        "perimeter_px": perimeter,
+        "area_m2": None,
+        "perimeter_m": None,
+        "source_wall_ids": source_ids,
+        "bridge_ids": [bridge["bridge_id"] for bridge in bridges],
+        "opening_ids": selected_opening_ids,
+        "pending_opening_ids": [],
+        "real_wall_segments": real_segments,
+        "bridges": bridges,
+        "unresolved_gaps": [],
+        "closure_method": "calculation_only_endpoint_link",
+        "inferred_edges": inferred,
+        "inference_candidates": copy.deepcopy(inferred),
+        "inferred_length_px": inferred_length,
+        "inferred_perimeter_ratio": inferred_length / perimeter,
+        "inference_reason_codes": ["calculation_only_dominant_envelope"],
+        "load_geometry_ready": False,
+    }

@@ -17,6 +17,7 @@ from pdf2image import convert_from_path
 
 from vector_pdf_fusion import FusionThresholds, build_line_candidates, fuse_line_candidates
 from vector_pdf_exterior import (
+    build_calculation_only_exterior_envelope,
     build_calculation_only_exterior_topology,
     build_exterior_topology,
     enumerate_exterior_gaps,
@@ -657,6 +658,27 @@ def analyze_vector_pdf_page(
         )
         if calculation_only.get("status") == "review_required":
             exterior = calculation_only
+    if (
+        exterior.get("status") != "review_required"
+        or exterior.get("unresolved_gaps")
+    ):
+        calculation_envelope = build_calculation_only_exterior_envelope(
+            exterior_walls,
+            gaps,
+            opening_result["accepted_openings"],
+            (width, height),
+            roi,
+        )
+        if (
+            calculation_envelope.get("status") == "review_required"
+            and not calculation_envelope.get("unresolved_gaps")
+        ):
+            exterior = calculation_envelope
+            selected_opening_ids = set(exterior.get("opening_ids", []))
+            opening_result["accepted_openings"] = [
+                opening for opening in opening_result["accepted_openings"]
+                if opening.get("opening_id") in selected_opening_ids
+            ]
     exterior_openings, exterior_topology, exterior_summary = _publish_exterior_artifacts(
         output,
         render_bgr,

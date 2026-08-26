@@ -391,6 +391,44 @@ class VectorPdfFusionPipelineTests(unittest.TestCase):
             "calculation_only_endpoint_link",
         )
 
+    def test_dominant_envelope_replaces_closed_face_with_unresolved_gaps(self):
+        from vector_pdf_fusion_pipeline import analyze_vector_pdf_page
+
+        unresolved = {
+            "format": "pdf-exterior-topology/1", "status": "review_required",
+            "confirmed": False, "polygon_px": [[10, 10], [20, 10], [20, 30], [10, 30]],
+            "area_px2": 200.0, "perimeter_px": 60.0,
+            "source_wall_ids": ["strip"], "bridge_ids": [], "opening_ids": [],
+            "pending_opening_ids": [], "real_wall_segments": [], "bridges": [],
+            "unresolved_gaps": [{"gap_id": "missing-corner"}], "closure_method": None,
+            "inferred_edges": [], "inference_candidates": [], "inferred_length_px": 0.0,
+            "inferred_perimeter_ratio": 0.0, "inference_reason_codes": [],
+            "load_geometry_ready": False,
+        }
+        envelope = {
+            **unresolved, "polygon_px": [[40, 40], [360, 40], [360, 270], [40, 270]],
+            "area_px2": 73600.0, "perimeter_px": 1100.0, "unresolved_gaps": [],
+            "closure_method": "calculation_only_endpoint_link",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with (
+                patch("vector_pdf_fusion_pipeline.convert_from_path", self._stub_render),
+                patch("vector_pdf_fusion_pipeline.build_exterior_topology", return_value=unresolved),
+                patch(
+                    "vector_pdf_fusion_pipeline.build_calculation_only_exterior_envelope",
+                    return_value=envelope,
+                ) as fallback,
+            ):
+                result = analyze_vector_pdf_page(
+                    self._make_room_pdf(root), 1, root / "output",
+                    model_config=object(), model_runner=self._supported_runner,
+                )
+
+        fallback.assert_called_once()
+        self.assertEqual(result["exterior_topology"]["area_px2"], 73600.0)
+        self.assertEqual(result["exterior_topology"]["unresolved_gaps"], [])
+
     def test_exterior_overlay_draws_selected_inference_as_orange_dashes(self):
         from vector_pdf_fusion_pipeline import _draw_exterior_overlay
 

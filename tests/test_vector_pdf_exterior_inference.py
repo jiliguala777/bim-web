@@ -407,6 +407,35 @@ class FootprintGuidedTopologyTests(unittest.TestCase):
 
 
 class CalculationOnlyClosureTests(unittest.TestCase):
+    def test_dominant_envelope_closes_stepped_exterior_and_ignores_small_wall_face(self):
+        from vector_pdf_exterior import build_calculation_only_exterior_envelope
+
+        walls = [
+            wall("top", (20, 20), (170, 20), "horizontal", "down"),
+            wall("right", (180, 30), (180, 120), "vertical", "left"),
+            wall("bottom", (80, 120), (180, 120), "horizontal", "up"),
+            wall("lower-left", (80, 60), (80, 120), "vertical", "right"),
+            wall("step", (20, 60), (80, 60), "horizontal", "up"),
+            wall("upper-left", (20, 20), (20, 60), "vertical", "right"),
+            # A closed wall-thickness face must not win over the building envelope.
+            wall("strip-top", (150, 45), (165, 45), "horizontal", "down"),
+            wall("strip-right", (165, 45), (165, 55), "vertical", "left"),
+            wall("strip-bottom", (150, 55), (165, 55), "horizontal", "up"),
+            wall("strip-left", (150, 45), (150, 55), "vertical", "right"),
+        ]
+
+        topology = build_calculation_only_exterior_envelope(
+            walls, [], [], (200, 140), [0, 0, 200, 140],
+        )
+
+        self.assertEqual(topology["status"], "review_required")
+        self.assertEqual(topology["closure_method"], "calculation_only_endpoint_link")
+        self.assertEqual(topology["area_px2"], 12400.0)
+        self.assertEqual(topology["perimeter_px"], 520.0)
+        self.assertEqual(topology["inferred_length_px"], 20.0)
+        self.assertEqual(topology["unresolved_gaps"], [])
+        self.assertFalse(topology["load_geometry_ready"])
+
     def test_closes_long_endpoint_gap_only_for_area_calculation(self):
         from vector_pdf_exterior import build_calculation_only_exterior_topology
         from vector_pdf_exterior_inference import generate_exterior_inference_candidates

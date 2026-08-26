@@ -107,6 +107,16 @@ class NativePdfExtractionTests(unittest.TestCase):
         self.assertTrue(all(isinstance(value, int) for value in curve["bbox_px"]))
         self.assertTrue(curve["has_bezier"])
         self.assertFalse(curve["is_closed"])
+        self.assertNotEqual(curve["path_start_px"], curve["bbox_px"][:2])
+        self.assertNotEqual(curve["path_end_px"], curve["bbox_px"][2:])
+        self.assertIn(
+            curve["path_start_px"][0],
+            (curve["bbox_px"][0], curve["bbox_px"][2]),
+        )
+        self.assertIn(
+            curve["path_end_px"][1],
+            (curve["bbox_px"][1], curve["bbox_px"][3]),
+        )
         self.assertTrue(page["opening_short_segments"])
 
     def test_keeps_open_bezier_arc_but_excludes_closed_curve_shape(self):
@@ -152,6 +162,10 @@ class NativePdfExtractionTests(unittest.TestCase):
 
         cropped_curve = cropped["opening_curve_edges"][0]
         self.assertEqual(cropped_curve["page_bbox_px"], curve["bbox_px"])
+        self.assertEqual(cropped_curve["page_path_start_px"], curve["path_start_px"])
+        self.assertEqual(cropped_curve["page_path_end_px"], curve["path_end_px"])
+        self.assertTrue(all(value >= 0 for value in cropped_curve["path_start_px"]))
+        self.assertTrue(all(value >= 0 for value in cropped_curve["path_end_px"]))
         self.assertLess(cropped_curve["bbox_px"][0], curve["bbox_px"][0])
         self.assertTrue(cropped["opening_short_segments"])
         self.assertIn("page_start_px", cropped["opening_short_segments"][0])

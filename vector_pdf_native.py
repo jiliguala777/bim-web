@@ -357,6 +357,22 @@ def _bbox_to_pixel(
     return [first[0], first[1], second[0], second[1]]
 
 
+def _curve_path_endpoints(item: dict) -> tuple[list[float], list[float]] | None:
+    path = item.get("path") or []
+    if not path or str(path[0][0]).lower() != "m":
+        return None
+    start = path[0][-1]
+    end = path[-1][-1]
+    if not isinstance(start, (list, tuple)) or not isinstance(end, (list, tuple)):
+        return None
+    if len(start) != 2 or len(end) != 2:
+        return None
+    try:
+        return [float(start[0]), float(start[1])], [float(end[0]), float(end[1])]
+    except (TypeError, ValueError):
+        return None
+
+
 def _opening_curve_edges(page, page_size, render_size, thresholds) -> list[dict]:
     curves = []
     page_width, page_height = page_size
@@ -368,6 +384,12 @@ def _opening_curve_edges(page, page_size, render_size, thresholds) -> list[dict]
         # columns, furniture or glyph shapes and must not become door evidence.
         if not has_bezier or is_closed:
             continue
+        path_endpoints = _curve_path_endpoints(item)
+        if path_endpoints is None:
+            continue
+        path_start_pt, path_end_pt = path_endpoints
+        path_start_px = _point_to_pixel(path_start_pt, page_size, render_size)
+        path_end_px = _point_to_pixel(path_end_pt, page_size, render_size)
         bbox_pt = [
             float(item["x0"]), float(item["top"]),
             float(item["x1"]), float(item["bottom"]),
@@ -384,8 +406,10 @@ def _opening_curve_edges(page, page_size, render_size, thresholds) -> list[dict]
         curves.append({
             "bbox_pt": bbox_pt,
             "bbox_px": _bbox_to_pixel(bbox_pt, page_size, render_size),
-            "start_px": _point_to_pixel([bbox_pt[0], bbox_pt[1]], page_size, render_size),
-            "end_px": _point_to_pixel([bbox_pt[2], bbox_pt[3]], page_size, render_size),
+            "start_px": path_start_px,
+            "end_px": path_end_px,
+            "path_start_px": path_start_px,
+            "path_end_px": path_end_px,
             "stroke_rgb": _stroke_rgb(item.get("stroking_color")),
             "width_pt": float(item.get("linewidth") or 0.0),
             "path_ops": list(path_ops),
@@ -524,6 +548,8 @@ def crop_native_page_data(page_data: dict, bbox_px: list[int]) -> dict:
         item["bbox_px"] = [ix0 - left, iy0 - top, ix1 - left, iy1 - top]
         item["page_start_px"] = copy.deepcopy(curve["start_px"])
         item["page_end_px"] = copy.deepcopy(curve["end_px"])
+        item["page_path_start_px"] = copy.deepcopy(curve["path_start_px"])
+        item["page_path_end_px"] = copy.deepcopy(curve["path_end_px"])
         item["start_px"] = [
             min(max(0, curve["start_px"][0] - left), right - left),
             min(max(0, curve["start_px"][1] - top), bottom - top),
@@ -532,6 +558,8 @@ def crop_native_page_data(page_data: dict, bbox_px: list[int]) -> dict:
             min(max(0, curve["end_px"][0] - left), right - left),
             min(max(0, curve["end_px"][1] - top), bottom - top),
         ]
+        item["path_start_px"] = copy.deepcopy(item["start_px"])
+        item["path_end_px"] = copy.deepcopy(item["end_px"])
         cropped_curves.append(item)
 
     cropped_short_segments = []

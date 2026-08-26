@@ -309,6 +309,12 @@ def extract_native_pdf_page(
         segment["is_page_border"] = _is_page_border(segment, page_size, config)
 
     dimensions = _detect_dimension_candidates(spans, segments)
+    opening_curve_edges = _opening_curve_edges(
+        page, page_size, render_size, config,
+    )
+    opening_short_segments = _opening_short_segments(
+        segments, dimensions, page_size, render_size,
+    )
     roi = _building_roi(segments, dimensions, page_size, render_size)
     has_vector_geometry = len(styled_edges) >= 4 or len(segments) >= 4
     return {
@@ -319,6 +325,8 @@ def extract_native_pdf_page(
         "dpi": int(dpi),
         "text_spans": spans,
         "orthogonal_segments": segments,
+        "opening_curve_edges": opening_curve_edges,
+        "opening_short_segments": opening_short_segments,
         "styled_edges": styled_edges,
         "dimension_candidates": dimensions,
         "building_roi": roi,
@@ -337,6 +345,77 @@ def _point_to_pixel(
         round(float(point[0]) * int(render_size[0]) / float(page_size[0])),
         round(float(point[1]) * int(render_size[1]) / float(page_size[1])),
     ]
+
+
+def _bbox_to_pixel(
+    bbox: list[float],
+    page_size: tuple[float, float] | list[float],
+    render_size: tuple[int, int] | list[int],
+) -> list[int]:
+    first = _point_to_pixel(bbox[:2], page_size, render_size)
+    second = _point_to_pixel(bbox[2:], page_size, render_size)
+    return [first[0], first[1], second[0], second[1]]
+
+
+def _opening_curve_edges(page, page_size, render_size, thresholds) -> list[dict]:
+    curves = []
+    page_width, page_height = page_size
+    for item in getattr(page, "curves", []):
+        bbox_pt = [
+            float(item["x0"]), float(item["top"]),
+            float(item["x1"]), float(item["bottom"]),
+        ]
+        width = abs(bbox_pt[2] - bbox_pt[0])
+        height = abs(bbox_pt[3] - bbox_pt[1])
+        if (
+            width <= thresholds.axis_tolerance_pt
+            or height <= thresholds.axis_tolerance_pt
+            or (width >= page_width * thresholds.border_span_fraction
+                and height >= page_height * thresholds.border_span_fraction)
+        ):
+            continue
+        curves.append({
+            "bbox_pt": bbox_pt,
+            "bbox_px": _bbox_to_pixel(bbox_pt, page_size, render_size),
+            "start_px": _point_to_pixel([bbox_pt[0], bbox_pt[1]], page_size, render_size),
+            "end_px": _point_to_pixel([bbox_pt[2], bbox_pt[3]], page_size, render_size),
+            "stroke_rgb": _stroke_rgb(item.get("stroking_color")),
+            "width_pt": float(item.get("linewidth") or 0.0),
+        })
+    curves.sort(key=lambda item: tuple(item["bbox_pt"]))
+    for index, curve in enumerate(curves, 1):
+        curve["curve_id"] = f"curve-{index:04d}"
+    return curves
+
+
+def _opening_short_segments(
+    segments: list[dict],
+    dimensions: list[dict],
+    page_size: tuple[float, float],
+    render_size: tuple[int, int],
+) -> list[dict]:
+    excluded = {
+        native_id
+        for dimension in dimensions
+        for native_id in dimension["member_native_ids"]
+    }
+    short_segments = []
+    for segment in segments:
+        if (
+            segment["native_id"] in excluded
+            or segment["is_page_border"]
+            or not 4.0 <= segment["length_pt"] <= 80.0
+        ):
+            continue
+        item = copy.deepcopy(segment)
+        item["start_px"] = _point_to_pixel(
+            item["start_pt"], page_size, render_size,
+        )
+        item["end_px"] = _point_to_pixel(
+            item["end_pt"], page_size, render_size,
+        )
+        short_segments.append(item)
+    return short_segments
 
 
 def build_dimension_mask(page_data: dict) -> np.ndarray:
@@ -423,6 +502,54 @@ def crop_native_page_data(page_data: dict, bbox_px: list[int]) -> dict:
         cropped_segments.append(item)
 
     result["orthogonal_segments"] = cropped_segments
+    cropped_curves = []
+    for curve in page_data.get("opening_curve_edges", []):
+        x0, y0, x1, y1 = (int(value) for value in curve["bbox_px"])
+        ix0, iy0 = max(left, x0), max(top, y0)
+        ix1, iy1 = min(right, x1), min(bottom, y1)
+        if ix1 <= ix0 or iy1 <= iy0:
+            continue
+        item = copy.deepcopy(curve)
+        item["page_bbox_px"] = [x0, y0, x1, y1]
+        item["bbox_px"] = [ix0 - left, iy0 - top, ix1 - left, iy1 - top]
+        item["page_start_px"] = copy.deepcopy(curve["start_px"])
+        item["page_end_px"] = copy.deepcopy(curve["end_px"])
+        item["start_px"] = [
+            min(max(0, curve["start_px"][0] - left), right - left),
+            min(max(0, curve["start_px"][1] - top), bottom - top),
+        ]
+        item["end_px"] = [
+            min(max(0, curve["end_px"][0] - left), right - left),
+            min(max(0, curve["end_px"][1] - top), bottom - top),
+        ]
+        cropped_curves.append(item)
+
+    cropped_short_segments = []
+    for segment in page_data.get("opening_short_segments", []):
+        start, end = segment["start_px"], segment["end_px"]
+        if segment["orientation"] == "horizontal":
+            y = int(start[1])
+            x0, x1 = sorted((int(start[0]), int(end[0])))
+            if y < top or y > bottom or x1 < left or x0 > right:
+                continue
+            local_start, local_end = [max(x0, left) - left, y - top], [min(x1, right) - left, y - top]
+        else:
+            x = int(start[0])
+            y0, y1 = sorted((int(start[1]), int(end[1])))
+            if x < left or x > right or y1 < top or y0 > bottom:
+                continue
+            local_start, local_end = [x - left, max(y0, top) - top], [x - left, min(y1, bottom) - top]
+        if local_start == local_end:
+            continue
+        item = copy.deepcopy(segment)
+        item["page_start_px"] = copy.deepcopy(start)
+        item["page_end_px"] = copy.deepcopy(end)
+        item["start_px"] = local_start
+        item["end_px"] = local_end
+        cropped_short_segments.append(item)
+
+    result["opening_curve_edges"] = cropped_curves
+    result["opening_short_segments"] = cropped_short_segments
     result["render_size_px"] = [right - left, bottom - top]
     result["crop_bbox_page_px"] = [left, top, right, bottom]
     roi = copy.deepcopy(page_data.get("building_roi") or {"enabled": False, "bbox_px": None})

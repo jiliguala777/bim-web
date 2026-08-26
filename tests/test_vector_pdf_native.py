@@ -31,6 +31,19 @@ class NativePdfExtractionTests(unittest.TestCase):
         pdf.save()
         return path
 
+    @staticmethod
+    def _make_door_arc_pdf(directory: str) -> Path:
+        path = Path(directory) / "door-arc.pdf"
+        pdf = canvas.Canvas(str(path), pagesize=(240, 180))
+        pdf.setStrokeColorRGB(0, 0, 0)
+        pdf.setLineWidth(1.0)
+        pdf.line(30, 90, 90, 90)
+        pdf.line(130, 90, 210, 90)
+        pdf.arc(70, 30, 130, 90, startAng=0, extent=90)
+        pdf.line(92, 86, 128, 86)
+        pdf.save()
+        return path
+
     def test_extracts_only_orthogonal_candidates_and_counts_diagonals(self):
         from vector_pdf_native import extract_native_pdf_page
 
@@ -65,6 +78,19 @@ class NativePdfExtractionTests(unittest.TestCase):
         self.assertGreater(np.count_nonzero(mask), 0)
         self.assertEqual(mask[333, 200], 0)
 
+    def test_extracts_curve_edges_and_short_segments_in_pixel_coordinates(self):
+        from vector_pdf_native import extract_native_pdf_page
+
+        with tempfile.TemporaryDirectory() as directory:
+            page = extract_native_pdf_page(self._make_door_arc_pdf(directory), dpi=100)
+
+        self.assertIn("opening_curve_edges", page)
+        self.assertEqual(len(page["opening_curve_edges"]), 1)
+        curve = page["opening_curve_edges"][0]
+        self.assertEqual(curve["curve_id"], "curve-0001")
+        self.assertTrue(all(isinstance(value, int) for value in curve["bbox_px"]))
+        self.assertTrue(page["opening_short_segments"])
+
     def test_crop_translates_analysis_coordinates_and_preserves_page_coordinates(self):
         from vector_pdf_native import crop_native_page_data, extract_native_pdf_page
 
@@ -83,6 +109,22 @@ class NativePdfExtractionTests(unittest.TestCase):
                 self.assertGreaterEqual(y, 0)
                 self.assertLessEqual(x, 300)
                 self.assertLessEqual(y, 300)
+        self.assertIn("opening_curve_edges", cropped)
+        self.assertIn("opening_short_segments", cropped)
+
+    def test_crop_translates_opening_evidence_coordinates(self):
+        from vector_pdf_native import crop_native_page_data, extract_native_pdf_page
+
+        with tempfile.TemporaryDirectory() as directory:
+            page = extract_native_pdf_page(self._make_door_arc_pdf(directory), dpi=100)
+        curve = page["opening_curve_edges"][0]
+        cropped = crop_native_page_data(page, [80, 80, 260, 220])
+
+        cropped_curve = cropped["opening_curve_edges"][0]
+        self.assertEqual(cropped_curve["page_bbox_px"], curve["bbox_px"])
+        self.assertLess(cropped_curve["bbox_px"][0], curve["bbox_px"][0])
+        self.assertTrue(cropped["opening_short_segments"])
+        self.assertIn("page_start_px", cropped["opening_short_segments"][0])
 
 
 if __name__ == "__main__":

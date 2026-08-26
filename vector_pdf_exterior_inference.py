@@ -381,10 +381,12 @@ def generate_exterior_inference_candidates(
             reasons.extend(evidence_reasons)
         reasons = list(dict.fromkeys(reasons))
         group_id = f"inference-group-{group_index:04d}"
+        group_size = len(enriched_edges)
         for edge_index, (edge, _) in enumerate(enriched_edges, 1):
             edge.update({
                 "inference_id": f"inferred-{group_index:04d}-{edge_index:02d}",
                 "edge_group_id": group_id,
+                "edge_group_size": group_size,
                 "decision": "rejected_candidate" if reasons else "accepted_candidate",
                 "reason_codes": reasons or ["footprint_guided_exterior_edge"],
             })

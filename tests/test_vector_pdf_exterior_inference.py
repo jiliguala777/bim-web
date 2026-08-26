@@ -19,6 +19,39 @@ def rectangular_footprint(width=200, height=140):
     return values
 
 
+def inferred(
+    inference_id, group_id, start, end, orientation, inside_direction,
+    *, group_size=1,
+):
+    return {
+        "inference_id": inference_id,
+        "edge_group_id": group_id,
+        "edge_group_size": group_size,
+        "inference_type": "orthogonal_corner" if group_size == 2 else "collinear_extension",
+        "start_px": list(start),
+        "end_px": list(end),
+        "orientation": orientation,
+        "inside_direction": inside_direction,
+        "length_px": float(abs(end[0] - start[0]) + abs(end[1] - start[1])),
+        "anchor_wall_ids": ["anchor-a", "anchor-b"],
+        "inside_mean": 0.90,
+        "outside_mean": 0.05,
+        "boundary_mean": 0.80,
+        "inside_outside_difference": 0.85,
+        "decision": "accepted_candidate",
+        "reason_codes": ["footprint_guided_exterior_edge"],
+    }
+
+
+def open_upper_right_fixture():
+    return [
+        wall("top", (20, 20), (170, 20), "horizontal", "down"),
+        wall("right", (180, 30), (180, 120), "vertical", "left"),
+        wall("bottom", (20, 120), (180, 120), "horizontal", "up"),
+        wall("left", (20, 20), (20, 120), "vertical", "right"),
+    ]
+
+
 class ExteriorInferenceCandidateTests(unittest.TestCase):
     def test_generates_two_edge_corner_group_for_supported_upper_right_gap(self):
         from vector_pdf_exterior_inference import generate_exterior_inference_candidates
@@ -36,6 +69,7 @@ class ExteriorInferenceCandidateTests(unittest.TestCase):
         corner = [item for item in accepted if item["inference_type"] == "orthogonal_corner"]
         self.assertEqual(len(corner), 2)
         self.assertEqual(len({item["edge_group_id"] for item in corner}), 1)
+        self.assertEqual({item["edge_group_size"] for item in corner}, {2})
         self.assertEqual(
             {(tuple(item["start_px"]), tuple(item["end_px"])) for item in corner},
             {((170, 20), (180, 20)), ((180, 20), (180, 30))},
@@ -170,6 +204,114 @@ class ExteriorInferenceCandidateTests(unittest.TestCase):
             "incompatible_corner_inside_directions",
             {reason for item in candidates for reason in item["reason_codes"]},
         )
+
+
+class FootprintGuidedTopologyTests(unittest.TestCase):
+    def test_two_edge_corner_group_closes_supported_exterior(self):
+        from vector_pdf_exterior import build_exterior_topology, enumerate_exterior_gaps
+
+        walls = open_upper_right_fixture()
+        candidates = [
+            inferred(
+                "corner-h", "corner-1", (170, 20), (180, 20),
+                "horizontal", "down", group_size=2,
+            ),
+            inferred(
+                "corner-v", "corner-1", (180, 20), (180, 30),
+                "vertical", "left", group_size=2,
+            ),
+        ]
+
+        topology = build_exterior_topology(
+            walls,
+            enumerate_exterior_gaps(walls, (200, 140), [0, 0, 200, 140]),
+            [],
+            rectangular_footprint(),
+            (200, 140),
+            [0, 0, 200, 140],
+            inference_candidates=candidates,
+        )
+
+        self.assertEqual(topology["status"], "review_required")
+        self.assertEqual(topology["closure_method"], "footprint_guided_inference")
+        self.assertEqual(
+            {edge["inference_id"] for edge in topology["inferred_edges"]},
+            {"corner-h", "corner-v"},
+        )
+        self.assertAlmostEqual(topology["inferred_length_px"], 20.0)
+        self.assertAlmostEqual(topology["inferred_perimeter_ratio"], 20.0 / 520.0)
+        self.assertFalse(topology["load_geometry_ready"])
+
+    def test_rejects_face_when_inferred_edges_exceed_twelve_percent(self):
+        from vector_pdf_exterior import _evaluate_inferred_face
+
+        candidates = {
+            f"edge-{index}": inferred(
+                f"edge-{index}", f"group-{index}",
+                (index * 40, 20), (index * 40 + 30, 20),
+                "horizontal", "down",
+            )
+            for index in range(5)
+        }
+
+        result = _evaluate_inferred_face(
+            {
+                "perimeter": 1000.0,
+                "inferred_edge_ids": set(candidates),
+                "edge_group_ids": {f"group-{index}" for index in range(5)},
+            },
+            candidates,
+        )
+
+        self.assertFalse(result["accepted"])
+        self.assertEqual(result["inferred_perimeter_ratio"], 0.15)
+        self.assertIn("inferred_perimeter_ratio_exceeded", result["reason_codes"])
+
+    def test_never_uses_only_half_of_an_orthogonal_corner_group(self):
+        from vector_pdf_exterior import build_exterior_topology
+
+        only_horizontal = inferred(
+            "corner-h", "corner-1", (170, 20), (180, 20),
+            "horizontal", "down", group_size=2,
+        )
+
+        topology = build_exterior_topology(
+            open_upper_right_fixture(),
+            [],
+            [],
+            rectangular_footprint(),
+            (200, 140),
+            [0, 0, 200, 140],
+            inference_candidates=[only_horizontal],
+        )
+
+        self.assertEqual(topology["status"], "exterior_not_closed")
+        self.assertIn("incomplete_inferred_edge_group", topology["inference_reason_codes"])
+
+    def test_rejects_near_equal_competing_inferred_polygons(self):
+        from vector_pdf_exterior import _select_inferred_face
+
+        first = {
+            "polygon": [(20, 20), (180, 20), (180, 120), (20, 120)],
+            "perimeter": 520.0,
+            "inference_metrics": {
+                "inferred_length_px": 20.0,
+                "score": (20.0, 2, -0.85, -0.96, []),
+            },
+        }
+        second = {
+            "polygon": [(20, 24), (176, 24), (176, 116), (20, 116)],
+            "perimeter": 496.0,
+            "inference_metrics": {
+                "inferred_length_px": 21.0,
+                "score": (21.0, 2, -0.84, -0.95, []),
+            },
+        }
+
+        selected, reasons = _select_inferred_face([first, second])
+
+        self.assertIsNone(selected)
+        self.assertEqual(reasons, ["competing_inferred_exterior"])
 
 
 if __name__ == "__main__":

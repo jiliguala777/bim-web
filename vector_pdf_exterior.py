@@ -544,6 +544,16 @@ def _unresolved_gap(gap: dict, reason: str | None = None) -> dict:
     return unresolved
 
 
+_TOPOLOGY_EVIDENCE_FIELDS = (
+    "source_wall_ids",
+    "bridge_ids",
+    "opening_ids",
+    "pending_opening_ids",
+    "inferred_edge_ids",
+    "edge_group_ids",
+)
+
+
 def _bridge_segment(bridge: dict) -> dict:
     segment = _strict_axis_segment(bridge)
     segment.update({
@@ -556,6 +566,8 @@ def _bridge_segment(bridge: dict) -> dict:
             {bridge["pending_opening_id"]}
             if bridge.get("pending_opening_id") is not None else set()
         ),
+        "inferred_edge_ids": set(),
+        "edge_group_ids": set(),
     })
     return segment
 
@@ -570,6 +582,27 @@ def _wall_segment(wall: dict) -> dict:
         "bridge_ids": set(),
         "opening_ids": set(),
         "pending_opening_ids": set(),
+        "inferred_edge_ids": set(),
+        "edge_group_ids": set(),
+    })
+    return segment
+
+
+def _inference_segment(candidate: dict) -> dict:
+    segment = _strict_axis_segment(candidate)
+    inference_id = candidate.get("inference_id")
+    edge_group_id = candidate.get("edge_group_id")
+    if not isinstance(inference_id, str) or not inference_id:
+        raise ValueError("inference_id must be a non-empty string")
+    if not isinstance(edge_group_id, str) or not edge_group_id:
+        raise ValueError("edge_group_id must be a non-empty string")
+    segment.update({
+        "source_wall_ids": set(),
+        "bridge_ids": set(),
+        "opening_ids": set(),
+        "pending_opening_ids": set(),
+        "inferred_edge_ids": {inference_id},
+        "edge_group_ids": {edge_group_id},
     })
     return segment
 
@@ -585,7 +618,7 @@ def _merge_topology_segments(segments: list[dict]) -> list[dict]:
         for member in members[1:]:
             if member["axis_start"] <= current["axis_end"]:
                 current["axis_end"] = max(current["axis_end"], member["axis_end"])
-                for field in ("source_wall_ids", "bridge_ids", "opening_ids", "pending_opening_ids"):
+                for field in _TOPOLOGY_EVIDENCE_FIELDS:
                     current[field].update(member[field])
                 continue
             merged.append(current)
@@ -641,6 +674,8 @@ def _split_at_intersections(
                 "bridge_ids": set(),
                 "opening_ids": set(),
                 "pending_opening_ids": set(),
+                "inferred_edge_ids": set(),
+                "edge_group_ids": set(),
             })
             for field in evidence:
                 evidence[field].update(segment[field])
@@ -735,6 +770,8 @@ def _enumerate_bounded_faces(adjacency: dict, edge_evidence: dict) -> list[dict]
             "bridge_ids": set(),
             "opening_ids": set(),
             "pending_opening_ids": set(),
+            "inferred_edge_ids": set(),
+            "edge_group_ids": set(),
         }
         for face_edge in face_edges:
             for field in evidence:
@@ -806,7 +843,14 @@ def _has_nested_faces(faces: list[dict]) -> bool:
     return False
 
 
-def _empty_exterior_topology(status: str, unresolved_gaps: list[dict], bridges: list[dict]) -> dict:
+def _empty_exterior_topology(
+    status: str,
+    unresolved_gaps: list[dict],
+    bridges: list[dict],
+    *,
+    inference_candidates: list[dict] | None = None,
+    inference_reason_codes: list[str] | None = None,
+) -> dict:
     return {
         "format": "pdf-exterior-topology/1",
         "status": status,
@@ -823,8 +867,95 @@ def _empty_exterior_topology(status: str, unresolved_gaps: list[dict], bridges: 
         "real_wall_segments": [],
         "bridges": bridges,
         "unresolved_gaps": unresolved_gaps,
+        "closure_method": None,
+        "inferred_edges": [],
+        "inference_candidates": copy.deepcopy(inference_candidates or []),
+        "inferred_length_px": 0.0,
+        "inferred_perimeter_ratio": 0.0,
+        "inference_reason_codes": list(inference_reason_codes or []),
         "load_geometry_ready": False,
     }
+
+
+def _evaluate_inferred_face(
+    face: dict,
+    candidates_by_id: dict[str, dict],
+) -> dict:
+    """Recompute inference usage and reject incomplete or excessive repairs."""
+    used_ids = {str(value) for value in face.get("inferred_edge_ids", set())}
+    reasons = []
+    selected = []
+    for inference_id in sorted(used_ids):
+        candidate = candidates_by_id.get(inference_id)
+        if candidate is None:
+            reasons.append("missing_inferred_edge_evidence")
+            continue
+        selected.append(candidate)
+
+    groups: dict[str, list[dict]] = defaultdict(list)
+    for candidate in candidates_by_id.values():
+        groups[str(candidate.get("edge_group_id"))].append(candidate)
+    for group_id in sorted({str(item.get("edge_group_id")) for item in selected}):
+        members = groups.get(group_id, [])
+        expected_sizes = {int(item.get("edge_group_size") or 0) for item in members}
+        used_members = [item for item in members if str(item.get("inference_id")) in used_ids]
+        if (
+            len(expected_sizes) != 1
+            or next(iter(expected_sizes), 0) != len(members)
+            or len(used_members) != len(members)
+        ):
+            reasons.append("incomplete_inferred_edge_group")
+
+    lengths = []
+    differences = []
+    for candidate in selected:
+        try:
+            segment = _strict_axis_segment(candidate)
+        except (KeyError, TypeError, ValueError):
+            reasons.append("invalid_inferred_edge_geometry")
+            continue
+        lengths.append(float(segment["axis_end"] - segment["axis_start"]))
+        differences.append(float(candidate.get("inside_outside_difference") or 0.0))
+    inferred_length = float(sum(lengths))
+    perimeter = float(face.get("perimeter") or 0.0)
+    ratio = inferred_length / perimeter if perimeter > 0 else math.inf
+    if not math.isfinite(ratio) or ratio > 0.12:
+        reasons.append("inferred_perimeter_ratio_exceeded")
+    reasons = list(dict.fromkeys(reasons))
+    average_difference = float(np.mean(differences)) if differences else 0.0
+    return {
+        "accepted": bool(selected) and not reasons,
+        "selected_edges": selected,
+        "inferred_length_px": inferred_length,
+        "inferred_perimeter_ratio": ratio,
+        "average_inside_outside_difference": average_difference,
+        "reason_codes": reasons,
+        "score": (
+            inferred_length,
+            len(selected),
+            -average_difference,
+            -(1.0 - ratio if math.isfinite(ratio) else 0.0),
+            face.get("polygon", []),
+        ),
+    }
+
+
+def _select_inferred_face(faces: list[dict]) -> tuple[dict | None, list[str]]:
+    if not faces:
+        return None, []
+    ordered = sorted(faces, key=lambda face: face["inference_metrics"]["score"])
+    selected = ordered[0]
+    if len(ordered) == 1:
+        return selected, []
+    competitor = ordered[1]
+    best_length = selected["inference_metrics"]["inferred_length_px"]
+    competition_limit = best_length + max(8.0, selected["perimeter"] * 0.02)
+    if (
+        competitor["polygon"] != selected["polygon"]
+        and competitor["inference_metrics"]["inferred_length_px"] <= competition_limit
+    ):
+        return None, ["competing_inferred_exterior"]
+    return selected, []
 
 
 def _real_wall_segments_for_face(
@@ -948,6 +1079,7 @@ def build_exterior_topology(
     *,
     scale_m_per_px: float | None = None,
     pending_openings: list[dict] | None = None,
+    inference_candidates: list[dict] | None = None,
 ) -> dict:
     """Build traceable bridges and select the largest supported orthogonal footprint."""
     width, height = (int(value) for value in image_size)
@@ -957,6 +1089,8 @@ def build_exterior_topology(
     roi = [0, 0, width, height] if building_roi is None else [int(value) for value in building_roi]
     repair_limit = _repair_limit_px((width, height), scale_m_per_px)
     pending_openings = [] if pending_openings is None else pending_openings
+    inference_candidates = [] if inference_candidates is None else copy.deepcopy(inference_candidates)
+    inference_mode = bool(inference_candidates)
 
     wall_segments = []
     for wall in exterior_walls:
@@ -1033,9 +1167,53 @@ def build_exterior_topology(
         bridges, unresolved_gaps = _discard_unused_small_gap_repairs(
             bridges, unresolved_gaps, gaps, set(),
         )
-        return _empty_exterior_topology("no_exterior_wall_evidence", unresolved_gaps, bridges)
+        return _empty_exterior_topology(
+            "no_exterior_wall_evidence", unresolved_gaps, bridges,
+            inference_candidates=inference_candidates,
+        )
 
-    graph_segments = [*wall_segments, *(_bridge_segment(bridge) for bridge in bridges)]
+    candidates_by_id = {}
+    inference_segments = []
+    invalid_inference_reasons = []
+    for candidate in inference_candidates:
+        if candidate.get("decision") != "accepted_candidate":
+            continue
+        inference_id = candidate.get("inference_id")
+        if not isinstance(inference_id, str) or not inference_id or inference_id in candidates_by_id:
+            invalid_inference_reasons.append("duplicate_or_invalid_inference_id")
+            continue
+        try:
+            inference_segments.append(_inference_segment(candidate))
+        except (KeyError, TypeError, ValueError):
+            invalid_inference_reasons.append("invalid_inferred_edge_geometry")
+            continue
+        candidates_by_id[inference_id] = candidate
+
+    candidates_by_group: dict[str, list[dict]] = defaultdict(list)
+    for candidate in candidates_by_id.values():
+        candidates_by_group[str(candidate.get("edge_group_id"))].append(candidate)
+    invalid_group_ids = set()
+    for group_id, members in candidates_by_group.items():
+        expected_sizes = {int(item.get("edge_group_size") or 0) for item in members}
+        if len(expected_sizes) != 1 or next(iter(expected_sizes), 0) != len(members):
+            invalid_group_ids.add(group_id)
+            invalid_inference_reasons.append("incomplete_inferred_edge_group")
+    if invalid_group_ids:
+        candidates_by_id = {
+            inference_id: candidate
+            for inference_id, candidate in candidates_by_id.items()
+            if str(candidate.get("edge_group_id")) not in invalid_group_ids
+        }
+        inference_segments = [
+            segment for segment in inference_segments
+            if not (segment["edge_group_ids"] & invalid_group_ids)
+        ]
+
+    graph_segments = [
+        *wall_segments,
+        *(_bridge_segment(bridge) for bridge in bridges),
+        *inference_segments,
+    ]
     merged = _merge_topology_segments(graph_segments)
     adjacency, edge_evidence = _split_at_intersections(merged)
     component_by_vertex = _vertex_components(adjacency)
@@ -1053,26 +1231,53 @@ def build_exterior_topology(
         len({face["component_id"] for face in roi_faces}) > 1
         or _has_nested_faces(roi_faces)
     )
-    used_bridge_ids = {
-        bridge_id for face in faces for bridge_id in face["bridge_ids"]
-    }
+    inference_reasons = list(dict.fromkeys(invalid_inference_reasons))
+    if inference_mode:
+        evaluated_faces = []
+        for face in faces:
+            metrics = _evaluate_inferred_face(face, candidates_by_id)
+            if metrics["accepted"]:
+                face["inference_metrics"] = metrics
+                evaluated_faces.append(face)
+            else:
+                inference_reasons.extend(metrics["reason_codes"])
+        faces = evaluated_faces
+    used_bridge_ids = {bridge_id for face in faces for bridge_id in face["bridge_ids"]}
     bridges, unresolved_gaps = _discard_unused_small_gap_repairs(
         bridges, unresolved_gaps, gaps, used_bridge_ids,
     )
-    if structurally_ambiguous:
+    if structurally_ambiguous and not inference_mode:
         return _empty_exterior_topology("ambiguous_exterior", unresolved_gaps, bridges)
     if not faces:
-        return _empty_exterior_topology("exterior_not_closed", unresolved_gaps, bridges)
+        return _empty_exterior_topology(
+            "exterior_not_closed", unresolved_gaps, bridges,
+            inference_candidates=inference_candidates,
+            inference_reason_codes=list(dict.fromkeys(inference_reasons)),
+        )
 
-    faces.sort(key=lambda face: (-face["area"], face["polygon"]))
-    largest = faces[0]
-    if len(faces) > 1 and faces[1]["area"] >= largest["area"] * 0.90:
-        return _empty_exterior_topology("ambiguous_exterior", unresolved_gaps, bridges)
+    if inference_mode:
+        largest, selection_reasons = _select_inferred_face(faces)
+        if largest is None:
+            return _empty_exterior_topology(
+                "ambiguous_exterior", unresolved_gaps, bridges,
+                inference_candidates=inference_candidates,
+                inference_reason_codes=selection_reasons,
+            )
+    else:
+        faces.sort(key=lambda face: (-face["area"], face["polygon"]))
+        largest = faces[0]
+        if len(faces) > 1 and faces[1]["area"] >= largest["area"] * 0.90:
+            return _empty_exterior_topology("ambiguous_exterior", unresolved_gaps, bridges)
 
     scale = float(scale_m_per_px) if scale_m_per_px is not None else None
     real_wall_segments = _real_wall_segments_for_face(
         exterior_walls, largest["polygon"], bridges, set(largest["bridge_ids"]),
     )
+    inference_metrics = largest.get("inference_metrics") or {
+        "selected_edges": [],
+        "inferred_length_px": 0.0,
+        "inferred_perimeter_ratio": 0.0,
+    }
     return {
         "format": "pdf-exterior-topology/1",
         "status": "review_required",
@@ -1089,5 +1294,13 @@ def build_exterior_topology(
         "real_wall_segments": real_wall_segments,
         "bridges": bridges,
         "unresolved_gaps": unresolved_gaps,
+        "closure_method": "footprint_guided_inference" if inference_mode else None,
+        "inferred_edges": copy.deepcopy(inference_metrics["selected_edges"]),
+        "inference_candidates": inference_candidates,
+        "inferred_length_px": inference_metrics["inferred_length_px"],
+        "inferred_perimeter_ratio": inference_metrics["inferred_perimeter_ratio"],
+        "inference_reason_codes": (
+            ["footprint_guided_inference_selected"] if inference_mode else []
+        ),
         "load_geometry_ready": False,
     }

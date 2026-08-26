@@ -1000,6 +1000,9 @@
                         <div>门：<strong id="exterior-door-summary">--</strong></div>
                         <div>窗：<strong id="exterior-window-summary">--</strong></div>
                         <div>待确认开口：<strong id="exterior-pending-opening-summary">--</strong></div>
+                        <div>门弧恢复墙段：<strong id="exterior-recovered-wall-summary">--</strong></div>
+                        <div>确认门弧：<strong id="exterior-confirmed-door-arc-summary">--</strong></div>
+                        <div>待确认门弧：<strong id="exterior-pending-door-arc-summary">--</strong></div>
                         <div>small repairs：<strong id="exterior-small-repair-summary">--</strong></div>
                         <div>unresolved：<strong id="exterior-unresolved-summary">--</strong></div>
                     </div>
@@ -3429,6 +3432,12 @@
                 `${Number(summary.window_count || 0)} 个 / ${formatValue(summary.window_total_width_px)} px`;
             document.getElementById('exterior-pending-opening-summary').innerText =
                 String(Number(summary.pending_opening_count || 0));
+            document.getElementById('exterior-recovered-wall-summary').innerText =
+                String(Number(summary.recovered_wall_count || 0));
+            document.getElementById('exterior-confirmed-door-arc-summary').innerText =
+                String(Number(summary.confirmed_door_arc_count || 0));
+            document.getElementById('exterior-pending-door-arc-summary').innerText =
+                String(Number(summary.pending_door_arc_count || 0));
             document.getElementById('exterior-small-repair-summary').innerText =
                 String(Number(summary.small_repair_count || 0));
             document.getElementById('exterior-unresolved-summary').innerText =

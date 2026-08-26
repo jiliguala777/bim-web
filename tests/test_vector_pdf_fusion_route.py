@@ -87,6 +87,9 @@ class VectorPdfFusionRouteTests(unittest.TestCase):
                     "exterior_summary": {
                         "exterior_wall_count": 4,
                         "accepted_opening_count": 0,
+                        "recovered_wall_count": 2,
+                        "confirmed_door_arc_count": 1,
+                        "pending_door_arc_count": 1,
                         "footprint_status": "review_required",
                     },
                 }
@@ -129,6 +132,9 @@ class VectorPdfFusionRouteTests(unittest.TestCase):
             self.assertIn("component_overlay", payload["images"])
             self.assertEqual(payload["exterior_summary"]["exterior_wall_count"], 4)
             self.assertEqual(payload["exterior_summary"]["pending_opening_count"], 0)
+            self.assertEqual(payload["exterior_summary"]["recovered_wall_count"], 2)
+            self.assertEqual(payload["exterior_summary"]["confirmed_door_arc_count"], 1)
+            self.assertEqual(payload["exterior_summary"]["pending_door_arc_count"], 1)
             self.assertEqual(
                 payload["topology_sha256"],
                 hashlib.sha256(

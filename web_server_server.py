@@ -2431,6 +2431,9 @@ def vector_pdf_fusion():
         ),
         'unresolved_gap_count': len(exterior_topology.get('unresolved') or []),
     })
+    exterior_summary.setdefault('recovered_wall_count', 0)
+    exterior_summary.setdefault('confirmed_door_arc_count', 0)
+    exterior_summary.setdefault('pending_door_arc_count', 0)
 
     _update_exterior_generation_if_current(
         report_dir,

@@ -1003,6 +1003,10 @@
                         <div>门弧恢复墙段：<strong id="exterior-recovered-wall-summary">--</strong></div>
                         <div>确认门弧：<strong id="exterior-confirmed-door-arc-summary">--</strong></div>
                         <div>待确认门弧：<strong id="exterior-pending-door-arc-summary">--</strong></div>
+                        <div>闭合方式：<strong id="exterior-closure-method-summary">--</strong></div>
+                        <div>推断边：<strong id="exterior-inferred-edge-summary">--</strong></div>
+                        <div>推断总长度：<strong id="exterior-inferred-length-summary">--</strong></div>
+                        <div>推断占周长：<strong id="exterior-inferred-ratio-summary">--</strong></div>
                         <div>small repairs：<strong id="exterior-small-repair-summary">--</strong></div>
                         <div>unresolved：<strong id="exterior-unresolved-summary">--</strong></div>
                     </div>
@@ -3438,6 +3442,16 @@
                 String(Number(summary.confirmed_door_arc_count || 0));
             document.getElementById('exterior-pending-door-arc-summary').innerText =
                 String(Number(summary.pending_door_arc_count || 0));
+            const footprintGuidedInference =
+                summary.closure_method === 'footprint_guided_inference';
+            document.getElementById('exterior-closure-method-summary').innerText =
+                footprintGuidedInference ? '足迹引导推断（需人工确认）' : '墙体/门窗常规闭合';
+            document.getElementById('exterior-inferred-edge-summary').innerText =
+                `${Number(summary.inferred_edge_count || 0)} 条`;
+            document.getElementById('exterior-inferred-length-summary').innerText =
+                `${formatValue(summary.inferred_length_px || 0)} px`;
+            document.getElementById('exterior-inferred-ratio-summary').innerText =
+                `${formatValue(Number(summary.inferred_perimeter_ratio || 0) * 100)}%`;
             document.getElementById('exterior-small-repair-summary').innerText =
                 String(Number(summary.small_repair_count || 0));
             document.getElementById('exterior-unresolved-summary').innerText =
@@ -3448,8 +3462,9 @@
                     : (data.images?.exterior_overlay
                         ? 'data:image/png;base64,' + data.images.exterior_overlay
                         : '');
-            document.getElementById('exterior-review-status').innerText =
-                '该结果尚未确认，不能用于能耗计算。请核对轮廓、门窗、修补与未解决缺口，并确认比例尺。';
+            document.getElementById('exterior-review-status').innerText = footprintGuidedInference
+                ? '外轮廓使用了橙色虚线推断边，必须人工核对后确认；确认前不能用于能耗计算。'
+                : '该结果尚未确认，不能用于能耗计算。请核对轮廓、门窗、修补与未解决缺口，并确认比例尺。';
             document.getElementById('exterior-review-status').style.color = 'var(--warning)';
             document.getElementById('exterior-review-panel').classList.remove('hidden');
             document.getElementById('confirm-exterior-button').disabled = false;

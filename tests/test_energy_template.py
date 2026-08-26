@@ -186,6 +186,23 @@ class EnergyTemplateTests(unittest.TestCase):
         self.assertIn('id="recognition-image-modal"', html)
         self.assertIn("openRecognitionImageModal", html)
 
+    def test_exterior_review_explains_footprint_guided_inference(self):
+        html = Path("templates/energy.html").read_text(encoding="utf-8")
+
+        for element_id in (
+            "exterior-closure-method-summary",
+            "exterior-inferred-edge-summary",
+            "exterior-inferred-length-summary",
+            "exterior-inferred-ratio-summary",
+        ):
+            with self.subTest(element_id=element_id):
+                self.assertIn(f'id="{element_id}"', html)
+        self.assertIn("footprint_guided_inference", html)
+        self.assertIn("橙色虚线", html)
+        self.assertIn("inferred_edge_count", html)
+        self.assertIn("inferred_length_px", html)
+        self.assertIn("inferred_perimeter_ratio", html)
+
     def test_exterior_height_and_repeat_controls_are_sent_to_energy_route(self):
         html = Path("templates/energy.html").read_text(encoding="utf-8")
 

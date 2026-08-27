@@ -5,8 +5,9 @@ import re
 import io
 import json
 import os
+import subprocess
 import tempfile
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import nullcontext, redirect_stderr, redirect_stdout
 from unittest.mock import MagicMock, patch
 
 import cv2
@@ -35,7 +36,7 @@ class EnergyTemplateTests(unittest.TestCase):
         self.assertIn("function startManualScaleCalibration()", html)
         self.assertIn("function saveManualScaleCalibration()", html)
         self.assertIn("fetch('/energy/scale_calibration'", html)
-        self.assertIn("!aiResultData?.room_topology?.load_geometry_ready", html)
+        self.assertIn("!hasCurrentConfirmedGeometry()", html)
         self.assertIn("!hasCurrentAiRecognitionResult()", html)
         self.assertIn('id="param-scale" class="form-control" value=""', html)
         self.assertNotIn("const scale = 0.05;", html)
@@ -121,6 +122,420 @@ class EnergyTemplateTests(unittest.TestCase):
             with self.subTest(element_id=element_id):
                 self.assertIn(f'id="{element_id}"', html)
         self.assertIn('<script src="/energy/crop_region.js">', html)
+
+    def test_vector_raster_ui_exposes_an_independent_crop_preview(self):
+        html = Path("templates/energy.html").read_text(encoding="utf-8")
+
+        for element_id in [
+            "vector-raster-selection",
+            "vector-raster-preview-image",
+            "vector-raster-crop-overlay",
+            "vector-raster-mode-full",
+            "vector-raster-mode-crop",
+            "clear-vector-raster-crop",
+            "recognize-vector-raster",
+        ]:
+            with self.subTest(element_id=element_id):
+                self.assertIn(f'id="{element_id}"', html)
+        self.assertIn("async function prepareVectorRasterCrop(file)", html)
+        self.assertIn("vectorRasterRecognitionMode", html)
+
+    def test_vector_pdf_backend_waits_only_for_two_point_scale(self):
+        html = Path("templates/energy.html").read_text(encoding="utf-8")
+
+        self.assertIn("新矢量模型（矢量 PDF/图片试验版）", html)
+        self.assertIn("const vectorPdfFusion = Boolean(!file && preparedPdf && vectorBackend);", html)
+        self.assertIn("'/energy/vector_pdf_fusion'", html)
+        self.assertIn("if (data.fusion_debug)", html)
+        self.assertIn("aiResultData = data;", html)
+        self.assertIn("请在原图上选择两个点并保存比例尺", html)
+
+    def test_vector_pdf_page_has_no_separate_exterior_review_step(self):
+        html = Path("templates/energy.html").read_text(encoding="utf-8")
+
+        self.assertIn("pendingExteriorFusion", html)
+        self.assertIn("/energy/vector_pdf_exterior_confirm", html)
+        self.assertIn("confirmPendingExteriorWithScale", html)
+        self.assertNotIn("确认外轮廓并用于能耗计算", html)
+        self.assertNotIn('id="exterior-review-panel"', html)
+        self.assertNotIn('id="component-review-overlay"', html)
+        self.assertIn("images.component_overlay", html)
+        self.assertIn("topology_sha256: pending.topology_sha256", html)
+        self.assertIn("scale_m_per_px: scale", html)
+        self.assertIn("confirmed: true", html)
+        self.assertIn("page_number: pending.pdf_page_number", html)
+        self.assertIn("crop_bbox_page_px: pending.crop_bbox_page_px", html)
+        self.assertIn("aiResultData = data.recognition;", html)
+
+    def test_exterior_result_keeps_component_overlay_and_supports_image_enlargement(self):
+        html = Path("templates/energy.html").read_text(encoding="utf-8")
+
+        self.assertIn("images.component_overlay", html)
+        self.assertIn('id="recognition-image-modal"', html)
+        self.assertIn("openRecognitionImageModal", html)
+
+    def test_exterior_height_and_repeat_controls_are_sent_to_energy_route(self):
+        html = Path("templates/energy.html").read_text(encoding="utf-8")
+
+        expected_inputs = {
+            "param-door-height": ('min="0.1"', 'step="0.1"', 'value="2.1"'),
+            "param-window-height": ('min="0.1"', 'step="0.1"', 'value="1.5"'),
+            "param-door-repeat-count": ('min="1"', 'step="1"', 'value="1"'),
+            "param-window-repeat-count": ('min="1"', 'step="1"'),
+        }
+        for element_id, fragments in expected_inputs.items():
+            with self.subTest(element_id=element_id):
+                input_tag = re.search(
+                    rf'<input[^>]*id="{element_id}"[^>]*>', html,
+                ).group(0)
+                for fragment in fragments:
+                    self.assertIn(fragment, input_tag)
+
+        for field in (
+            "door_height_m",
+            "window_height_m",
+            "door_repeat_count",
+            "window_repeat_count",
+        ):
+            with self.subTest(field=field):
+                self.assertIn(f"{field}:", html)
+
+    def test_exterior_pending_and_confirmed_state_is_cleared_with_recognition_selection(self):
+        html = Path("templates/energy.html").read_text(encoding="utf-8")
+        clear_segment = html[
+            html.index("function clearPdfRecognitionDerivedState()")
+            :html.index("function invalidatePdfRecognitionSelection")
+        ]
+
+        self.assertIn("pendingExteriorFusion = null;", clear_segment)
+        self.assertIn("aiResultData = derivedState.aiResultData;", clear_segment)
+        self.assertIn("function hasCurrentConfirmedGeometry()", html)
+        self.assertIn("exterior_topology?.confirmed === true", html)
+        self.assertIn("room_topology?.load_geometry_ready === true", html)
+
+    def test_report_identity_change_invalidates_executable_client_state(self):
+        node_script = r'''
+const fs = require('fs');
+const vm = require('vm');
+const html = fs.readFileSync('templates/energy.html', 'utf8');
+const inlineScript = [...html.matchAll(/<script(?:[^>]*)>([\s\S]*?)<\/script>/g)]
+  .map(match => match[1]).find(Boolean);
+const elements = new Proxy({}, {
+  get(target, key) {
+    if (!target[key]) {
+      target[key] = {
+        value: '', checked: true, disabled: false, innerText: '',
+        style: {}, classList: { add() {}, remove() {}, toggle() {} },
+        addEventListener() {}, setAttribute() {}, removeAttribute() {},
+        querySelectorAll() { return []; }
+      };
+    }
+    return target[key];
+  }
+});
+elements['current-report-number'].value = '  REPORT-A  ';
+elements['pdf-page-select'].value = '1';
+let fetchCalls = 0;
+const context = {
+  EnergyPdfRecognitionState: require('./static/energy/pdf_recognition_state.js'),
+  document: {
+    addEventListener() {}, getElementById(id) { return elements[id]; },
+    querySelectorAll() { return []; }
+  },
+  window: { addEventListener() {}, scrollTo() {} },
+  console, AbortController, FormData, alert() {},
+  fetch: async () => {
+    fetchCalls += 1;
+    throw new Error('stale state attempted a request');
+  },
+  Chart: function Chart() {}
+};
+vm.createContext(context);
+vm.runInContext(inlineScript, context);
+vm.runInContext(`
+  preparedPdf = { uploadToken: 'token-a' };
+  pdfUploadSessionId = 1;
+  const start = pdfRecognitionRequests.begin(
+    currentPdfRecognitionSelection(), { abort() {} }
+  );
+  if (!pdfRecognitionRequests.accept(start.request, currentPdfRecognitionSelection())) {
+    throw new Error('REPORT-A recognition was not accepted');
+  }
+  acceptedRecognitionReportNumber = 'REPORT-A';
+  aiResultData = {
+    report_number: 'REPORT-A',
+    exterior_topology: { confirmed: true, load_geometry_ready: true }
+  };
+  if (!hasCurrentConfirmedGeometry()) throw new Error('REPORT-A was not ready');
+  document.getElementById('current-report-number').value = 'REPORT-B';
+  handleReportNumberInputChange();
+  if (hasCurrentConfirmedGeometry()) throw new Error('stale REPORT-A stayed ready');
+  if (aiResultData !== null || pendingExteriorFusion !== null) {
+    throw new Error('report change did not clear derived state');
+  }
+  if (pdfRecognitionRequests.hasAccepted(currentPdfRecognitionSelection())) {
+    throw new Error('REPORT-A fingerprint was accepted for REPORT-B');
+  }
+  calculateEnergy();
+`, context);
+if (fetchCalls !== 0) throw new Error('stale REPORT-A was sent as REPORT-B');
+'''
+        completed = subprocess.run(
+            ["node", "-e", node_script],
+            cwd=Path.cwd(),
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
+    def test_stale_energy_responses_cannot_land_after_report_identity_changes(self):
+        node_script = r'''
+const fs = require('fs');
+const vm = require('vm');
+const html = fs.readFileSync('templates/energy.html', 'utf8');
+const inlineScript = [...html.matchAll(/<script(?:[^>]*)>([\s\S]*?)<\/script>/g)]
+  .map(match => match[1]).find(Boolean);
+const elements = new Proxy({}, {
+  get(target, key) {
+    if (!target[key]) {
+      target[key] = {
+        value: '', checked: true, disabled: false, innerText: '', innerHTML: '',
+        style: {}, className: '',
+        classList: { add() {}, remove() {}, toggle() {} },
+        addEventListener() {}, setAttribute() {}, removeAttribute() {},
+        querySelectorAll() { return []; }
+      };
+    }
+    return target[key];
+  }
+});
+elements['current-report-number'].value = 'REPORT-A';
+elements['pdf-page-select'].value = '1';
+elements['param-floors'].value = '1';
+elements['param-window-repeat-count'].value = '';
+const requests = [];
+const tracking = { displays: [], steps: [], alerts: [], hideCount: 0 };
+const context = {
+  EnergyPdfRecognitionState: require('./static/energy/pdf_recognition_state.js'),
+  document: {
+    addEventListener() {}, getElementById(id) { return elements[id]; },
+    querySelectorAll() { return []; }, createElement() { return elements.created; }
+  },
+  window: { addEventListener() {}, scrollTo() {} },
+  console, AbortController, FormData,
+  alert(message) { tracking.alerts.push(message); },
+  fetch(url, options) {
+    if (url !== '/energy/ai_simulate') throw new Error(`unexpected fetch ${url}`);
+    let resolve;
+    const response = new Promise(done => { resolve = done; });
+    requests.push({
+      reportNumber: JSON.parse(options.body).report_number,
+      resolve
+    });
+    return response;
+  },
+  Chart: function Chart() {}, tracking
+};
+
+function acceptRecognition(reportNumber) {
+  elements['current-report-number'].value = reportNumber;
+  vm.runInContext(`
+    {
+      const accepted = pdfRecognitionRequests.begin(
+        currentPdfRecognitionSelection(), { abort() {} }
+      );
+      if (!pdfRecognitionRequests.accept(accepted.request, currentPdfRecognitionSelection())) {
+        throw new Error('could not accept recognition for ${reportNumber}');
+      }
+      pdfRecognitionRequests.finish(accepted.request, currentPdfRecognitionSelection());
+    }
+    acceptedRecognitionReportNumber = '${reportNumber}';
+    reportNumber = '${reportNumber}';
+    aiResultData = {
+      report_number: '${reportNumber}',
+      exterior_topology: { confirmed: true, load_geometry_ready: true }
+    };
+  `, context);
+}
+
+(async () => {
+  vm.createContext(context);
+  vm.runInContext(inlineScript, context);
+  vm.runInContext(`
+    displayResults = data => tracking.displays.push(data.marker);
+    gotoStep = step => tracking.steps.push(step);
+    showLoader = () => {};
+    hideLoader = () => { tracking.hideCount += 1; };
+  `, context);
+
+  vm.runInContext(`preparedPdf = { uploadToken: 'token' }; pdfUploadSessionId = 1;`, context);
+  acceptRecognition('REPORT-A');
+  const calculationA = vm.runInContext('calculateEnergy()', context);
+
+  elements['current-report-number'].value = 'REPORT-B';
+  vm.runInContext('handleReportNumberInputChange()', context);
+  if (tracking.hideCount !== 1) {
+    throw new Error('report invalidation did not retire the abandoned REPORT-A loader');
+  }
+  acceptRecognition('REPORT-B');
+  const calculationB = vm.runInContext('calculateEnergy()', context);
+
+  if (requests.map(item => item.reportNumber).join(',') !== 'REPORT-A,REPORT-B') {
+    throw new Error('calculation report numbers were not frozen per request');
+  }
+  requests[0].resolve({ json: async () => ({ marker: 'REPORT-A result' }) });
+  await calculationA;
+  if (vm.runInContext('energyResultData', context) !== null) {
+    throw new Error('stale REPORT-A response wrote energyResultData');
+  }
+  if (tracking.displays.length || tracking.steps.length || tracking.hideCount !== 1) {
+    throw new Error('stale REPORT-A response rendered, navigated, or hid REPORT-B loader: '
+      + JSON.stringify(tracking));
+  }
+
+  requests[1].resolve({ json: async () => ({ marker: 'REPORT-B result' }) });
+  await calculationB;
+  if (vm.runInContext('energyResultData.marker', context) !== 'REPORT-B result') {
+    throw new Error('current REPORT-B response did not land');
+  }
+  if (tracking.displays.join(',') !== 'REPORT-B result'
+      || tracking.steps.join(',') !== '4' || tracking.hideCount !== 2) {
+    throw new Error('current REPORT-B response did not render normally');
+  }
+
+  const staleError = vm.runInContext('calculateEnergy()', context);
+  elements['current-report-number'].value = 'REPORT-C';
+  vm.runInContext('handleReportNumberInputChange()', context);
+  if (tracking.hideCount !== 3) {
+    throw new Error('report invalidation did not retire the abandoned REPORT-B loader');
+  }
+  requests[2].resolve({ json: async () => ({ error: 'delayed REPORT-B failure' }) });
+  await staleError;
+  if (tracking.alerts.length || tracking.hideCount !== 3
+      || tracking.displays.join(',') !== 'REPORT-B result'
+      || tracking.steps.join(',') !== '4') {
+    throw new Error('stale error/finally mutated the newer report state');
+  }
+})().catch(error => { console.error(error); process.exitCode = 1; });
+'''
+        completed = subprocess.run(
+            ["node", "-e", node_script],
+            cwd=Path.cwd(),
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
+    def test_vector_pdf_two_point_scale_directly_confirms_exterior(self):
+        node_script = r'''
+const fs = require('fs');
+const vm = require('vm');
+const html = fs.readFileSync('templates/energy.html', 'utf8');
+const inlineScript = [...html.matchAll(/<script(?:[^>]*)>([\s\S]*?)<\/script>/g)]
+  .map(match => match[1]).find(Boolean);
+const elements = new Proxy({}, {
+  get(target, key) {
+    if (!target[key]) {
+      target[key] = {
+        value: '', checked: true, disabled: false, innerText: '', innerHTML: '',
+        src: '', style: {}, className: '',
+        classList: { add() {}, remove() {}, toggle() {} },
+        addEventListener() {}, setAttribute() {}, removeAttribute() {},
+        querySelectorAll() { return []; },
+        getContext() { return { clearRect() {} }; }
+      };
+    }
+    return target[key];
+  }
+});
+elements['current-report-number'].value = 'REPORT-A';
+elements['pdf-page-select'].value = '1';
+elements['manual-scale-length'].value = '1000';
+elements['manual-scale-unit'].value = 'mm';
+const requests = [];
+const context = {
+  EnergyPdfRecognitionState: require('./static/energy/pdf_recognition_state.js'),
+  document: {
+    addEventListener() {}, getElementById(id) { return elements[id]; },
+    querySelectorAll() { return []; }, createElement() { return elements.created; }
+  },
+  window: { addEventListener() {}, scrollTo() {} },
+  console, AbortController, FormData, Chart: function Chart() {},
+  requestAnimationFrame(callback) { callback(); }, alert(message) { throw new Error(message); },
+  fetch: async (url, options) => {
+    requests.push({ url, body: JSON.parse(options.body) });
+    if (url !== '/energy/vector_pdf_exterior_confirm') {
+      throw new Error(`unexpected fetch ${url}`);
+    }
+    return {
+      ok: true,
+      json: async () => ({
+        success: true,
+        report_number: 'REPORT-A',
+        recognition: {
+          report_number: 'REPORT-A',
+          exterior_topology: {
+            confirmed: true, load_geometry_ready: true,
+            area_m2: 80, perimeter_m: 36
+          },
+          opening_widths: { window_total_width_m: 4 },
+          room_topology: { load_geometry_ready: false },
+          scale_calibration: {
+            status: 'confirmed', method: 'manual_two_point', scale_m_per_px: 0.01
+          },
+          pixel_lengths: { wall_px: 3600, window_px: 400 }
+        }
+      })
+    };
+  }
+};
+
+(async () => {
+  vm.createContext(context);
+  vm.runInContext(inlineScript, context);
+  vm.runInContext(`
+    updateAnnualUsePreview = () => {};
+    gotoStep = () => {};
+    preparedPdf = { uploadToken: 'token-a' };
+    pdfUploadSessionId = 1;
+    const started = pdfRecognitionRequests.begin(
+      currentPdfRecognitionSelection(), { abort() {} }
+    );
+    if (!pdfRecognitionRequests.accept(started.request, currentPdfRecognitionSelection())) {
+      throw new Error('recognition was not accepted');
+    }
+    acceptedRecognitionReportNumber = 'REPORT-A';
+    pendingExteriorFusion = {
+      report_number: 'REPORT-A', topology_sha256: '${'a'.repeat(64)}',
+      pdf_page_number: 1, crop_bbox_page_px: null
+    };
+    aiResultData = { report_number: 'REPORT-A', image_size: [1000, 800] };
+    calibrationPoints = [[10, 20], [110, 20]];
+  `, context);
+  const saved = await vm.runInContext('saveManualScaleCalibration()', context);
+  if (!saved) throw new Error('two-point calibration did not complete');
+  if (requests.length !== 1) throw new Error(`expected one request, got ${requests.length}`);
+  if (Math.abs(requests[0].body.scale_m_per_px - 0.01) > 1e-12) {
+    throw new Error(`wrong scale ${requests[0].body.scale_m_per_px}`);
+  }
+  if (vm.runInContext('pendingExteriorFusion', context) !== null) {
+    throw new Error('pending exterior state remained after calibration');
+  }
+  if (!vm.runInContext('hasCurrentConfirmedGeometry()', context)) {
+    throw new Error('calibrated exterior did not enable calculation');
+  }
+})().catch(error => { console.error(error); process.exitCode = 1; });
+'''
+        completed = subprocess.run(
+            ["node", "-e", node_script],
+            cwd=Path.cwd(),
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
 
     def test_pdf_region_recognition_ui_loads_preview_and_manages_crop_state(self):
         html = Path("templates/energy.html").read_text(encoding="utf-8")
@@ -479,7 +894,7 @@ class EnergyTemplateTests(unittest.TestCase):
 
         self.assertLess(
             recognize_segment.index("invalidatePdfRecognitionSelection("),
-            recognize_segment.index("fetch('/energy/ai_recognize'"),
+            recognize_segment.index("fetch(recognitionEndpoint"),
         )
         self.assertLess(calculate_segment.index("invalidateEnergyResult();"), calculate_segment.index("fetch('/energy/ai_simulate'"))
         self.assertNotIn("energyResultData =", calculate_failure)
@@ -1612,18 +2027,19 @@ class EnergyRouteClientTests(unittest.TestCase):
                     ("VALID-REPORT", prepared["upload_token"] + "tampered", "1", "token"),
                     ("OTHER-REPORT", prepared["upload_token"], "1", "report"),
                 ]
-                for report_number, token, page_number, expected_error in cases:
-                    with self.subTest(report_number=report_number, page_number=page_number):
-                        response = self.client.post(
-                            "/energy/ai_recognize",
-                            data={
-                                "report_number": report_number,
-                                "pdf_upload_token": token,
-                                "pdf_page_number": page_number,
-                            },
-                        )
-                        self.assertEqual(response.status_code, 400)
-                        self.assertIn(expected_error, response.get_json()["error"].lower())
+                with patch.object(self.server, "HAS_FLOORPLAN_AI", True):
+                    for report_number, token, page_number, expected_error in cases:
+                        with self.subTest(report_number=report_number, page_number=page_number):
+                            response = self.client.post(
+                                "/energy/ai_recognize",
+                                data={
+                                    "report_number": report_number,
+                                    "pdf_upload_token": token,
+                                    "pdf_page_number": page_number,
+                                },
+                            )
+                            self.assertEqual(response.status_code, 400)
+                            self.assertIn(expected_error, response.get_json()["error"].lower())
             finally:
                 self.server.app.config["UPLOAD_FOLDER"] = previous_upload
 
@@ -1748,6 +2164,64 @@ class EnergyRouteClientTests(unittest.TestCase):
             self.assertTrue((report_dir / "ai_raw_model_mask.png").exists())
             self.assertEqual(body["topology_repair"]["exterior_repair"]["status"], "manual_exterior_wall_required")
 
+    def test_vector_pdf_fusion_returns_complete_exterior_review_summary(self):
+        fusion = {
+            "status": "evaluable",
+            "summary": {},
+            "reason_codes": [],
+            "exterior_summary": {
+                "footprint_status": "closed",
+                "unresolved_gap_count": 1,
+            },
+            "exterior_topology": {
+                "area_px2": 5000.0,
+                "perimeter_px": 300.0,
+                "bridges": [
+                    {"bridge_id": "repair-1", "bridge_type": "small_gap_repair"},
+                    {"bridge_id": "opening-bridge-1", "bridge_type": "opening_bridge"},
+                ],
+                "unresolved": [{"gap_id": "gap-1"}],
+            },
+            "opening_candidates": {
+                "accepted_openings": [
+                    {"opening_id": "door-1", "kind": "door", "width_px": 30.0},
+                    {"opening_id": "window-1", "kind": "window", "width_px": 20.0},
+                ],
+            },
+        }
+        with (
+            patch.object(self.server, "HAS_VECTOR_PDF_FUSION", True),
+            patch.object(self.server, "_vector_pdf_fusion_config", object()),
+            patch.object(
+                self.server,
+                "_validated_prepared_pdf",
+                return_value=(Path("prepared.pdf"), 2, 3),
+            ),
+            patch.object(self.server, "analyze_vector_pdf_page", return_value=fusion),
+            patch.object(self.server, "_sha256_file", return_value="a" * 64),
+            patch.object(self.server.cv2, "imread", return_value=None),
+        ):
+            response = self.client.post(
+                "/energy/vector_pdf_fusion",
+                data={
+                    "report_number": "EXT-REVIEW",
+                    "pdf_upload_token": "token",
+                    "pdf_page_number": "2",
+                    "recognition_mode": "full_page",
+                },
+            )
+
+        self.assertEqual(response.status_code, 200, response.get_json())
+        summary = response.get_json()["exterior_summary"]
+        self.assertEqual(summary["area_px2"], 5000.0)
+        self.assertEqual(summary["perimeter_px"], 300.0)
+        self.assertEqual(summary["door_count"], 1)
+        self.assertEqual(summary["door_total_width_px"], 30.0)
+        self.assertEqual(summary["window_count"], 1)
+        self.assertEqual(summary["window_total_width_px"], 20.0)
+        self.assertEqual(summary["small_repair_count"], 1)
+        self.assertEqual(summary["unresolved_gap_count"], 1)
+
     def post_and_capture_params(self, payload):
         result = {
             "success": True,
@@ -1775,6 +2249,276 @@ class EnergyRouteClientTests(unittest.TestCase):
 
         params = calculate.call_args.args[0] if calculate.called else None
         return response, params
+
+    def post_exterior_energy(self, recognition, payload=None):
+        result = {
+            "success": True,
+            "summary": {
+                "total_energy_kwh": 0,
+                "eui": 0,
+                "rating": "A",
+                "rating_label": "test",
+            },
+        }
+        connection = MagicMock()
+        connection.execute.return_value.fetchone.return_value = None
+        with (
+            patch.object(self.server, "HAS_FLOORPLAN_AI", True),
+            patch.object(self.server, "HAS_ENERGY_CALC", True),
+            patch.object(
+                self.server, "_exterior_report_lock",
+                return_value=nullcontext(), create=True,
+            ),
+            patch.object(
+                self.server, "_require_current_exterior_generation",
+                return_value={
+                    "generation": "test-generation",
+                    "status": "ready",
+                    "topology_sha256": "a" * 64,
+                },
+                create=True,
+            ),
+            patch.object(self.server, "_load_recognition_payload", return_value=recognition),
+            patch.object(self.server.energy_calc, "calculate_energy", return_value=result) as calculate,
+            patch.object(self.server, "get_db_connection", return_value=connection),
+        ):
+            response = self.client.post(
+                "/energy/ai_simulate",
+                json={"report_number": "EXT-ENERGY", **(payload or {})},
+            )
+        return response, calculate
+
+    @staticmethod
+    def exterior_recognition(*, confirmed=True, room_topology=None, perimeter_m=40.0):
+        return {
+            "model": {"version": "exterior-test"},
+            "preprocessing": {"requested": "vector_pdf_fusion", "use_preprocessing": False},
+            "image_size": [100, 100],
+            "geometry": {"walls": [], "windows": [], "doors": []},
+            "room_topology": room_topology or {
+                "status": "exterior_only",
+                "room_count": 0,
+                "rooms": [],
+                "total_area_px2": 0.0,
+                "load_geometry_ready": False,
+            },
+            "exterior_topology": {
+                "area_m2": 100.0,
+                "perimeter_m": perimeter_m,
+                "confirmed": confirmed,
+                "load_geometry_ready": confirmed,
+            },
+            "openings": [
+                {"opening_id": "door-1", "kind": "door", "width_m": 2.0},
+                {"opening_id": "window-1", "kind": "window", "width_m": 8.0},
+            ],
+        }
+
+    def post_persisted_exterior_energy(self, recognition, marker):
+        result = {
+            "success": True,
+            "summary": {"total_energy_kwh": 0, "eui": 0, "rating": "A", "rating_label": "test"},
+        }
+        temporary = tempfile.TemporaryDirectory()
+        upload_root = Path(temporary.name)
+        report_dir = upload_root / "energy" / "EXT-ENERGY"
+        report_dir.mkdir(parents=True)
+        (report_dir / "recognition.json").write_text(
+            json.dumps(recognition), encoding="utf-8",
+        )
+        if marker is not None:
+            (report_dir / "exterior_generation.json").write_text(
+                json.dumps(marker), encoding="utf-8",
+            )
+        connection = MagicMock()
+        connection.execute.return_value.fetchone.return_value = None
+        previous_upload = self.server.app.config["UPLOAD_FOLDER"]
+        self.server.app.config["UPLOAD_FOLDER"] = str(upload_root)
+        try:
+            with (
+                patch.object(self.server, "HAS_FLOORPLAN_AI", True),
+                patch.object(self.server, "HAS_ENERGY_CALC", True),
+                patch.object(self.server, "HAS_DESIGN_LOAD_CALC", False),
+                patch.object(self.server.energy_calc, "calculate_energy", return_value=result) as calculate,
+                patch.object(self.server, "get_db_connection", return_value=connection),
+            ):
+                response = self.client.post(
+                    "/energy/ai_simulate",
+                    json={"report_number": "EXT-ENERGY", "height": 3.0, "floors": 2},
+                )
+        finally:
+            self.server.app.config["UPLOAD_FOLDER"] = previous_upload
+            temporary.cleanup()
+        return response, calculate
+
+    @staticmethod
+    def bind_exterior_generation(recognition, *, generation="generation-a", topology_sha256="a" * 64):
+        recognition = json.loads(json.dumps(recognition))
+        recognition["schema_version"] = 1
+        recognition["report_number"] = "EXT-ENERGY"
+        recognition["exterior_generation"] = {
+            "generation": generation,
+            "topology_sha256": topology_sha256,
+        }
+        return recognition
+
+    @staticmethod
+    def exterior_marker(*, status="ready", generation="generation-a", topology_sha256="a" * 64):
+        return {
+            "format": "pdf-exterior-generation/1",
+            "report_number": "EXT-ENERGY",
+            "generation": generation,
+            "status": status,
+            "topology_sha256": topology_sha256 if status == "ready" else None,
+        }
+
+    def test_energy_route_rejects_confirmed_exterior_when_generation_is_not_current(self):
+        recognition = self.bind_exterior_generation(self.exterior_recognition())
+        cases = (
+            ("missing marker", None),
+            ("running generation", self.exterior_marker(status="running", generation="generation-b")),
+            ("failed generation", self.exterior_marker(status="failed", generation="generation-b")),
+            ("generation mismatch", self.exterior_marker(generation="generation-b")),
+            ("hash mismatch", self.exterior_marker(topology_sha256="b" * 64)),
+        )
+        for label, marker in cases:
+            with self.subTest(label=label):
+                response, calculate = self.post_persisted_exterior_energy(recognition, marker)
+                self.assertEqual(response.status_code, 409, response.get_json())
+                self.assertIn("generation", response.get_json()["error"].lower())
+                calculate.assert_not_called()
+
+    def test_stale_exterior_uses_existing_ready_room_fallback(self):
+        room_topology = {
+            "status": "closed",
+            "room_count": 1,
+            "rooms": [{"id": "room-1", "area_px2": 400.0}],
+            "total_area_px2": 400.0,
+            "scale_m_per_px": 0.5,
+            "load_geometry_ready": True,
+        }
+        recognition = self.bind_exterior_generation(
+            self.exterior_recognition(room_topology=room_topology),
+        )
+        recognition["scale_calibration"] = {
+            "status": "confirmed",
+            "method": "legacy-room-test",
+            "scale_m_per_px": 0.5,
+        }
+        response, calculate = self.post_persisted_exterior_energy(
+            recognition,
+            self.exterior_marker(status="failed", generation="generation-b"),
+        )
+
+        self.assertEqual(response.status_code, 200, response.get_json())
+        self.assertEqual(response.get_json()["floor_area_source"], "room_polygons")
+        self.assertEqual(calculate.call_args.args[0]["geometry"]["floor_area_m2"], 100.0)
+
+    def test_energy_route_uses_confirmed_exterior_and_separate_opening_heights(self):
+        response, calculate = self.post_exterior_energy(
+            self.exterior_recognition(),
+            {
+                "height": 3.0,
+                "floors": 2,
+                "door_height_m": 2.1,
+                "window_height_m": 1.5,
+                "door_repeat_count": 1,
+                "window_repeat_count": 2,
+            },
+        )
+
+        self.assertEqual(response.status_code, 200, response.get_json())
+        geometry = calculate.call_args.args[0]["geometry"]
+        self.assertEqual(geometry["floor_area_m2"], 100.0)
+        self.assertEqual(geometry["roof_area_m2"], 100.0)
+        self.assertEqual(geometry["door_area_m2"], 4.2)
+        self.assertEqual(geometry["window_area_m2"], 24.0)
+        self.assertEqual(geometry["wall_area_m2"], 211.8)
+        self.assertEqual(response.get_json()["floor_area_source"], "confirmed_exterior_footprint")
+
+    def test_energy_route_defaults_exterior_repeats_to_door_once_and_windows_all_floors(self):
+        response, calculate = self.post_exterior_energy(
+            self.exterior_recognition(),
+            {
+                "height": 3.0,
+                "floors": 2,
+                "door_height_m": 2.1,
+                "window_height_m": 1.5,
+            },
+        )
+
+        self.assertEqual(response.status_code, 200, response.get_json())
+        geometry = calculate.call_args.args[0]["geometry"]
+        self.assertEqual(geometry["door_area_m2"], 4.2)
+        self.assertEqual(geometry["window_area_m2"], 24.0)
+
+    def test_unconfirmed_exterior_cannot_calculate_without_an_existing_fallback(self):
+        response, calculate = self.post_exterior_energy(
+            self.exterior_recognition(confirmed=False),
+            {"height": 3.0, "floors": 2},
+        )
+
+        self.assertEqual(response.status_code, 400, response.get_json())
+        calculate.assert_not_called()
+
+    def test_unconfirmed_exterior_does_not_preempt_old_confirmed_room_topology(self):
+        room_topology = {
+            "status": "closed",
+            "room_count": 1,
+            "rooms": [{"id": "room-1", "area_px2": 400.0}],
+            "total_area_px2": 400.0,
+            "scale_m_per_px": 0.5,
+            "load_geometry_ready": True,
+        }
+        recognition = self.exterior_recognition(
+            confirmed=False,
+            room_topology=room_topology,
+        )
+        recognition["scale_calibration"] = {
+            "status": "confirmed",
+            "method": "legacy-room-test",
+            "scale_m_per_px": 0.5,
+        }
+
+        response, calculate = self.post_exterior_energy(
+            recognition,
+            {"height": 3.0, "floors": 2},
+        )
+
+        self.assertEqual(response.status_code, 200, response.get_json())
+        self.assertEqual(response.get_json()["floor_area_source"], "room_polygons")
+        self.assertEqual(calculate.call_args.args[0]["geometry"]["floor_area_m2"], 100.0)
+
+    def test_energy_route_rejects_exterior_openings_larger_than_gross_wall(self):
+        response, calculate = self.post_exterior_energy(
+            self.exterior_recognition(perimeter_m=4.0),
+            {
+                "height": 3.0,
+                "floors": 1,
+                "door_height_m": 3.0,
+                "window_height_m": 1.0,
+            },
+        )
+
+        self.assertEqual(response.status_code, 400, response.get_json())
+        self.assertIn("gross exterior wall area", response.get_json()["error"])
+        calculate.assert_not_called()
+
+    def test_energy_route_strictly_validates_exterior_repeat_counts(self):
+        for field, value in (
+            ("door_repeat_count", 1.5),
+            ("door_repeat_count", 3),
+            ("window_repeat_count", 1.5),
+            ("window_repeat_count", 3),
+        ):
+            with self.subTest(field=field, value=value):
+                response, calculate = self.post_exterior_energy(
+                    self.exterior_recognition(),
+                    {"height": 3.0, "floors": 2, field: value},
+                )
+                self.assertEqual(response.status_code, 400, response.get_json())
+                self.assertIn(field, response.get_json()["error"])
+                calculate.assert_not_called()
 
     def post_with_actual_calculator(self, payload):
         recognition = {
@@ -2439,10 +3183,11 @@ class EnergyRouteClientTests(unittest.TestCase):
                 self.assertEqual(params["cooling"]["enabled"], expected[1])
 
     def test_route_rejects_both_calculation_scopes_disabled(self):
-        response = self.client.post(
-            "/energy/ai_simulate",
-            json={"calculate_heating": False, "calculate_cooling": False},
-        )
+        with patch.object(self.server, "HAS_FLOORPLAN_AI", True):
+            response = self.client.post(
+                "/energy/ai_simulate",
+                json={"calculate_heating": False, "calculate_cooling": False},
+            )
 
         self.assertEqual(response.status_code, 400, response.get_json())
         self.assertIn("供暖或制冷", response.get_json()["error"])

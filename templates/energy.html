@@ -308,14 +308,16 @@
             touch-action: none;
         }
 
-        #pdf-page-preview-image {
+        #pdf-page-preview-image,
+        #vector-raster-preview-image {
             display: block;
             max-width: 100%;
             max-height: 70vh;
             user-select: none;
         }
 
-        #pdf-crop-overlay {
+        #pdf-crop-overlay,
+        #vector-raster-crop-overlay {
             position: absolute;
             border: 2px solid var(--warning);
             background: rgba(241, 196, 15, 0.18);
@@ -545,6 +547,30 @@
             max-height: 380px;
             border-radius: 8px;
             object-fit: contain;
+        }
+
+        .recognition-expandable { cursor: zoom-in; }
+
+        .recognition-image-card {
+            width: min(1200px, calc(100vw - 32px));
+            max-height: calc(100vh - 32px);
+            padding: 16px;
+        }
+
+        .recognition-image-viewport {
+            max-height: calc(100vh - 118px);
+            overflow: auto;
+            text-align: center;
+            background: #fff;
+            border-radius: 8px;
+        }
+
+        #recognition-image-modal-image {
+            display: block;
+            max-width: 100%;
+            max-height: calc(100vh - 130px);
+            margin: 0 auto;
+            transform-origin: top center;
         }
 
         .preview-box-title {
@@ -878,12 +904,38 @@
                 上传您的建筑平面图纸（支持 PNG、JPG、BMP 及 PDF 格式）。AI 自动识别墙体、门和窗户的几何轮廓并自动提取空间物理属性。
             </p>
 
+            <div class="form-group" style="max-width:360px; margin-bottom:16px;">
+                <label class="form-label" for="model-backend">识别模型</label>
+                <select id="model-backend" class="form-control">
+                    <option value="legacy_onnx">旧 ONNX 四分类模型</option>
+                    <option value="vector_pytorch">新矢量模型（矢量 PDF/图片试验版）</option>
+                </select>
+            </div>
+
             <div class="upload-wrapper" id="uploadWrapper">
                 <div class="upload-icon-large">☁️</div>
                 <div class="upload-text">点击或拖拽文件到这里上传</div>
                 <div class="upload-sub">支持常见建筑图纸格式，包含黑底CAD、白色底稿或扫描图</div>
                 <div class="upload-sub" style="margin-top: 6px; color: var(--warning);">多页 PDF 可在上传后选择需要识别的楼层页。</div>
                 <input type="file" id="rasterFileInput" class="file-input" accept="image/*,application/pdf">
+            </div>
+
+            <div id="vector-raster-selection" class="param-group-card hidden" style="margin-top:16px;">
+                <div class="param-group-title">新矢量模型识别区域</div>
+                <p style="color:var(--text-muted); margin-bottom:14px;">一张图片包含多张图纸时，请拖动框选其中一张；框选后仅识别该区域。</p>
+                <div class="pdf-preview-frame">
+                    <div class="pdf-preview-image-wrap">
+                        <img id="vector-raster-preview-image" src="" alt="矢量模型图片预览" draggable="false">
+                        <div id="vector-raster-crop-overlay" class="hidden"></div>
+                    </div>
+                </div>
+                <div class="pdf-mode-controls">
+                    <label><input type="radio" id="vector-raster-mode-full" name="vector-raster-mode" value="full_page" checked>识别整张图片</label>
+                    <label><input type="radio" id="vector-raster-mode-crop" name="vector-raster-mode" value="crop_region">框选区域</label>
+                    <button type="button" id="clear-vector-raster-crop" class="btn btn-secondary" disabled>清除框选</button>
+                    <span id="vector-raster-crop-summary" style="color:var(--text-muted); font-size:13px;">整图识别模式</span>
+                </div>
+                <div style="margin-top:14px;"><button type="button" id="recognize-vector-raster" class="btn btn-primary" disabled>开始识别整张图片</button></div>
             </div>
 
             <div id="pdf-page-selection" class="param-group-card hidden" style="margin-top:16px;">
@@ -929,8 +981,8 @@
                         <div class="preview-box-title">输入建筑图纸</div>
                     </div>
                     <div class="preview-box">
-                        <img id="imgOverlay" src="" alt="AI 构件语义识别">
-                        <div class="preview-box-title">AI 识别构件叠加图 (红墙、蓝窗、绿门)</div>
+                        <img id="imgOverlay" class="recognition-expandable" src="" alt="AI 构件语义识别" onclick="openRecognitionImageModal(this.src, '墙体、门窗综合识别图')">
+                        <div class="preview-box-title">墙体、门窗综合识别图（点击放大）</div>
                     </div>
                 </div>
 
@@ -990,6 +1042,22 @@
                         <div class="form-group">
                             <label class="form-label" for="param-floors">地上层数 (层)</label>
                             <input type="number" id="param-floors" class="form-control" value="1">
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label" for="param-door-height">外门高度 (m)</label>
+                            <input id="param-door-height" type="number" min="0.1" step="0.1" value="2.1" class="form-control">
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label" for="param-window-height">外窗高度 (m)</label>
+                            <input id="param-window-height" type="number" min="0.1" step="0.1" value="1.5" class="form-control">
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label" for="param-door-repeat-count">外门重复层数</label>
+                            <input id="param-door-repeat-count" type="number" min="1" step="1" value="1" class="form-control">
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label" for="param-window-repeat-count">外窗重复层数（留空时等于地上层数）</label>
+                            <input id="param-window-repeat-count" type="number" min="1" step="1" class="form-control">
                         </div>
                         <div class="form-group">
                             <label class="form-label" for="param-orientation">主要朝向</label>
@@ -1616,12 +1684,27 @@
         </div>
     </div>
 
+    <div class="loader-overlay" id="recognition-image-modal" style="background: rgba(15, 20, 28, 0.92);" onclick="closeRecognitionImageModal()">
+        <div class="modal-card recognition-image-card" onclick="event.stopPropagation()">
+            <div class="modal-header">
+                <div class="modal-title" id="recognition-image-modal-title">识别结果</div>
+                <button type="button" class="btn btn-secondary" onclick="closeRecognitionImageModal()" style="padding: 6px 10px;">关闭</button>
+            </div>
+            <div class="recognition-image-viewport" id="recognition-image-viewport">
+                <img id="recognition-image-modal-image" src="" alt="放大的识别结果">
+            </div>
+            <p style="color:var(--text-muted); margin-top:10px; font-size:13px;">滚轮可缩放，点击背景或按 Esc 关闭。</p>
+        </div>
+    </div>
+
     <script src="/energy/crop_region.js"></script>
     <script src="/energy/pdf_recognition_state.js"></script>
     <script>
         let currentStep = 1;
         let reportNumber = '';
+        let acceptedRecognitionReportNumber = null;
         let aiResultData = null;
+        let pendingExteriorFusion = null;
         let preparedPdf = null;
         let pdfRecognitionMode = 'full_page';
         let pdfCropBBox = null;
@@ -1629,6 +1712,11 @@
         let pdfCropBeforeDrag = null;
         let pdfCropDragging = false;
         let pdfPreviewSize = null;
+        let vectorRasterFile = null;
+        let vectorRasterRecognitionMode = 'full_page';
+        let vectorRasterCropBBox = null;
+        let vectorRasterCropStart = null;
+        let vectorRasterCropDragging = false;
         let pdfUploadSessionId = 0;
         let pdfPreviewRequestId = 0;
         let pdfPrepareAbortController = null;
@@ -1639,6 +1727,8 @@
             EnergyPdfRecognitionState.createSelectionBoundRequestState();
         let calibrationPoints = [];
         let energyResultData = null;
+        let energyCalculationRequestGeneration = 0;
+        let activeEnergyCalculationRequestGeneration = null;
         let chartInstance = null;
         let wallAssemblyLibrary = [];
         let envelopeLibraries = {
@@ -1662,11 +1752,20 @@
         let activeOrientationKey = 'east';
         let activeModalType = 'wall';
         let detailedEnvelope = createDefaultDetailedEnvelope();
+        let recognitionImageScale = 1;
 
         // 初始化
         document.addEventListener('DOMContentLoaded', () => {
             generateReportNumber();
             setupUpload();
+            document.getElementById('recognition-image-viewport').addEventListener('wheel', event => {
+                event.preventDefault();
+                recognitionImageScale = Math.max(1, Math.min(4, recognitionImageScale + (event.deltaY < 0 ? 0.2 : -0.2)));
+                document.getElementById('recognition-image-modal-image').style.transform = `scale(${recognitionImageScale})`;
+            }, { passive: false });
+            document.addEventListener('keydown', event => {
+                if (event.key === 'Escape') closeRecognitionImageModal();
+            });
             setupScaleCalibrationCanvas();
             updateCalculationScopeControls();
             updateAnnualUsePreview();
@@ -1955,6 +2054,20 @@
 
         function closeOrientationModal() {
             document.getElementById('orientationModal').style.display = 'none';
+        }
+
+        function openRecognitionImageModal(source, title) {
+            if (!source) return;
+            recognitionImageScale = 1;
+            document.getElementById('recognition-image-modal-title').innerText = title || '识别结果';
+            const image = document.getElementById('recognition-image-modal-image');
+            image.src = source;
+            image.style.transform = 'scale(1)';
+            document.getElementById('recognition-image-modal').style.display = 'flex';
+        }
+
+        function closeRecognitionImageModal() {
+            document.getElementById('recognition-image-modal').style.display = 'none';
         }
 
         function saveOrientationModal() {
@@ -2358,7 +2471,7 @@
             if (roomTopology?.total_area_m2 != null) {
                 areaInput.value = Number(roomTopology.total_area_m2).toFixed(2);
             }
-            calculateButton.disabled = !roomTopology?.load_geometry_ready;
+            calculateButton.disabled = !hasCurrentConfirmedGeometry();
             updatePhysicalLengths();
         }
 
@@ -2397,11 +2510,32 @@
             );
 
             try {
+                if (pendingExteriorFusion) {
+                    const [pointA, pointB] = calibrationPoints;
+                    const pixelDistance = Math.hypot(
+                        pointB[0] - pointA[0], pointB[1] - pointA[1]
+                    );
+                    const actualLengthM = document.getElementById('manual-scale-unit').value === 'mm'
+                        ? actualLength / 1000
+                        : actualLength;
+                    const scale = actualLengthM / pixelDistance;
+                    if (!Number.isFinite(scale) || scale <= 0) {
+                        throw new Error('两点距离无效，请重新选择。');
+                    }
+                    const confirmed = await confirmPendingExteriorWithScale(
+                        scale,
+                        calibrationSelection,
+                        requestController.signal
+                    );
+                    if (!confirmed) return false;
+                    document.getElementById('scale-calibration-canvas').style.pointerEvents = 'none';
+                    return true;
+                }
                 const response = await fetch('/energy/scale_calibration', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({
-                        report_number: reportNumber,
+                        report_number: acceptedRecognitionReportNumber,
                         point_a: calibrationPoints[0],
                         point_b: calibrationPoints[1],
                         actual_length: actualLength,
@@ -2503,7 +2637,16 @@
             window.scrollTo({ top: 0, behavior: 'smooth' });
         }
 
+        function invalidateEnergyCalculationRequest() {
+            energyCalculationRequestGeneration += 1;
+            if (activeEnergyCalculationRequestGeneration !== null) {
+                activeEnergyCalculationRequestGeneration = null;
+                hideLoader();
+            }
+        }
+
         function invalidateEnergyResult() {
+            invalidateEnergyCalculationRequest();
             energyResultData = null;
         }
 
@@ -2512,10 +2655,19 @@
             gotoStep(1);
         }
 
-        function currentPdfRecognitionSelection() {
+        function normalizedReportNumber(value) {
+            return String(value || '').trim();
+        }
+
+        function currentPdfRecognitionSelection(reportNumberOverride = null) {
+            const selectedReportNumber = normalizedReportNumber(
+                reportNumberOverride ?? document.getElementById('current-report-number').value
+            );
             return EnergyPdfRecognitionState.createSelectionFingerprint({
                 uploadSessionId: pdfUploadSessionId,
-                uploadToken: preparedPdf?.uploadToken || null,
+                // The helper owns the fingerprint schema, so bind report identity into
+                // its opaque upload-token slot without changing the actual server token.
+                uploadToken: `${selectedReportNumber}\u0000${preparedPdf?.uploadToken || ''}`,
                 pageNumber: preparedPdf
                     ? document.getElementById('pdf-page-select').value
                     : null,
@@ -2526,12 +2678,57 @@
         }
 
         function hasCurrentAiRecognitionResult() {
+            const currentReportNumber = normalizedReportNumber(
+                document.getElementById('current-report-number').value
+            );
             return Boolean(
                 aiResultData
+                && acceptedRecognitionReportNumber === currentReportNumber
+                && (
+                    aiResultData.report_number == null
+                    || aiResultData.report_number === acceptedRecognitionReportNumber
+                )
                 && pdfRecognitionRequests.hasAccepted(
                     currentPdfRecognitionSelection()
                 )
             );
+        }
+
+        function hasCurrentConfirmedGeometry() {
+            if (!hasCurrentAiRecognitionResult()) return false;
+            return Boolean(
+                (
+                    aiResultData.exterior_topology?.confirmed === true
+                    && aiResultData.exterior_topology?.load_geometry_ready === true
+                )
+                || aiResultData.room_topology?.load_geometry_ready === true
+            );
+        }
+
+        function isCurrentEnergyCalculationRequest(calculationRequest) {
+            return Boolean(
+                calculationRequest
+                && calculationRequest.generation === energyCalculationRequestGeneration
+                && calculationRequest.generation === activeEnergyCalculationRequestGeneration
+                && calculationRequest.reportNumber === acceptedRecognitionReportNumber
+                && calculationRequest.reportNumber === normalizedReportNumber(
+                    document.getElementById('current-report-number').value
+                )
+                && EnergyPdfRecognitionState.fingerprintsEqual(
+                    calculationRequest.selection,
+                    currentPdfRecognitionSelection()
+                )
+                && pdfRecognitionRequests.hasAccepted(calculationRequest.selection)
+            );
+        }
+
+        function updateCalculateEnergyAvailability() {
+            document.getElementById('calculate-energy-button').disabled =
+                !hasCurrentConfirmedGeometry();
+        }
+
+        function clearExteriorReviewState() {
+            pendingExteriorFusion = null;
         }
 
         function clearPdfRecognitionDerivedState() {
@@ -2559,7 +2756,11 @@
             );
             aiResultData = derivedState.aiResultData;
             energyResultData = derivedState.energyResultData;
+            invalidateEnergyCalculationRequest();
             calibrationPoints = derivedState.calibrationPoints;
+            acceptedRecognitionReportNumber = null;
+            pendingExteriorFusion = null;
+            clearExteriorReviewState();
         }
 
         function invalidatePdfRecognitionSelection({ returnToUpload = true } = {}) {
@@ -2599,10 +2800,85 @@
             panel.style.display = panel.style.display === 'none' || !panel.style.display ? 'block' : 'none';
         }
 
+        function resetVectorRasterSelection() {
+            vectorRasterFile = null;
+            vectorRasterRecognitionMode = 'full_page';
+            vectorRasterCropBBox = null;
+            vectorRasterCropStart = null;
+            vectorRasterCropDragging = false;
+            const preview = document.getElementById('vector-raster-preview-image');
+            preview.removeAttribute('src');
+            document.getElementById('vector-raster-mode-full').checked = true;
+            document.getElementById('vector-raster-mode-crop').checked = false;
+            document.getElementById('vector-raster-selection').classList.add('hidden');
+            document.getElementById('vector-raster-crop-overlay').classList.add('hidden');
+        }
+
+        function vectorRasterPoint(event) {
+            const image = document.getElementById('vector-raster-preview-image');
+            const rect = image.getBoundingClientRect();
+            return AnnotationCropRegion.canvasPointToImage(
+                { x: event.clientX, y: event.clientY },
+                { offsetX: rect.left, offsetY: rect.top, scale: rect.width / image.naturalWidth,
+                    width: image.naturalWidth, height: image.naturalHeight }
+            );
+        }
+
+        function updateVectorRasterCropControls() {
+            const image = document.getElementById('vector-raster-preview-image');
+            const cropValid = vectorRasterRecognitionMode === 'crop_region'
+                && AnnotationCropRegion.validateCrop(vectorRasterCropBBox, image.naturalWidth, image.naturalHeight);
+            document.getElementById('recognize-vector-raster').disabled = !vectorRasterFile
+                || (vectorRasterRecognitionMode === 'crop_region' && !cropValid);
+            document.getElementById('recognize-vector-raster').innerText = vectorRasterRecognitionMode === 'crop_region'
+                ? '开始识别所选区域' : '开始识别整张图片';
+            document.getElementById('clear-vector-raster-crop').disabled = !vectorRasterCropBBox;
+            image.style.cursor = vectorRasterRecognitionMode === 'crop_region' ? 'crosshair' : 'default';
+            const summary = document.getElementById('vector-raster-crop-summary');
+            if (vectorRasterRecognitionMode !== 'crop_region') summary.innerText = '整图识别模式';
+            else if (!vectorRasterCropBBox) summary.innerText = '请在预览图上拖动框选识别区域';
+            else {
+                const [x0, y0, x1, y1] = vectorRasterCropBBox;
+                summary.innerText = cropValid ? `已选择 ${x1 - x0} × ${y1 - y0} 像素`
+                    : `所选区域 ${x1 - x0} × ${y1 - y0} 像素，区域过小`;
+            }
+        }
+
+        function updateVectorRasterCropOverlay() {
+            const image = document.getElementById('vector-raster-preview-image');
+            const overlay = document.getElementById('vector-raster-crop-overlay');
+            if (!vectorRasterCropBBox || !image.naturalWidth) {
+                overlay.classList.add('hidden');
+                updateVectorRasterCropControls();
+                return;
+            }
+            const [x0, y0, x1, y1] = vectorRasterCropBBox;
+            overlay.style.left = `${x0 * image.clientWidth / image.naturalWidth}px`;
+            overlay.style.top = `${y0 * image.clientHeight / image.naturalHeight}px`;
+            overlay.style.width = `${(x1 - x0) * image.clientWidth / image.naturalWidth}px`;
+            overlay.style.height = `${(y1 - y0) * image.clientHeight / image.naturalHeight}px`;
+            overlay.classList.remove('hidden');
+            updateVectorRasterCropControls();
+        }
+
+        async function prepareVectorRasterCrop(file) {
+            resetVectorRasterSelection();
+            const image = document.getElementById('vector-raster-preview-image');
+            image.src = URL.createObjectURL(file);
+            await new Promise((resolve, reject) => { image.onload = resolve; image.onerror = reject; });
+            vectorRasterFile = file;
+            document.getElementById('vector-raster-selection').classList.remove('hidden');
+            updateVectorRasterCropControls();
+        }
+
         // 上传与识别逻辑
         function setupUpload() {
             const uploadWrapper = document.getElementById('uploadWrapper');
             const fileInput = document.getElementById('rasterFileInput');
+
+            document.getElementById('current-report-number').addEventListener(
+                'input', handleReportNumberInputChange
+            );
 
             uploadWrapper.addEventListener('dragover', (e) => {
                 e.preventDefault();
@@ -2646,6 +2922,17 @@
                 if (event.target.checked) setPdfRecognitionMode('crop_region');
             });
             document.getElementById('clear-pdf-crop').addEventListener('click', resetPdfCropSelection);
+            document.getElementById('model-backend').addEventListener('change', resetVectorRasterSelection);
+            document.getElementById('vector-raster-mode-full').addEventListener('change', () => {
+                vectorRasterRecognitionMode = 'full_page'; vectorRasterCropBBox = null; updateVectorRasterCropOverlay();
+            });
+            document.getElementById('vector-raster-mode-crop').addEventListener('change', () => {
+                vectorRasterRecognitionMode = 'crop_region'; updateVectorRasterCropOverlay();
+            });
+            document.getElementById('clear-vector-raster-crop').addEventListener('click', () => {
+                vectorRasterCropBBox = null; updateVectorRasterCropOverlay();
+            });
+            document.getElementById('recognize-vector-raster').addEventListener('click', () => submitRecognition(vectorRasterFile));
 
             const previewImage = document.getElementById('pdf-page-preview-image');
             previewImage.addEventListener('pointerdown', (event) => {
@@ -2708,7 +2995,30 @@
                 }
                 updatePdfCropOverlay();
             });
+            const vectorPreview = document.getElementById('vector-raster-preview-image');
+            vectorPreview.addEventListener('pointerdown', (event) => {
+                if (vectorRasterRecognitionMode !== 'crop_region' || !vectorRasterFile || event.button !== 0) return;
+                event.preventDefault(); vectorRasterCropDragging = true; vectorRasterCropStart = vectorRasterPoint(event);
+                vectorRasterCropBBox = AnnotationCropRegion.normalizeCrop(vectorRasterCropStart, vectorRasterCropStart, vectorPreview.naturalWidth, vectorPreview.naturalHeight);
+                vectorPreview.setPointerCapture(event.pointerId); updateVectorRasterCropOverlay();
+            });
+            vectorPreview.addEventListener('pointermove', (event) => {
+                if (!vectorRasterCropDragging) return;
+                vectorRasterCropBBox = AnnotationCropRegion.normalizeCrop(vectorRasterCropStart, vectorRasterPoint(event), vectorPreview.naturalWidth, vectorPreview.naturalHeight); updateVectorRasterCropOverlay();
+            });
+            vectorPreview.addEventListener('pointerup', (event) => {
+                if (!vectorRasterCropDragging) return;
+                vectorRasterCropDragging = false; vectorRasterCropStart = null;
+                if (vectorPreview.hasPointerCapture(event.pointerId)) vectorPreview.releasePointerCapture(event.pointerId);
+                updateVectorRasterCropOverlay();
+            });
+            vectorPreview.addEventListener('pointercancel', (event) => {
+                vectorRasterCropDragging = false; vectorRasterCropStart = null;
+                if (vectorPreview.hasPointerCapture(event.pointerId)) vectorPreview.releasePointerCapture(event.pointerId);
+                updateVectorRasterCropOverlay();
+            });
             window.addEventListener('resize', updatePdfCropOverlay);
+            window.addEventListener('resize', updateVectorRasterCropOverlay);
         }
 
         async function handleFile(file) {
@@ -2717,14 +3027,38 @@
             const isPdf = file.type === 'application/pdf' || file.name.toLowerCase().endsWith('.pdf');
             if (isPdf) {
                 await preparePdf(file);
+            } else if (document.getElementById('model-backend').value === 'vector_pytorch') {
+                await prepareVectorRasterCrop(file);
             } else {
                 await submitRecognition(file);
             }
         }
 
         function updateReportNumberFromInput() {
-            const repNumInput = document.getElementById('current-report-number').value.trim();
+            const repNumInput = normalizedReportNumber(
+                document.getElementById('current-report-number').value
+            );
             if (repNumInput) reportNumber = repNumInput;
+        }
+
+        function handleReportNumberInputChange() {
+            const nextReportNumber = normalizedReportNumber(
+                document.getElementById('current-report-number').value
+            );
+            const identityChanged = nextReportNumber !== reportNumber
+                || (
+                    acceptedRecognitionReportNumber !== null
+                    && nextReportNumber !== acceptedRecognitionReportNumber
+                )
+                || (
+                    pendingExteriorFusion?.report_number != null
+                    && nextReportNumber !== pendingExteriorFusion.report_number
+                );
+            reportNumber = nextReportNumber;
+            if (identityChanged) {
+                invalidatePdfRecognitionSelection({ returnToUpload: false });
+            }
+            updateCalculateEnergyAvailability();
         }
 
         function advancePdfPreviewRequest() {
@@ -3072,6 +3406,81 @@
             }
         }
 
+        async function confirmPendingExteriorWithScale(
+            scale,
+            confirmationSelection,
+            signal
+        ) {
+            const pending = pendingExteriorFusion;
+            const pendingReportNumber = normalizedReportNumber(pending?.report_number);
+            if (
+                !pending
+                || !pendingReportNumber
+                || pendingReportNumber !== acceptedRecognitionReportNumber
+                || pendingReportNumber !== normalizedReportNumber(
+                    document.getElementById('current-report-number').value
+                )
+                || !pdfRecognitionRequests.hasAccepted(confirmationSelection)
+            ) {
+                throw new Error('当前页码或识别区域已变化，请重新识别。');
+            }
+            const response = await fetch('/energy/vector_pdf_exterior_confirm', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    report_number: pendingReportNumber,
+                    topology_sha256: pending.topology_sha256,
+                    scale_m_per_px: scale,
+                    calibration_method: 'manual_two_point',
+                    confirmed: true,
+                    page_number: pending.pdf_page_number,
+                    crop_bbox_page_px: pending.crop_bbox_page_px
+                }),
+                signal
+            });
+            const data = await response.json();
+            if (
+                pendingExteriorFusion !== pending
+                || !pdfRecognitionRequests.hasAccepted(confirmationSelection)
+                || !EnergyPdfRecognitionState.fingerprintsEqual(
+                    confirmationSelection,
+                    currentPdfRecognitionSelection()
+                )
+            ) return false;
+            if (!response.ok || data.error) {
+                throw new Error(data.error || response.statusText);
+            }
+            if (
+                !data.recognition
+                || data.report_number !== pendingReportNumber
+                || data.recognition.report_number !== pendingReportNumber
+                || data.recognition.exterior_topology?.confirmed !== true
+                || data.recognition.exterior_topology?.load_geometry_ready !== true
+            ) {
+                throw new Error('服务器未返回可计算的外轮廓识别结果');
+            }
+
+            aiResultData = data.recognition;
+            acceptedRecognitionReportNumber = data.report_number;
+            reportNumber = data.report_number;
+            pendingExteriorFusion = null;
+            const exterior = aiResultData.exterior_topology;
+            applyScaleCalibrationResult(
+                aiResultData.scale_calibration,
+                aiResultData.room_topology
+            );
+            document.getElementById('param-floor-area').value = Number(exterior.area_m2).toFixed(2);
+            document.getElementById('param-wall-length').value = Number(exterior.perimeter_m).toFixed(2);
+            document.getElementById('param-window-length').value = Number(
+                aiResultData.opening_widths?.window_total_width_m || 0
+            ).toFixed(2);
+            document.getElementById('room-closure-summary').innerText =
+                '识别结果和两点比例尺已保存，可以进行能耗计算。';
+            document.getElementById('room-closure-summary').style.color = 'var(--success)';
+            updateCalculateEnergyAvailability();
+            return true;
+        }
+
         // 发送图片或已暂存 PDF 的指定页到后台进行 AI 构件分割
         async function submitRecognition(file = null) {
             if (
@@ -3079,6 +3488,14 @@
                 || pdfPrepareAbortController
                 || pdfPreviewAbortController
             ) return false;
+            const requestReportNumber = normalizedReportNumber(
+                document.getElementById('current-report-number').value
+            );
+            if (!requestReportNumber) {
+                alert('请输入报告编号。');
+                return false;
+            }
+            reportNumber = requestReportNumber;
             const fd = new FormData();
             if (file) {
                 fd.append('raster_file', file);
@@ -3086,29 +3503,39 @@
                 fd.append('pdf_upload_token', preparedPdf.uploadToken);
                 fd.append('pdf_page_number', document.getElementById('pdf-page-select').value);
             }
-            const recognitionMode = file ? 'full_page' : pdfRecognitionMode;
+            const vectorRasterCrop = Boolean(
+                file
+                && file === vectorRasterFile
+                && document.getElementById('model-backend').value === 'vector_pytorch'
+            );
+            const recognitionMode = file
+                ? (vectorRasterCrop ? vectorRasterRecognitionMode : 'full_page')
+                : pdfRecognitionMode;
             fd.append('recognition_mode', recognitionMode);
             if (recognitionMode === 'crop_region') {
-                const previewImage = document.getElementById('pdf-page-preview-image');
+                const previewImage = vectorRasterCrop
+                    ? document.getElementById('vector-raster-preview-image')
+                    : document.getElementById('pdf-page-preview-image');
+                const cropBBox = vectorRasterCrop ? vectorRasterCropBBox : pdfCropBBox;
                 if (!AnnotationCropRegion.validateCrop(
-                    pdfCropBBox,
+                    cropBBox,
                     previewImage.naturalWidth,
                     previewImage.naturalHeight
                 )) {
-                    alert('请先框选有效的 PDF 识别区域。');
+                    alert('请先框选有效的识别区域。');
                     return;
                 }
-                fd.append('crop_bbox_px', JSON.stringify(pdfCropBBox));
+                fd.append('crop_bbox_px', JSON.stringify(cropBBox));
                 fd.append('crop_preview_size', JSON.stringify([
                     previewImage.naturalWidth,
                     previewImage.naturalHeight
                 ]));
             }
             fd.append('preprocessing', 'auto');
-            updateReportNumberFromInput();
-            fd.append('report_number', reportNumber);
+            fd.append('model_backend', document.getElementById('model-backend').value);
+            fd.append('report_number', requestReportNumber);
 
-            const recognitionSelection = currentPdfRecognitionSelection();
+            const recognitionSelection = currentPdfRecognitionSelection(requestReportNumber);
             invalidatePdfRecognitionSelection({ returnToUpload: false });
             const requestController = new AbortController();
             const requestStart = pdfRecognitionRequests.begin(
@@ -3119,11 +3546,20 @@
             if (requestStart.hideLoader) {
                 hideLoader();
             }
-            showLoader("ONNX 引擎正在提取空间构件 (红墙/蓝窗/绿门)...");
+            const vectorBackend = document.getElementById('model-backend').value === 'vector_pytorch';
+            const vectorPdfFusion = Boolean(!file && preparedPdf && vectorBackend);
+            const recognitionEndpoint = vectorPdfFusion
+                ? '/energy/vector_pdf_fusion'
+                : '/energy/ai_recognize';
+            showLoader(vectorPdfFusion
+                ? "正在融合 PDF 原生线条与模型识别结果..."
+                : vectorBackend
+                ? "矢量模型正在识别房间、墙、门窗（试验版）..."
+                : "ONNX 引擎正在提取空间构件 (红墙/蓝窗/绿门)...");
             updatePdfRecognitionControls();
 
             try {
-                const response = await fetch('/energy/ai_recognize', {
+                const response = await fetch(recognitionEndpoint, {
                     method: 'POST',
                     body: fd,
                     signal: requestController.signal
@@ -3139,13 +3575,57 @@
                 if (!response.ok || data.error) {
                     throw new Error(data.error || response.statusText);
                 }
+                if (vectorPdfFusion && data.report_number !== requestReportNumber) {
+                    throw new Error('服务器返回的报告编号与本次识别不一致');
+                }
                 if (!pdfRecognitionRequests.accept(
                     recognitionRequest,
                     currentSelection
                 )) {
                     return false;
                 }
+                acceptedRecognitionReportNumber = requestReportNumber;
 
+                if (data.fusion_debug) {
+                    aiResultData = data;
+                    pendingExteriorFusion = data;
+                    const images = data.images || {};
+                    document.getElementById('imgOriginal').src = images.original
+                        ? 'data:image/png;base64,' + images.original
+                        : '';
+                    document.getElementById('imgOverlay').src = images.component_overlay
+                        ? 'data:image/png;base64,' + images.component_overlay
+                        : (images.exterior_overlay
+                            ? 'data:image/png;base64,' + images.exterior_overlay
+                            : '');
+                    document.getElementById('aiRecognitionResults').classList.remove('hidden');
+                    const closureSummary = document.getElementById('room-closure-summary');
+                    if (data.exterior_status !== 'review_required') {
+                        pendingExteriorFusion = null;
+                        document.getElementById('scale-calibration-panel').classList.add('hidden');
+                        closureSummary.innerText = '识别完成，但外轮廓仍无法闭合，暂时不能计算建筑面积。';
+                        closureSummary.style.color = 'var(--warning)';
+                        updateCalculateEnergyAvailability();
+                        return true;
+                    }
+                    calibrationPoints = [];
+                    applyScaleCalibrationResult(
+                        { status: 'unconfirmed' },
+                        { load_geometry_ready: false }
+                    );
+                    updateCalculateEnergyAvailability();
+
+                    const summary = data.summary || {};
+                    closureSummary.innerText = `识别完成：墙体 ${Number(summary.accepted_wall_count || 0)} 条。请在原图上选择两个点并保存比例尺。`;
+                    closureSummary.style.color = 'var(--success)';
+                    document.getElementById('param-floor-area').value = '';
+                    requestAnimationFrame(() => resizeScaleCalibrationCanvas());
+                    return true;
+                }
+
+                pendingExteriorFusion = null;
+                clearExteriorReviewState();
+                if (data.report_number == null) data.report_number = requestReportNumber;
                 aiResultData = data;
                 
                 document.getElementById('imgOriginal').src = 'data:image/jpeg;base64,' + data.images.original;
@@ -3176,6 +3656,7 @@
 
                 calibrationPoints = [];
                 applyScaleCalibrationResult(data.scale_calibration, data.room_topology);
+                updateCalculateEnergyAvailability();
                 gotoStep(2);
                 requestAnimationFrame(() => resizeScaleCalibrationCanvas());
                 return true;
@@ -3290,8 +3771,8 @@
 
         async function calculateEnergy() {
             invalidateEnergyResult();
-            if (!aiResultData?.room_topology?.load_geometry_ready || !hasCurrentAiRecognitionResult()) {
-                alert('房间尚未闭合或比例尺尚未确认，暂时不能进行负荷计算。');
+            if (!hasCurrentConfirmedGeometry()) {
+                alert('请先完成图纸识别和两点比例尺标定。');
                 return;
             }
             const calculateHeating = document.getElementById('calculate-heating').checked;
@@ -3301,22 +3782,47 @@
                 alert('至少选择供暖或制冷中的一种计算。');
                 return;
             }
-            showLoader("正在运用度日数负荷模型与机电 COP 耦合求解能耗...");
 
-            const repNumInput = document.getElementById('current-report-number').value.trim();
-            if (repNumInput) {
-                reportNumber = repNumInput;
+            const calculationReportNumber = normalizedReportNumber(
+                acceptedRecognitionReportNumber
+            );
+            if (!calculationReportNumber) {
+                alert('当前报告没有已确认的识别结果。');
+                return;
             }
+            const calculationRequest = Object.freeze({
+                generation: energyCalculationRequestGeneration,
+                reportNumber: calculationReportNumber,
+                selection: currentPdfRecognitionSelection(calculationReportNumber)
+            });
+            activeEnergyCalculationRequestGeneration = calculationRequest.generation;
+            if (!isCurrentEnergyCalculationRequest(calculationRequest)) {
+                activeEnergyCalculationRequestGeneration = null;
+                return;
+            }
+            showLoader("正在运用度日数负荷模型与机电 COP 耦合求解能耗...");
             const windowShgc = parseFloat(document.getElementById('param-shgc').value);
             const curtainShading = parseFloat(document.getElementById('param-curtain-shading').value) || 1;
+            const floors = parseInt(document.getElementById('param-floors').value);
+            const doorHeight = Number(document.getElementById('param-door-height').value);
+            const windowHeight = Number(document.getElementById('param-window-height').value);
+            const doorRepeatCount = Number(document.getElementById('param-door-repeat-count').value);
+            const windowRepeatValue = document.getElementById('param-window-repeat-count').value.trim();
+            const windowRepeatCount = windowRepeatValue === ''
+                ? floors
+                : Number(windowRepeatValue);
 
             const params = {
-                report_number: reportNumber,
+                report_number: calculationReportNumber,
                 calculation_mode: calculationMode,
                 scale: parseFloat(document.getElementById('param-scale').value),
                 height: parseFloat(document.getElementById('param-height').value),
-                floors: parseInt(document.getElementById('param-floors').value),
+                floors,
                 floor_area_m2: parseFloat(document.getElementById('param-floor-area').value),
+                door_height_m: doorHeight,
+                window_height_m: windowHeight,
+                door_repeat_count: doorRepeatCount,
+                window_repeat_count: windowRepeatCount,
                 orientation: document.getElementById('param-orientation').value,
                 
                 u_wall: parseFloat(document.getElementById('param-u-wall').value),
@@ -3380,6 +3886,9 @@
                     body: JSON.stringify(params)
                 });
                 const data = await response.json();
+                if (!isCurrentEnergyCalculationRequest(calculationRequest)) {
+                    return false;
+                }
                 if (data.error) {
                     throw new Error(data.error);
                 }
@@ -3389,9 +3898,15 @@
                 gotoStep(4);
 
             } catch (error) {
+                if (!isCurrentEnergyCalculationRequest(calculationRequest)) {
+                    return false;
+                }
                 alert("能耗计算失败: " + error.message);
             } finally {
-                hideLoader();
+                if (isCurrentEnergyCalculationRequest(calculationRequest)) {
+                    activeEnergyCalculationRequestGeneration = null;
+                    hideLoader();
+                }
             }
         }
 
@@ -3655,8 +4170,8 @@
                     throw new Error(data.error);
                 }
 
-                reportNumber = data.report_number;
-                document.getElementById('current-report-number').value = reportNumber;
+                document.getElementById('current-report-number').value = data.report_number;
+                handleReportNumberInputChange();
 
                 const p = data.params || {};
                 const geometry = p.geometry || {};

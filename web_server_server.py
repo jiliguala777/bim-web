@@ -256,7 +256,89 @@ def get_db_connection():
     return conn
 
 
+def _migrate_reports_schema(conn):
+    """Upgrade report records to the user-scoped composite identity."""
+    savepoint = "reports_schema_migration"
+    conn.execute(f"SAVEPOINT {savepoint}")
+    try:
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(reports)")}
+        if "status" not in columns:
+            conn.execute("ALTER TABLE reports ADD COLUMN status TEXT")
+        if "updated_at" not in columns:
+            conn.execute("ALTER TABLE reports ADD COLUMN updated_at DATETIME")
+
+        conn.execute(
+            """
+            DELETE FROM reports
+            WHERE id NOT IN (
+                SELECT id FROM (
+                    SELECT id,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY username, report_number
+                               ORDER BY created_at DESC, id DESC
+                           ) AS row_number
+                    FROM reports
+                )
+                WHERE row_number = 1
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS reports_username_report_number_uq
+            ON reports(username, report_number)
+            """
+        )
+    except Exception:
+        conn.execute(f"ROLLBACK TO {savepoint}")
+        conn.execute(f"RELEASE {savepoint}")
+        raise
+    else:
+        conn.execute(f"RELEASE {savepoint}")
+
+
+def _report_row(username, report_number):
+    conn = get_db_connection()
+    try:
+        return conn.execute(
+            "SELECT * FROM reports WHERE username = ? AND report_number = ?",
+            (username, report_number),
+        ).fetchone()
+    finally:
+        conn.close()
+
+
+def _upsert_report_status(username, report_number, status):
+    conn = get_db_connection()
+    try:
+        conn.execute(
+            """
+            INSERT INTO reports (username, report_number, status, updated_at)
+            VALUES (?, ?, ?, datetime('now'))
+            ON CONFLICT(username, report_number) DO UPDATE SET
+                status = excluded.status,
+                updated_at = datetime('now')
+            """,
+            (username, report_number, status),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _user_exists(username):
+    conn = get_db_connection()
+    try:
+        return conn.execute(
+            "SELECT 1 FROM users WHERE username = ?",
+            (username,),
+        ).fetchone() is not None
+    finally:
+        conn.close()
+
+
 def init_db():
+    conn = None
     try:
         conn = get_db_connection()
         conn.execute('''
@@ -278,10 +360,15 @@ def init_db():
             results TEXT
         );
         ''')
+        _migrate_reports_schema(conn)
         conn.commit()
-        conn.close()
-    except Exception as e:
-        print(f"Database init warning: {e}")
+    except Exception:
+        if conn is not None:
+            conn.rollback()
+        raise
+    finally:
+        if conn is not None:
+            conn.close()
 
 init_db()
 
@@ -301,6 +388,7 @@ def login():
         if admin_password and username == admin_user and password == admin_password:
             session['logged_in'] = True
             session['username'] = username
+            session['is_admin'] = True
             session.permanent = True
             return jsonify({'status': 'success'})
             
@@ -312,6 +400,7 @@ def login():
         if user and check_password_hash(user['password_hash'], password):
             session['logged_in'] = True
             session['username'] = username
+            session['is_admin'] = False
             session.permanent = True
             return jsonify({'status': 'success'})
             
@@ -345,7 +434,7 @@ def register():
 
 @app.route('/logout')
 def logout():
-    session.pop('logged_in', None)
+    session.clear()
     return redirect(url_for('login'))
 
 

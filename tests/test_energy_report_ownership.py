@@ -160,6 +160,56 @@ class ReportSchemaMigrationTests(unittest.TestCase):
                 finally:
                     connection.close()
 
+    def test_migration_rejects_unsupported_inline_unique_schema_without_changes(self):
+        variants = [
+            ("check", "username TEXT NOT NULL", [], ["CHECK (length(report_number) <= 32)"]),
+            ("foreign_key", "username TEXT NOT NULL", [], ["FOREIGN KEY(username) REFERENCES users(username)"]),
+            ("collation", "username TEXT NOT NULL COLLATE NOCASE", [], []),
+            (
+                "generated_column",
+                "username TEXT NOT NULL",
+                ["report_number_length INTEGER GENERATED ALWAYS AS (length(report_number)) STORED"],
+                [],
+            ),
+        ]
+        for name, username_definition, extra_columns, table_constraints in variants:
+            with self.subTest(feature=name), tempfile.TemporaryDirectory() as directory:
+                database_path = Path(directory) / "legacy.db"
+                connection = sqlite3.connect(database_path)
+                definitions = [
+                    "id INTEGER PRIMARY KEY AUTOINCREMENT",
+                    username_definition,
+                    "report_number TEXT NOT NULL UNIQUE",
+                    "created_at TEXT DEFAULT CURRENT_TIMESTAMP",
+                    *extra_columns,
+                    *table_constraints,
+                ]
+                connection.execute(f"CREATE TABLE reports ({', '.join(definitions)})")
+                connection.execute(
+                    "INSERT INTO reports (username, report_number, created_at) VALUES (?, ?, ?)",
+                    ("alice", "BIM-1", "2026-01-01 00:00:00"),
+                )
+                schema_before = connection.execute(
+                    "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'reports'"
+                ).fetchone()[0]
+                rows_before = connection.execute(
+                    "SELECT id, username, report_number, created_at FROM reports"
+                ).fetchall()
+
+                try:
+                    with self.assertRaisesRegex(RuntimeError, "unsupported reports schema"):
+                        self.server._migrate_reports_schema(connection)
+                    schema_after = connection.execute(
+                        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'reports'"
+                    ).fetchone()[0]
+                    rows_after = connection.execute(
+                        "SELECT id, username, report_number, created_at FROM reports"
+                    ).fetchall()
+                    self.assertEqual(schema_after, schema_before)
+                    self.assertEqual(rows_after, rows_before)
+                finally:
+                    connection.close()
+
 
 class ReportOwnershipHelperTests(unittest.TestCase):
     @classmethod

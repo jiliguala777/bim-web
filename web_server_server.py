@@ -333,6 +333,7 @@ def _remove_legacy_report_number_uniqueness(conn):
 
 
 def _rebuild_reports_without_legacy_report_number_uniqueness(conn, legacy_indexes):
+    _assert_reports_schema_can_be_rebuilt(conn)
     columns = list(conn.execute("PRAGMA table_info(reports)"))
     primary_key_columns = [column for column in columns if column[5]]
     if len(primary_key_columns) > 1:
@@ -389,6 +390,27 @@ def _rebuild_reports_without_legacy_report_number_uniqueness(conn, legacy_indexe
         conn.execute(sql)
     for sql in retained_trigger_sql:
         conn.execute(sql)
+
+
+def _assert_reports_schema_can_be_rebuilt(conn):
+    table_sql = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'reports'"
+    ).fetchone()[0]
+    unsupported_features = {
+        "CHECK": "CHECK constraints",
+        "FOREIGN KEY": "foreign keys",
+        "REFERENCES": "foreign keys",
+        "COLLATE": "collations",
+        "GENERATED": "generated columns",
+        "STRICT": "STRICT table options",
+        "WITHOUT ROWID": "WITHOUT ROWID table options",
+        "ON CONFLICT": "constraint conflict policies",
+    }
+    for token, description in unsupported_features.items():
+        if token in table_sql.upper():
+            raise RuntimeError(f"unsupported reports schema cannot be safely rebuilt: {description}")
+    if any(column[6] for column in conn.execute("PRAGMA table_xinfo(reports)")):
+        raise RuntimeError("unsupported reports schema cannot be safely rebuilt: generated columns")
 
 
 def _report_row(username, report_number):

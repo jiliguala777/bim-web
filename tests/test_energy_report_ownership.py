@@ -108,6 +108,58 @@ class ReportSchemaMigrationTests(unittest.TestCase):
             finally:
                 connection.close()
 
+    def test_migration_replaces_legacy_report_number_uniqueness(self):
+        for legacy_constraint in ("inline", "index"):
+            with self.subTest(legacy_constraint=legacy_constraint), tempfile.TemporaryDirectory() as directory:
+                database_path = Path(directory) / "legacy.db"
+                connection = sqlite3.connect(database_path)
+                report_number_column = "report_number TEXT NOT NULL UNIQUE" if legacy_constraint == "inline" else "report_number TEXT NOT NULL"
+                connection.execute(
+                    f"""
+                    CREATE TABLE reports (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        username TEXT NOT NULL,
+                        {report_number_column},
+                        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                        geometry_used TEXT,
+                        params TEXT,
+                        results TEXT,
+                        UNIQUE(username, created_at)
+                    )
+                    """
+                )
+                if legacy_constraint == "index":
+                    connection.execute("CREATE UNIQUE INDEX reports_report_number_uq ON reports(report_number)")
+                connection.execute(
+                    """
+                    INSERT INTO reports (username, report_number, created_at, geometry_used, params, results)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    ("alice", "BIM-1", "2026-01-01 00:00:00", "geometry", "params", "results"),
+                )
+
+                try:
+                    self.server._migrate_reports_schema(connection)
+                    connection.execute(
+                        "INSERT INTO reports (username, report_number) VALUES (?, ?)", ("bob", "BIM-1")
+                    )
+                    owners = connection.execute(
+                        "SELECT username FROM reports WHERE report_number = ? ORDER BY username", ("BIM-1",)
+                    ).fetchall()
+                    self.assertEqual([owner[0] for owner in owners], ["alice", "bob"])
+                    alice_data = connection.execute(
+                        "SELECT geometry_used, params, results FROM reports WHERE username = ? AND report_number = ?",
+                        ("alice", "BIM-1"),
+                    ).fetchone()
+                    self.assertEqual(alice_data, ("geometry", "params", "results"))
+                    with self.assertRaises(sqlite3.IntegrityError):
+                        connection.execute(
+                            "INSERT INTO reports (username, report_number, created_at) VALUES (?, ?, ?)",
+                            ("alice", "BIM-2", "2026-01-01 00:00:00"),
+                        )
+                finally:
+                    connection.close()
+
 
 class ReportOwnershipHelperTests(unittest.TestCase):
     @classmethod

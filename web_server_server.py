@@ -283,6 +283,7 @@ def _migrate_reports_schema(conn):
             )
             """
         )
+        _remove_legacy_report_number_uniqueness(conn)
         conn.execute(
             """
             CREATE UNIQUE INDEX IF NOT EXISTS reports_username_report_number_uq
@@ -295,6 +296,99 @@ def _migrate_reports_schema(conn):
         raise
     else:
         conn.execute(f"RELEASE {savepoint}")
+
+
+def _quote_sqlite_identifier(identifier):
+    return '"' + identifier.replace('"', '""') + '"'
+
+
+def _report_index_metadata(conn):
+    metadata = []
+    for index in conn.execute("PRAGMA index_list(reports)"):
+        name = index[1]
+        columns = [column[2] for column in conn.execute(f"PRAGMA index_info({_quote_sqlite_identifier(name)})")]
+        metadata.append({
+            "name": name,
+            "unique": bool(index[2]),
+            "origin": index[3],
+            "columns": columns,
+        })
+    return metadata
+
+
+def _remove_legacy_report_number_uniqueness(conn):
+    legacy_indexes = [
+        index for index in _report_index_metadata(conn)
+        if index["unique"] and index["columns"] == ["report_number"]
+    ]
+    if not legacy_indexes:
+        return
+
+    if any(index["origin"] == "u" for index in legacy_indexes):
+        _rebuild_reports_without_legacy_report_number_uniqueness(conn, legacy_indexes)
+        return
+
+    for index in legacy_indexes:
+        conn.execute(f"DROP INDEX {_quote_sqlite_identifier(index['name'])}")
+
+
+def _rebuild_reports_without_legacy_report_number_uniqueness(conn, legacy_indexes):
+    columns = list(conn.execute("PRAGMA table_info(reports)"))
+    primary_key_columns = [column for column in columns if column[5]]
+    if len(primary_key_columns) > 1:
+        raise RuntimeError("cannot safely migrate reports with a composite primary key")
+
+    retained_indexes = [
+        index for index in _report_index_metadata(conn)
+        if index not in legacy_indexes
+    ]
+    retained_index_sql = [
+        conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?", (index["name"],)
+        ).fetchone()[0]
+        for index in retained_indexes
+        if index["origin"] == "c"
+    ]
+    retained_trigger_sql = [
+        trigger[0] for trigger in conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND tbl_name = 'reports'"
+        )
+    ]
+
+    definitions = []
+    for _, name, column_type, not_null, default_value, primary_key in columns:
+        definition = f"{_quote_sqlite_identifier(name)} {column_type}"
+        if primary_key:
+            definition += " PRIMARY KEY"
+            if column_type.upper() == "INTEGER":
+                definition += " AUTOINCREMENT"
+        if not_null:
+            definition += " NOT NULL"
+        if default_value is not None:
+            definition += f" DEFAULT {default_value}"
+        definitions.append(definition)
+
+    temporary_table = "reports_composite_migration"
+    column_names = ", ".join(_quote_sqlite_identifier(column[1]) for column in columns)
+    conn.execute(f"CREATE TABLE {_quote_sqlite_identifier(temporary_table)} ({', '.join(definitions)})")
+    conn.execute(
+        f"INSERT INTO {_quote_sqlite_identifier(temporary_table)} ({column_names}) "
+        f"SELECT {column_names} FROM reports"
+    )
+    conn.execute("DROP TABLE reports")
+    conn.execute(f"ALTER TABLE {_quote_sqlite_identifier(temporary_table)} RENAME TO reports")
+
+    for index in retained_indexes:
+        if index["origin"] == "u":
+            index_name = f"reports_preserved_unique_{'_'.join(index['columns'])}"
+            index_columns = ", ".join(_quote_sqlite_identifier(column) for column in index["columns"])
+            conn.execute(
+                f"CREATE UNIQUE INDEX {_quote_sqlite_identifier(index_name)} ON reports ({index_columns})"
+            )
+    for sql in retained_index_sql:
+        conn.execute(sql)
+    for sql in retained_trigger_sql:
+        conn.execute(sql)
 
 
 def _report_row(username, report_number):

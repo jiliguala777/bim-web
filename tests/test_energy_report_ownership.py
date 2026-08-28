@@ -1,9 +1,12 @@
+import io
 import os
 import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
+
+from energy_report_storage import user_storage_key
 
 
 class AuthSessionTests(unittest.TestCase):
@@ -295,6 +298,258 @@ class ReportOwnershipHelperTests(unittest.TestCase):
         ).fetchone()[0]
         connection.close()
         self.assertEqual(alice_count, 1)
+
+
+class ReportUploadIsolationTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        import web_server_server
+
+        cls.server = web_server_server
+        cls.server.app.config.update(TESTING=True, SECRET_KEY="energy-report-upload-isolation-test")
+
+    def setUp(self):
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        temporary_root = Path(self.temporary_directory.name)
+        self.database_path = temporary_root / "users.db"
+        self.upload_root = temporary_root / "uploads"
+        self.original_database_path = self.server.DB_PATH
+        self.original_upload_folder = self.server.app.config["UPLOAD_FOLDER"]
+        self.server.DB_PATH = str(self.database_path)
+        self.server.app.config["UPLOAD_FOLDER"] = str(self.upload_root)
+        self.server.init_db()
+        connection = self.server.get_db_connection()
+        connection.executemany(
+            "INSERT INTO users (username, password_hash) VALUES (?, ?)",
+            [("alice", "hash"), ("bob", "hash")],
+        )
+        connection.commit()
+        connection.close()
+        self.client = self.server.app.test_client()
+
+    def tearDown(self):
+        self.server.DB_PATH = self.original_database_path
+        self.server.app.config["UPLOAD_FOLDER"] = self.original_upload_folder
+        self.temporary_directory.cleanup()
+
+    def login_as(self, username, is_admin=False):
+        with self.client.session_transaction() as state:
+            state.clear()
+            state.update(logged_in=True, username=username, is_admin=is_admin)
+
+    @staticmethod
+    def image_file():
+        return io.BytesIO(b"test image"), "plan.png"
+
+    def test_same_report_number_isolated_by_authenticated_user(self):
+        self.login_as("alice")
+        alice_response = self.client.post(
+            "/energy/upload",
+            data={"report_number": "BIM-1", "raster_file": self.image_file()},
+        )
+        self.login_as("bob")
+        bob_response = self.client.post(
+            "/energy/upload",
+            data={"report_number": "BIM-1", "raster_file": self.image_file()},
+        )
+
+        self.assertEqual(alice_response.status_code, 200, alice_response.get_json())
+        self.assertEqual(bob_response.status_code, 200, bob_response.get_json())
+        self.assertTrue((self.upload_root / "energy" / user_storage_key("alice") / "BIM-1").is_dir())
+        self.assertTrue((self.upload_root / "energy" / user_storage_key("bob") / "BIM-1").is_dir())
+        self.assertFalse((self.upload_root / "energy" / "BIM-1").exists())
+        self.assertEqual(self.server._report_row("alice", "BIM-1")["status"], "uploaded")
+        self.assertEqual(self.server._report_row("bob", "BIM-1")["status"], "uploaded")
+
+    def test_ordinary_user_cannot_upload_for_another_owner(self):
+        self.login_as("alice")
+
+        response = self.client.post(
+            "/energy/upload",
+            data={
+                "report_number": "BIM-1",
+                "owner_username": "bob",
+                "raster_file": self.image_file(),
+            },
+        )
+
+        self.assertEqual(response.status_code, 403, response.get_json())
+        self.assertFalse((self.upload_root / "energy").exists())
+
+    def test_all_general_report_routes_reject_an_ordinary_users_cross_owner_request(self):
+        self.login_as("alice")
+        requests = [
+            ("get", "/api/v1/simulation_data/BIM-1?owner_username=bob", {}),
+            ("get", "/energy/layers/geometry?project=BIM-1&owner_username=bob", {}),
+            ("post", "/energy/geometry", {"json": {"report_number": "BIM-1", "owner_username": "bob"}}),
+            ("post", "/energy/geometry_advanced", {"json": {"report_number": "BIM-1", "owner_username": "bob"}}),
+            ("post", "/energy/calculate", {"json": {"report_number": "BIM-1", "owner_username": "bob"}}),
+            ("post", "/energy/upload_ifc", {"data": {"report_number": "BIM-1", "owner_username": "bob"}}),
+            ("get", "/energy/ifc_properties?project=BIM-1&owner_username=bob", {}),
+            ("get", "/energy/ifc_walls?project=BIM-1&owner_username=bob", {}),
+            ("post", "/energy/ifc_simulate", {"json": {"report_number": "BIM-1", "owner_username": "bob"}}),
+        ]
+
+        for method, url, kwargs in requests:
+            with self.subTest(url=url):
+                response = getattr(self.client, method)(url, **kwargs)
+                self.assertEqual(response.status_code, 403, response.get_json())
+        self.assertFalse((self.upload_root / "energy").exists())
+
+    def test_admin_can_target_existing_user_but_not_unknown_user(self):
+        self.login_as("admin", is_admin=True)
+
+        accepted = self.client.post(
+            "/energy/upload",
+            data={
+                "report_number": "BIM-ADMIN",
+                "owner_username": "bob",
+                "raster_file": self.image_file(),
+            },
+        )
+        own_report = self.client.post(
+            "/energy/upload",
+            data={"report_number": "ADMIN-OWN", "raster_file": self.image_file()},
+        )
+        denied = self.client.post(
+            "/energy/upload",
+            data={
+                "report_number": "BIM-MISSING",
+                "owner_username": "unknown",
+                "raster_file": self.image_file(),
+            },
+        )
+
+        self.assertEqual(accepted.status_code, 200, accepted.get_json())
+        self.assertEqual(own_report.status_code, 200, own_report.get_json())
+        self.assertEqual(denied.status_code, 403, denied.get_json())
+        self.assertTrue(
+            (self.upload_root / "energy" / user_storage_key("bob") / "BIM-ADMIN" / "building_plan.png").is_file()
+        )
+        self.assertTrue(
+            (self.upload_root / "energy" / user_storage_key("admin") / "ADMIN-OWN" / "building_plan.png").is_file()
+        )
+        self.assertFalse((self.upload_root / "energy" / user_storage_key("unknown")).exists())
+
+    def test_failed_upload_updates_only_the_created_composite_report_row(self):
+        self.login_as("alice")
+
+        with self.assertLogs(self.server.logger, level="ERROR"):
+            with patch("werkzeug.datastructures.FileStorage.save", side_effect=OSError("disk full")):
+                response = self.client.post(
+                    "/energy/upload",
+                    data={"report_number": "BIM-FAIL", "raster_file": self.image_file()},
+                )
+
+        self.assertEqual(response.status_code, 500, response.get_json())
+        self.assertEqual(self.server._report_row("alice", "BIM-FAIL")["status"], "failed")
+        self.assertIsNone(self.server._report_row("bob", "BIM-FAIL"))
+
+    def test_storage_errors_are_sanitized_and_use_specific_http_statuses(self):
+        self.login_as("alice")
+
+        malformed = self.client.post(
+            "/energy/upload",
+            data={"report_number": "../outside", "raster_file": self.image_file()},
+        )
+        missing = self.client.get("/api/v1/simulation_data/MISSING")
+
+        self.assertEqual(malformed.status_code, 400, malformed.get_json())
+        self.assertEqual(missing.status_code, 404, missing.get_json())
+        self.assertNotIn(str(self.upload_root), malformed.get_data(as_text=True))
+        self.assertNotIn(str(self.upload_root), missing.get_data(as_text=True))
+
+    def test_calculation_worker_payload_keeps_resolved_owner_outside_request_context(self):
+        self.login_as("alice")
+        upload = self.client.post(
+            "/energy/upload",
+            data={"report_number": "BIM-CALC", "raster_file": self.image_file()},
+        )
+        self.assertEqual(upload.status_code, 200, upload.get_json())
+
+        fake_thread = MagicMock()
+        with (
+            patch.object(self.server.threading, "Thread", return_value=fake_thread) as thread_factory,
+            patch.object(self.server, "simulation_jobs") as jobs,
+        ):
+            response = self.client.post(
+                "/energy/calculate",
+                json={"report_number": "BIM-CALC", "mode": "simple"},
+            )
+
+        self.assertEqual(response.status_code, 200, response.get_json())
+        worker_payload = thread_factory.call_args.kwargs["args"][1]
+        self.assertEqual(worker_payload["owner_username"], "alice")
+        self.assertEqual(worker_payload["report_number"], "BIM-CALC")
+        jobs.set.assert_called_once()
+        fake_thread.start.assert_called_once_with()
+
+    def test_general_dxf_geometry_reads_the_authenticated_users_report(self):
+        self.login_as("alice")
+        report_dir = self.upload_root / "energy" / user_storage_key("alice") / "BIM-DXF"
+        report_dir.mkdir(parents=True)
+        (report_dir / "building_plan.dxf").write_bytes(b"alice dxf")
+        fake_document = MagicMock()
+        fake_document.modelspace.return_value = []
+
+        def readfile(path):
+            self.assertEqual(Path(path), report_dir / "building_plan.dxf")
+            return fake_document
+
+        with patch.object(self.server, "ezdxf", create=True) as ezdxf:
+            ezdxf.readfile.side_effect = readfile
+            response = self.client.post(
+                "/energy/geometry",
+                json={"report_number": "BIM-DXF", "layers": []},
+            )
+
+        self.assertEqual(response.status_code, 200, response.get_json())
+        self.assertEqual(response.get_json(), {"geoms": []})
+
+    def test_ifc_upload_and_read_use_the_same_user_scoped_report(self):
+        self.login_as("alice")
+        parser = MagicMock()
+        parser.get_project_info.return_value = {}
+        parser.get_element_summary.return_value = {}
+        parser.get_storeys.return_value = []
+        parser.extract_for_simulation.return_value = {}
+        parser.get_property_tree.return_value = {"name": "alice model"}
+
+        with (
+            patch.object(self.server, "HAS_IFC", True),
+            patch.object(self.server, "IFCParser", return_value=parser, create=True),
+        ):
+            upload = self.client.post(
+                "/energy/upload_ifc",
+                data={"report_number": "BIM-IFC", "ifc_file": (io.BytesIO(b"IFC"), "model.ifc")},
+            )
+            properties = self.client.get("/energy/ifc_properties?project=BIM-IFC")
+
+        stored = (
+            self.upload_root / "energy" / user_storage_key("alice") / "BIM-IFC" / "building_model.ifc"
+        )
+        self.assertEqual(upload.status_code, 200, upload.get_json())
+        self.assertEqual(properties.status_code, 200, properties.get_json())
+        self.assertEqual(properties.get_json(), {"name": "alice model"})
+        self.assertEqual(stored.read_bytes(), b"IFC")
+
+    def test_benchmark_fixtures_are_stored_outside_user_report_directories(self):
+        self.login_as("alice")
+
+        with (
+            patch.object(self.server, "HAS_BENCHMARK", True),
+            patch.object(self.server, "BESTEST_BENCHMARKS", {"case-1": {}}, create=True),
+            patch.object(self.server, "generate_test_dxf", return_value=True, create=True) as generate_dxf,
+            patch.object(self.server, "generate_test_ifc", return_value=True, create=True) as generate_ifc,
+            patch.object(self.server, "HAS_IFC", True),
+        ):
+            response = self.client.post("/ops/benchmark/generate_test_files")
+
+        expected_root = self.upload_root / "ops" / "bestest"
+        self.assertEqual(response.status_code, 200, response.get_json())
+        self.assertEqual(Path(generate_dxf.call_args.args[0]).parent, expected_root)
+        self.assertEqual(Path(generate_ifc.call_args.args[0]).parent, expected_root)
+        self.assertFalse((self.upload_root / "energy" / "bestest").exists())
 
 
 if __name__ == "__main__":

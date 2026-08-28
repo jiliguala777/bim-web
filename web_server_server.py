@@ -22,6 +22,14 @@ import psutil
 import subprocess
 from contextlib import contextmanager
 
+from energy_report_storage import (
+    EnergyReportContext,
+    InvalidReportPath,
+    ReportAccessDenied,
+    resolve_energy_report_context,
+    resolve_report_owner,
+)
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MODELS_DIR = os.path.join(BASE_DIR, 'models')
 WEATHER_DATA_DIR = os.path.join(BASE_DIR, 'weather_data')
@@ -499,6 +507,62 @@ def _user_exists(username):
         conn.close()
 
 
+def _requested_owner_username(payload=None):
+    """Return an explicitly requested report owner from the current request."""
+    if payload is not None and hasattr(payload, 'get') and 'owner_username' in payload:
+        return payload.get('owner_username')
+    if 'owner_username' in request.form:
+        return request.form.get('owner_username')
+    json_payload = request.get_json(silent=True)
+    if json_payload is not None and hasattr(json_payload, 'get') and 'owner_username' in json_payload:
+        return json_payload.get('owner_username')
+    if 'owner_username' in request.args:
+        return request.args.get('owner_username')
+    return None
+
+
+def _effective_report_owner(requested_owner=None):
+    """Resolve and authorize the report owner represented by this request."""
+    if requested_owner is None:
+        requested_owner = _requested_owner_username()
+    session_username = session.get('username')
+    is_admin = session.get('is_admin') is True
+    owner_username = resolve_report_owner(session_username, is_admin, requested_owner)
+    explicit_target = isinstance(requested_owner, str) and bool(requested_owner.strip())
+    if is_admin and explicit_target and owner_username != session_username and not _user_exists(owner_username):
+        raise ReportAccessDenied("the requested report owner does not exist")
+    return owner_username
+
+
+def _energy_report_context(report_number, requested_owner=None, create=False) -> EnergyReportContext:
+    """Resolve the current request's authorized, user-scoped report directory."""
+    if requested_owner is None:
+        requested_owner = _requested_owner_username()
+    owner_username = _effective_report_owner(requested_owner)
+    context = resolve_energy_report_context(
+        app.config['UPLOAD_FOLDER'],
+        owner_username,
+        False,
+        report_number,
+        requested_owner=owner_username,
+        create=create,
+    )
+    if not create and not context.report_dir.is_dir():
+        raise FileNotFoundError("report not found")
+    return context
+
+
+def _report_storage_error_response(exc):
+    """Map report-storage failures without exposing filesystem locations."""
+    if isinstance(exc, ReportAccessDenied):
+        return jsonify({'error': 'Report access denied'}), 403
+    if isinstance(exc, InvalidReportPath):
+        return jsonify({'error': 'Invalid report path'}), 400
+    if isinstance(exc, FileNotFoundError):
+        return jsonify({'error': 'Report not found'}), 404
+    raise exc
+
+
 def init_db():
     conn = None
     try:
@@ -634,22 +698,25 @@ def get_simulation_data(report_number):
     Returns extracted geometry and simulation constants for local API bridge.
     Confidential device data is NOT handled here.
     """
-    target_dir = os.path.join(app.config['UPLOAD_FOLDER'], 'energy', report_number)
-    dxf_path = os.path.join(target_dir, 'building_plan.dxf')
-    
-    # In a real scenario, we'd store the last simulation results in a DB or JSON file
-    # For now, we'll re-extract or return defaults
-    return jsonify({
-        'report_number': report_number,
-        'geometry': {
-            'floor_area': 500, # Placeholder or extracted value
-            'perimeter': 100
-        },
-        'env_params': {
-            'u_wall': 0.6,
-            'u_win': 2.5
-        }
-    })
+    try:
+        context = _energy_report_context(report_number)
+        dxf_path = context.report_dir / 'building_plan.dxf'
+
+        # In a real scenario, we'd store the last simulation results in a DB or JSON file
+        # For now, we'll re-extract or return defaults
+        return jsonify({
+            'report_number': context.report_number,
+            'geometry': {
+                'floor_area': 500, # Placeholder or extracted value
+                'perimeter': 100
+            },
+            'env_params': {
+                'u_wall': 0.6,
+                'u_win': 2.5
+            }
+        })
+    except (ReportAccessDenied, InvalidReportPath, FileNotFoundError) as e:
+        return _report_storage_error_response(e)
 
 
 @app.route('/energy/library/walls', methods=['GET'])
@@ -706,13 +773,15 @@ def energy_library_envelope(category):
 @app.route('/energy/upload', methods=['POST'])
 @login_required
 def energy_upload():
+    context = None
     try:
         report_number = request.form.get('report_number', 'default')
-        report_number = secure_filename(report_number) or 'default'
-        target_dir = os.path.join(app.config['UPLOAD_FOLDER'], 'energy', report_number)
-        os.makedirs(target_dir, exist_ok=True)
+        context = _energy_report_context(report_number, create=True)
+        target_dir = os.fspath(context.report_dir)
+        _upsert_report_status(context.owner_username, context.report_number, 'created')
         
         result = {'status': 'success', 'files': {}}
+        files_uploaded = False
         dxf_uploaded = False
         dxf_path = os.path.join(target_dir, 'building_plan.dxf') # Define dxf_path early
         
@@ -722,6 +791,7 @@ def energy_upload():
                 f.save(dxf_path)
                 result['files']['dxf'] = 'building_plan.dxf'
                 dxf_uploaded = True
+                files_uploaded = True
         
         # 处理光栅图/PDF上传 (Learning-based 接口)
         raster_uploaded = False
@@ -733,6 +803,7 @@ def energy_upload():
                 f.save(raster_path)
                 result['files']['raster'] = f'building_plan.{ext}'
                 raster_uploaded = True
+                files_uploaded = True
                 
                 # 如果是 PDF，尝试转换为 PNG 进行后续解析
                 if ext == 'pdf':
@@ -784,6 +855,7 @@ def energy_upload():
                 p = os.path.join(target_dir, 'weather_data.epw')
                 f.save(p)
                 result['files']['epw'] = 'weather_data.epw'
+                files_uploaded = True
         elif request.form.get('city_id'):
             city_id = request.form['city_id']
             src = os.path.join(WEATHER_DATA_DIR, f'{city_id}.epw')
@@ -791,10 +863,22 @@ def energy_upload():
                 import shutil
                 shutil.copy(src, os.path.join(target_dir, 'weather_data.epw'))
                 result['files']['epw'] = 'weather_data.epw'
+                files_uploaded = True
+
+        if files_uploaded:
+            _upsert_report_status(context.owner_username, context.report_number, 'uploaded')
 
         return jsonify(result)
+    except (ReportAccessDenied, InvalidReportPath) as e:
+        return _report_storage_error_response(e)
     except Exception as e:
-        logger.error(f"Upload error: {e}")
+        if context is not None:
+            try:
+                if _report_row(context.owner_username, context.report_number) is not None:
+                    _upsert_report_status(context.owner_username, context.report_number, 'failed')
+            except Exception:
+                logger.exception("Could not update failed upload status")
+        logger.error(f"Upload error: {e}", exc_info=True)
         return jsonify({'error': str(e)}), 500
 
 @app.route('/energy/layers/geometry', methods=['GET'])
@@ -803,8 +887,8 @@ def get_all_layers_geometry():
     """获取所有图层的几何数据及边框"""
     try:
         report_number = request.args.get('project', 'default')
-        target_dir = os.path.join(app.config['UPLOAD_FOLDER'], 'energy', report_number)
-        dxf_path = os.path.join(target_dir, 'building_plan.dxf')
+        context = _energy_report_context(report_number)
+        dxf_path = context.report_dir / 'building_plan.dxf'
         
         if not os.path.exists(dxf_path):
             return jsonify({'error': 'DXF file not found'}), 404
@@ -839,6 +923,8 @@ def get_all_layers_geometry():
         }
         return jsonify({'layers': layers_data, 'bounds': bounds})
     except Exception as e:
+        if isinstance(e, (ReportAccessDenied, InvalidReportPath, FileNotFoundError)):
+            return _report_storage_error_response(e)
         return jsonify({'error': str(e)}), 500
 
 @app.route('/energy/geometry', methods=['POST'])
@@ -847,12 +933,12 @@ def energy_geometry():
     """获取指定图层的几何数据用于预览"""
     try:
         data = request.get_json()
-        report_number = secure_filename(data.get('report_number', 'default')) or 'default'
+        report_number = data.get('report_number', 'default')
         layers = data.get('layers', [])
         scale = float(data.get('scale', 1.0))
-        
-        target_dir = os.path.join(app.config['UPLOAD_FOLDER'], 'energy', report_number)
-        dxf_path = os.path.join(target_dir, 'building_plan.dxf')
+
+        context = _energy_report_context(report_number, requested_owner=_requested_owner_username(data))
+        dxf_path = context.report_dir / 'building_plan.dxf'
         
         if not os.path.exists(dxf_path):
             return jsonify({'error': 'DXF file not found'}), 404
@@ -876,6 +962,8 @@ def energy_geometry():
                     })
         return jsonify({'geoms': geoms})
     except Exception as e:
+        if isinstance(e, (ReportAccessDenied, InvalidReportPath, FileNotFoundError)):
+            return _report_storage_error_response(e)
         return jsonify({'error': str(e)}), 500
 
 @app.route('/energy/geometry_advanced', methods=['POST'])
@@ -888,9 +976,10 @@ def energy_geometry_advanced():
         data = request.get_json()
         report_number = data.get('report_number', 'default')
         scale = float(data.get('scale', 1.0))
-        
-        target_dir = os.path.join(app.config['UPLOAD_FOLDER'], 'energy', report_number)
-        dxf_path = os.path.join(target_dir, 'building_plan.dxf')
+
+        context = _energy_report_context(report_number, requested_owner=_requested_owner_username(data))
+        target_dir = context.report_dir
+        dxf_path = target_dir / 'building_plan.dxf'
         
         if not os.path.exists(dxf_path):
             return jsonify({'error': 'DXF file not found'}), 404
@@ -902,8 +991,8 @@ def energy_geometry_advanced():
         engine = AdvancedCADRecognition(dxf_path)
         
         # 如果有位图则使用位图路由，否则使用矢量启发式路由 (混合模式)
-        png_path = os.path.join(target_dir, 'building_plan.png')
-        jpg_path = os.path.join(target_dir, 'building_plan.jpg')
+        png_path = target_dir / 'building_plan.png'
+        jpg_path = target_dir / 'building_plan.jpg'
         
         raster_path = png_path if os.path.exists(png_path) else (jpg_path if os.path.exists(jpg_path) else None)
         
@@ -946,6 +1035,8 @@ def energy_geometry_advanced():
 
         return jsonify({'geoms': walls, 'mode': 'advanced'})
     except Exception as e:
+        if isinstance(e, (ReportAccessDenied, InvalidReportPath, FileNotFoundError)):
+            return _report_storage_error_response(e)
         logger.error(f"Advanced geometry error: {e}")
         return jsonify({'error': str(e)}), 500
 
@@ -957,7 +1048,17 @@ def energy_geometry_advanced():
 @login_required
 def energy_calculate():
     """启动计算任务 (支持 Simple 和 EnergyPlus)"""
-    data = request.get_json()
+    data = request.get_json() or {}
+    try:
+        context = _energy_report_context(
+            data.get('report_number', 'default'),
+            requested_owner=_requested_owner_username(data),
+        )
+    except (ReportAccessDenied, InvalidReportPath, FileNotFoundError) as e:
+        return _report_storage_error_response(e)
+    data = dict(data)
+    data['report_number'] = context.report_number
+    data['owner_username'] = context.owner_username
     job_id = str(uuid.uuid4())
     mode = data.get('mode', 'simple') # 默认简单模式
     
@@ -1027,6 +1128,23 @@ def get_dxf_metrics(dxf_path, wall_layers, window_layers, scale=1.0):
         print(f"Metrics error: {e}")
         return 0, 0, 0
 
+
+def _background_energy_report_context(data) -> EnergyReportContext:
+    """Resolve a report from identity copied into a background-job payload."""
+    owner_username = data.get('owner_username')
+    context = resolve_energy_report_context(
+        app.config['UPLOAD_FOLDER'],
+        owner_username,
+        False,
+        data.get('report_number', 'default'),
+        requested_owner=owner_username,
+        create=False,
+    )
+    if not context.report_dir.is_dir():
+        raise FileNotFoundError("report not found")
+    return context
+
+
 def simple_simulation_task(job_id, data):
     """简单能效计算模型 (基于度日数法 HDD/CDD + 真实几何)"""
     try:
@@ -1043,9 +1161,8 @@ def simple_simulation_task(job_id, data):
         wall_layers = data.get('wall_layers', [])
         win_layers = data.get('window_layers', [])
         
-        report_number = data.get('report_number', 'default')
-        target_dir = os.path.join(app.config['UPLOAD_FOLDER'], 'energy', report_number)
-        dxf_path = os.path.join(target_dir, 'building_plan.dxf')
+        context = _background_energy_report_context(data)
+        dxf_path = context.report_dir / 'building_plan.dxf'
         
         # 实时从 DXF 提取几何数据
         if os.path.exists(dxf_path) and (wall_layers or win_layers):
@@ -1124,10 +1241,10 @@ def energy_status(job_id):
 def background_simulation_task(job_id, data):
     """在后台执行复杂的能耗模拟逻辑"""
     try:
-        report_number = data.get('report_number', 'default')
-        target_dir = os.path.join(app.config['UPLOAD_FOLDER'], 'energy', report_number)
-        dxf_path = os.path.join(target_dir, 'building_plan.dxf')
-        epw_path = os.path.join(target_dir, 'weather_data.epw')
+        context = _background_energy_report_context(data)
+        target_dir = context.report_dir
+        dxf_path = target_dir / 'building_plan.dxf'
+        epw_path = target_dir / 'weather_data.epw'
         
         params = {
             'scale': float(data.get('scale', 1.0)),
@@ -1149,9 +1266,9 @@ def background_simulation_task(job_id, data):
         
         # 2. 执行 EnergyPlus 模拟 (深度算法)
         simulation_jobs.update(job_id, progress=50)
-        output_dir = os.path.join(target_dir, 'energyplus_runs', job_id)
+        output_dir = target_dir / 'energyplus_runs' / job_id
 
-        idf_path = os.path.join(output_dir, 'run.idf')
+        idf_path = output_dir / 'run.idf'
         os.makedirs(output_dir, exist_ok=True)
         
         energyplus_engine.generate_idf(idf_path, geom_result, params)
@@ -1217,14 +1334,20 @@ def extract_geometry(dxf_path, params):
 @login_required
 def upload_ifc():
     """上传 IFC 文件并解析建筑信息"""
+    try:
+        requested_owner = _requested_owner_username()
+        _effective_report_owner(requested_owner)
+    except (ReportAccessDenied, InvalidReportPath) as e:
+        return _report_storage_error_response(e)
     if not HAS_IFC:
         return jsonify({'error': 'IFC support not available (ifcopenshell not installed)'}), 501
-    
+
+    context = None
     try:
         report_number = request.form.get('report_number', 'default')
-        report_number = secure_filename(report_number) or 'default'
-        target_dir = os.path.join(app.config['UPLOAD_FOLDER'], 'energy', report_number)
-        os.makedirs(target_dir, exist_ok=True)
+        context = _energy_report_context(report_number, requested_owner=requested_owner, create=True)
+        target_dir = context.report_dir
+        _upsert_report_status(context.owner_username, context.report_number, 'created')
         
         if 'ifc_file' not in request.files:
             return jsonify({'error': 'No IFC file provided'}), 400
@@ -1233,8 +1356,9 @@ def upload_ifc():
         if not f or not allowed_file(f.filename, ALLOWED_IFC):
             return jsonify({'error': 'Invalid file type. Only .ifc files accepted'}), 400
         
-        ifc_path = os.path.join(target_dir, 'building_model.ifc')
+        ifc_path = target_dir / 'building_model.ifc'
         f.save(ifc_path)
+        _upsert_report_status(context.owner_username, context.report_number, 'uploaded')
         
         # 解析 IFC
         parser = IFCParser(ifc_path)
@@ -1249,8 +1373,16 @@ def upload_ifc():
         }
         
         return jsonify(result)
+    except (ReportAccessDenied, InvalidReportPath) as e:
+        return _report_storage_error_response(e)
     except Exception as e:
-        logger.error(f"IFC upload error: {e}")
+        if context is not None:
+            try:
+                if _report_row(context.owner_username, context.report_number) is not None:
+                    _upsert_report_status(context.owner_username, context.report_number, 'failed')
+            except Exception:
+                logger.exception("Could not update failed IFC upload status")
+        logger.error(f"IFC upload error: {e}", exc_info=True)
         return jsonify({'error': str(e)}), 500
 
 
@@ -1258,13 +1390,18 @@ def upload_ifc():
 @login_required
 def ifc_properties():
     """获取已上传 IFC 模型的属性树"""
+    try:
+        requested_owner = _requested_owner_username()
+        _effective_report_owner(requested_owner)
+    except (ReportAccessDenied, InvalidReportPath, FileNotFoundError) as e:
+        return _report_storage_error_response(e)
     if not HAS_IFC:
         return jsonify({'error': 'IFC support not available'}), 501
     
     try:
         report_number = request.args.get('project', 'default')
-        target_dir = os.path.join(app.config['UPLOAD_FOLDER'], 'energy', report_number)
-        ifc_path = os.path.join(target_dir, 'building_model.ifc')
+        context = _energy_report_context(report_number, requested_owner=requested_owner)
+        ifc_path = context.report_dir / 'building_model.ifc'
         
         if not os.path.exists(ifc_path):
             return jsonify({'error': 'IFC file not found. Upload one first.'}), 404
@@ -1273,6 +1410,8 @@ def ifc_properties():
         tree = parser.get_property_tree()
         
         return jsonify(tree)
+    except (ReportAccessDenied, InvalidReportPath, FileNotFoundError) as e:
+        return _report_storage_error_response(e)
     except Exception as e:
         logger.error(f"IFC property tree error: {e}")
         return jsonify({'error': str(e)}), 500
@@ -1282,13 +1421,18 @@ def ifc_properties():
 @login_required
 def ifc_walls():
     """获取 IFC 模型中的墙体列表及热工参数"""
+    try:
+        requested_owner = _requested_owner_username()
+        _effective_report_owner(requested_owner)
+    except (ReportAccessDenied, InvalidReportPath, FileNotFoundError) as e:
+        return _report_storage_error_response(e)
     if not HAS_IFC:
         return jsonify({'error': 'IFC support not available'}), 501
     
     try:
         report_number = request.args.get('project', 'default')
-        target_dir = os.path.join(app.config['UPLOAD_FOLDER'], 'energy', report_number)
-        ifc_path = os.path.join(target_dir, 'building_model.ifc')
+        context = _energy_report_context(report_number, requested_owner=requested_owner)
+        ifc_path = context.report_dir / 'building_model.ifc'
         
         if not os.path.exists(ifc_path):
             return jsonify({'error': 'IFC file not found'}), 404
@@ -1303,6 +1447,8 @@ def ifc_walls():
             'windows': windows,
             'spaces': spaces,
         })
+    except (ReportAccessDenied, InvalidReportPath, FileNotFoundError) as e:
+        return _report_storage_error_response(e)
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
@@ -1311,14 +1457,19 @@ def ifc_walls():
 @login_required
 def ifc_simulate():
     """使用 IFC 提取的数据直接运行能耗模拟"""
+    data = request.get_json(silent=True) or {}
+    try:
+        requested_owner = _requested_owner_username(data)
+        _effective_report_owner(requested_owner)
+    except (ReportAccessDenied, InvalidReportPath, FileNotFoundError) as e:
+        return _report_storage_error_response(e)
     if not HAS_IFC:
         return jsonify({'error': 'IFC support not available'}), 501
     
     try:
-        data = request.get_json() or {}
         report_number = data.get('report_number', 'default')
-        target_dir = os.path.join(app.config['UPLOAD_FOLDER'], 'energy', report_number)
-        ifc_path = os.path.join(target_dir, 'building_model.ifc')
+        context = _energy_report_context(report_number, requested_owner=requested_owner)
+        ifc_path = context.report_dir / 'building_model.ifc'
         
         if not os.path.exists(ifc_path):
             return jsonify({'error': 'IFC file not found'}), 404
@@ -1363,6 +1514,8 @@ def ifc_simulate():
         result['ifc_data'] = sim_data
         
         return jsonify(result)
+    except (ReportAccessDenied, InvalidReportPath, FileNotFoundError) as e:
+        return _report_storage_error_response(e)
     except Exception as e:
         logger.error(f"IFC simulation error: {e}")
         return jsonify({'error': str(e)}), 500
@@ -1393,7 +1546,7 @@ def ops_benchmark():
 def generate_test_files():
     """生成 BESTEST 标准测试文件 (DXF + IFC)"""
     try:
-        test_dir = os.path.join(app.config['UPLOAD_FOLDER'], 'energy', 'bestest')
+        test_dir = os.path.join(app.config['UPLOAD_FOLDER'], 'ops', 'bestest')
         os.makedirs(test_dir, exist_ok=True)
         
         files = {}

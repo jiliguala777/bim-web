@@ -210,6 +210,45 @@ class ReportSchemaMigrationTests(unittest.TestCase):
                 finally:
                     connection.close()
 
+    def test_migration_accepts_nonsemantic_keywords_in_legacy_table_sql(self):
+        variants = [
+            ("string_literal", "note TEXT DEFAULT 'references'"),
+            ("quoted_identifier", '"references" TEXT'),
+            ("comment", "note TEXT /* references */"),
+        ]
+        for name, extra_column in variants:
+            with self.subTest(location=name), tempfile.TemporaryDirectory() as directory:
+                database_path = Path(directory) / "legacy.db"
+                connection = sqlite3.connect(database_path)
+                connection.execute(
+                    f"""
+                    CREATE TABLE reports (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        username TEXT NOT NULL,
+                        report_number TEXT NOT NULL UNIQUE,
+                        {extra_column},
+                        created_at TEXT DEFAULT CURRENT_TIMESTAMP
+                    )
+                    """
+                )
+                connection.execute(
+                    "INSERT INTO reports (username, report_number) VALUES (?, ?)",
+                    ("alice", "BIM-1"),
+                )
+
+                try:
+                    self.server._migrate_reports_schema(connection)
+                    connection.execute(
+                        "INSERT INTO reports (username, report_number) VALUES (?, ?)",
+                        ("bob", "BIM-1"),
+                    )
+                    owners = connection.execute(
+                        "SELECT username FROM reports WHERE report_number = ? ORDER BY username", ("BIM-1",)
+                    ).fetchall()
+                    self.assertEqual(owners, [("alice",), ("bob",)])
+                finally:
+                    connection.close()
+
 
 class ReportOwnershipHelperTests(unittest.TestCase):
     @classmethod

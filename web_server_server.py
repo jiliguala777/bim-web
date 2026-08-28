@@ -396,21 +396,67 @@ def _assert_reports_schema_can_be_rebuilt(conn):
     table_sql = conn.execute(
         "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'reports'"
     ).fetchone()[0]
+    ddl_tokens = _sqlite_ddl_tokens(table_sql)
     unsupported_features = {
         "CHECK": "CHECK constraints",
-        "FOREIGN KEY": "foreign keys",
         "REFERENCES": "foreign keys",
         "COLLATE": "collations",
         "GENERATED": "generated columns",
         "STRICT": "STRICT table options",
-        "WITHOUT ROWID": "WITHOUT ROWID table options",
-        "ON CONFLICT": "constraint conflict policies",
     }
     for token, description in unsupported_features.items():
-        if token in table_sql.upper():
+        if token in ddl_tokens:
+            raise RuntimeError(f"unsupported reports schema cannot be safely rebuilt: {description}")
+    token_pairs = set(zip(ddl_tokens, ddl_tokens[1:]))
+    unsupported_pairs = {
+        ("FOREIGN", "KEY"): "foreign keys",
+        ("WITHOUT", "ROWID"): "WITHOUT ROWID table options",
+        ("ON", "CONFLICT"): "constraint conflict policies",
+    }
+    for tokens, description in unsupported_pairs.items():
+        if tokens in token_pairs:
             raise RuntimeError(f"unsupported reports schema cannot be safely rebuilt: {description}")
     if any(column[6] for column in conn.execute("PRAGMA table_xinfo(reports)")):
         raise RuntimeError("unsupported reports schema cannot be safely rebuilt: generated columns")
+
+
+def _sqlite_ddl_tokens(sql):
+    """Return unquoted SQLite DDL keywords while skipping literal and comment text."""
+    tokens = []
+    position = 0
+    while position < len(sql):
+        character = sql[position]
+        if character.isspace():
+            position += 1
+        elif sql.startswith("--", position):
+            newline = sql.find("\n", position + 2)
+            position = len(sql) if newline == -1 else newline + 1
+        elif sql.startswith("/*", position):
+            comment_end = sql.find("*/", position + 2)
+            position = len(sql) if comment_end == -1 else comment_end + 2
+        elif character in "'\"`":
+            quote = character
+            position += 1
+            while position < len(sql):
+                if sql[position] == quote:
+                    position += 1
+                    if position < len(sql) and sql[position] == quote:
+                        position += 1
+                        continue
+                    break
+                position += 1
+        elif character == "[":
+            identifier_end = sql.find("]", position + 1)
+            position = len(sql) if identifier_end == -1 else identifier_end + 1
+        elif character.isalpha() or character == "_":
+            token_end = position + 1
+            while token_end < len(sql) and (sql[token_end].isalnum() or sql[token_end] in "_$"):
+                token_end += 1
+            tokens.append(sql[position:token_end].upper())
+            position = token_end
+        else:
+            position += 1
+    return tokens
 
 
 def _report_row(username, report_number):

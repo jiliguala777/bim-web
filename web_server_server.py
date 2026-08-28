@@ -236,6 +236,22 @@ class JobStore:
 
 simulation_jobs = JobStore()
 
+
+class ReportOwnerNotFound(FileNotFoundError):
+    """Raised when an administrator explicitly targets an unknown owner."""
+
+
+class ReportNotFound(FileNotFoundError):
+    """Raised when an authorized report directory does not exist."""
+
+
+_REPORT_STORAGE_EXCEPTIONS = (
+    ReportAccessDenied,
+    InvalidReportPath,
+    ReportOwnerNotFound,
+    ReportNotFound,
+)
+
 # --- Authentication Decorator ---
 def login_required(f):
     @wraps(f)
@@ -496,6 +512,24 @@ def _upsert_report_status(username, report_number, status):
         conn.close()
 
 
+def _update_report_status_if_exists(username, report_number, status):
+    """Atomically update a report status without inserting a missing identity."""
+    conn = get_db_connection()
+    try:
+        cursor = conn.execute(
+            """
+            UPDATE reports
+            SET status = ?, updated_at = datetime('now')
+            WHERE username = ? AND report_number = ?
+            """,
+            (status, username, report_number),
+        )
+        conn.commit()
+        return cursor.rowcount > 0
+    finally:
+        conn.close()
+
+
 def _user_exists(username):
     conn = get_db_connection()
     try:
@@ -530,16 +564,16 @@ def _effective_report_owner(requested_owner=None):
     owner_username = resolve_report_owner(session_username, is_admin, requested_owner)
     explicit_target = isinstance(requested_owner, str) and bool(requested_owner.strip())
     if is_admin and explicit_target and owner_username != session_username and not _user_exists(owner_username):
-        raise ReportAccessDenied("the requested report owner does not exist")
+        raise ReportOwnerNotFound("the requested report owner does not exist")
     return owner_username
 
 
-def _energy_report_context(report_number, requested_owner=None, create=False) -> EnergyReportContext:
-    """Resolve the current request's authorized, user-scoped report directory."""
+def _resolved_energy_report_context(report_number, requested_owner=None, create=False) -> EnergyReportContext:
+    """Resolve and validate a request report without requiring it to exist."""
     if requested_owner is None:
         requested_owner = _requested_owner_username()
     owner_username = _effective_report_owner(requested_owner)
-    context = resolve_energy_report_context(
+    return resolve_energy_report_context(
         app.config['UPLOAD_FOLDER'],
         owner_username,
         False,
@@ -547,8 +581,13 @@ def _energy_report_context(report_number, requested_owner=None, create=False) ->
         requested_owner=owner_username,
         create=create,
     )
+
+
+def _energy_report_context(report_number, requested_owner=None, create=False) -> EnergyReportContext:
+    """Resolve the current request's authorized, user-scoped report directory."""
+    context = _resolved_energy_report_context(report_number, requested_owner, create)
     if not create and not context.report_dir.is_dir():
-        raise FileNotFoundError("report not found")
+        raise ReportNotFound("report not found")
     return context
 
 
@@ -561,6 +600,12 @@ def _report_storage_error_response(exc):
     if isinstance(exc, FileNotFoundError):
         return jsonify({'error': 'Report not found'}), 404
     raise exc
+
+
+def _internal_report_error_response(log_message, exc):
+    """Log report-processing detail while returning a path-safe response."""
+    logger.error("%s: %s", log_message, exc, exc_info=True)
+    return jsonify({'error': 'Internal server error'}), 500
 
 
 def init_db():
@@ -715,7 +760,7 @@ def get_simulation_data(report_number):
                 'u_win': 2.5
             }
         })
-    except (ReportAccessDenied, InvalidReportPath, FileNotFoundError) as e:
+    except _REPORT_STORAGE_EXCEPTIONS as e:
         return _report_storage_error_response(e)
 
 
@@ -869,17 +914,15 @@ def energy_upload():
             _upsert_report_status(context.owner_username, context.report_number, 'uploaded')
 
         return jsonify(result)
-    except (ReportAccessDenied, InvalidReportPath) as e:
+    except (ReportAccessDenied, InvalidReportPath, ReportOwnerNotFound) as e:
         return _report_storage_error_response(e)
     except Exception as e:
         if context is not None:
             try:
-                if _report_row(context.owner_username, context.report_number) is not None:
-                    _upsert_report_status(context.owner_username, context.report_number, 'failed')
+                _update_report_status_if_exists(context.owner_username, context.report_number, 'failed')
             except Exception:
                 logger.exception("Could not update failed upload status")
-        logger.error(f"Upload error: {e}", exc_info=True)
-        return jsonify({'error': str(e)}), 500
+        return _internal_report_error_response("Upload error", e)
 
 @app.route('/energy/layers/geometry', methods=['GET'])
 @login_required
@@ -923,9 +966,9 @@ def get_all_layers_geometry():
         }
         return jsonify({'layers': layers_data, 'bounds': bounds})
     except Exception as e:
-        if isinstance(e, (ReportAccessDenied, InvalidReportPath, FileNotFoundError)):
+        if isinstance(e, _REPORT_STORAGE_EXCEPTIONS):
             return _report_storage_error_response(e)
-        return jsonify({'error': str(e)}), 500
+        return _internal_report_error_response("Layer geometry error", e)
 
 @app.route('/energy/geometry', methods=['POST'])
 @login_required
@@ -962,9 +1005,9 @@ def energy_geometry():
                     })
         return jsonify({'geoms': geoms})
     except Exception as e:
-        if isinstance(e, (ReportAccessDenied, InvalidReportPath, FileNotFoundError)):
+        if isinstance(e, _REPORT_STORAGE_EXCEPTIONS):
             return _report_storage_error_response(e)
-        return jsonify({'error': str(e)}), 500
+        return _internal_report_error_response("Energy geometry error", e)
 
 @app.route('/energy/geometry_advanced', methods=['POST'])
 @login_required
@@ -1035,10 +1078,9 @@ def energy_geometry_advanced():
 
         return jsonify({'geoms': walls, 'mode': 'advanced'})
     except Exception as e:
-        if isinstance(e, (ReportAccessDenied, InvalidReportPath, FileNotFoundError)):
+        if isinstance(e, _REPORT_STORAGE_EXCEPTIONS):
             return _report_storage_error_response(e)
-        logger.error(f"Advanced geometry error: {e}")
-        return jsonify({'error': str(e)}), 500
+        return _internal_report_error_response("Advanced geometry error", e)
 
 
 # ==========================================
@@ -1054,7 +1096,7 @@ def energy_calculate():
             data.get('report_number', 'default'),
             requested_owner=_requested_owner_username(data),
         )
-    except (ReportAccessDenied, InvalidReportPath, FileNotFoundError) as e:
+    except _REPORT_STORAGE_EXCEPTIONS as e:
         return _report_storage_error_response(e)
     data = dict(data)
     data['report_number'] = context.report_number
@@ -1141,7 +1183,7 @@ def _background_energy_report_context(data) -> EnergyReportContext:
         create=False,
     )
     if not context.report_dir.is_dir():
-        raise FileNotFoundError("report not found")
+        raise ReportNotFound("report not found")
     return context
 
 
@@ -1227,7 +1269,8 @@ def simple_simulation_task(job_id, data):
             }
         })
     except Exception as e:
-        simulation_jobs.update(job_id, status='failed', error=str(e))
+        logger.error("Simple simulation task error: %s", e, exc_info=True)
+        simulation_jobs.update(job_id, status='failed', error='Simulation failed')
 
 
 @app.route('/energy/status/<job_id>')
@@ -1295,8 +1338,8 @@ def background_simulation_task(job_id, data):
         })
 
     except Exception as e:
-        logger.error(f"Simulation task error: {e}", exc_info=True)
-        simulation_jobs.update(job_id, status='failed', error=str(e))
+        logger.error("Simulation task error: %s", e, exc_info=True)
+        simulation_jobs.update(job_id, status='failed', error='Simulation failed')
 
 def extract_geometry(dxf_path, params):
     """通用的 CAD 几何提取模块"""
@@ -1334,17 +1377,17 @@ def extract_geometry(dxf_path, params):
 @login_required
 def upload_ifc():
     """上传 IFC 文件并解析建筑信息"""
+    report_number = request.form.get('report_number', 'default')
     try:
         requested_owner = _requested_owner_username()
-        _effective_report_owner(requested_owner)
-    except (ReportAccessDenied, InvalidReportPath) as e:
+        _resolved_energy_report_context(report_number, requested_owner)
+    except _REPORT_STORAGE_EXCEPTIONS as e:
         return _report_storage_error_response(e)
     if not HAS_IFC:
         return jsonify({'error': 'IFC support not available (ifcopenshell not installed)'}), 501
 
     context = None
     try:
-        report_number = request.form.get('report_number', 'default')
         context = _energy_report_context(report_number, requested_owner=requested_owner, create=True)
         target_dir = context.report_dir
         _upsert_report_status(context.owner_username, context.report_number, 'created')
@@ -1373,33 +1416,31 @@ def upload_ifc():
         }
         
         return jsonify(result)
-    except (ReportAccessDenied, InvalidReportPath) as e:
+    except _REPORT_STORAGE_EXCEPTIONS as e:
         return _report_storage_error_response(e)
     except Exception as e:
         if context is not None:
             try:
-                if _report_row(context.owner_username, context.report_number) is not None:
-                    _upsert_report_status(context.owner_username, context.report_number, 'failed')
+                _update_report_status_if_exists(context.owner_username, context.report_number, 'failed')
             except Exception:
                 logger.exception("Could not update failed IFC upload status")
-        logger.error(f"IFC upload error: {e}", exc_info=True)
-        return jsonify({'error': str(e)}), 500
+        return _internal_report_error_response("IFC upload error", e)
 
 
 @app.route('/energy/ifc_properties', methods=['GET'])
 @login_required
 def ifc_properties():
     """获取已上传 IFC 模型的属性树"""
+    report_number = request.args.get('project', 'default')
     try:
         requested_owner = _requested_owner_username()
-        _effective_report_owner(requested_owner)
-    except (ReportAccessDenied, InvalidReportPath, FileNotFoundError) as e:
+        _resolved_energy_report_context(report_number, requested_owner)
+    except _REPORT_STORAGE_EXCEPTIONS as e:
         return _report_storage_error_response(e)
     if not HAS_IFC:
         return jsonify({'error': 'IFC support not available'}), 501
     
     try:
-        report_number = request.args.get('project', 'default')
         context = _energy_report_context(report_number, requested_owner=requested_owner)
         ifc_path = context.report_dir / 'building_model.ifc'
         
@@ -1410,27 +1451,26 @@ def ifc_properties():
         tree = parser.get_property_tree()
         
         return jsonify(tree)
-    except (ReportAccessDenied, InvalidReportPath, FileNotFoundError) as e:
+    except _REPORT_STORAGE_EXCEPTIONS as e:
         return _report_storage_error_response(e)
     except Exception as e:
-        logger.error(f"IFC property tree error: {e}")
-        return jsonify({'error': str(e)}), 500
+        return _internal_report_error_response("IFC property tree error", e)
 
 
 @app.route('/energy/ifc_walls', methods=['GET'])
 @login_required
 def ifc_walls():
     """获取 IFC 模型中的墙体列表及热工参数"""
+    report_number = request.args.get('project', 'default')
     try:
         requested_owner = _requested_owner_username()
-        _effective_report_owner(requested_owner)
-    except (ReportAccessDenied, InvalidReportPath, FileNotFoundError) as e:
+        _resolved_energy_report_context(report_number, requested_owner)
+    except _REPORT_STORAGE_EXCEPTIONS as e:
         return _report_storage_error_response(e)
     if not HAS_IFC:
         return jsonify({'error': 'IFC support not available'}), 501
     
     try:
-        report_number = request.args.get('project', 'default')
         context = _energy_report_context(report_number, requested_owner=requested_owner)
         ifc_path = context.report_dir / 'building_model.ifc'
         
@@ -1447,10 +1487,10 @@ def ifc_walls():
             'windows': windows,
             'spaces': spaces,
         })
-    except (ReportAccessDenied, InvalidReportPath, FileNotFoundError) as e:
+    except _REPORT_STORAGE_EXCEPTIONS as e:
         return _report_storage_error_response(e)
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        return _internal_report_error_response("IFC walls error", e)
 
 
 @app.route('/energy/ifc_simulate', methods=['POST'])
@@ -1458,16 +1498,16 @@ def ifc_walls():
 def ifc_simulate():
     """使用 IFC 提取的数据直接运行能耗模拟"""
     data = request.get_json(silent=True) or {}
+    report_number = data.get('report_number', 'default')
     try:
         requested_owner = _requested_owner_username(data)
-        _effective_report_owner(requested_owner)
-    except (ReportAccessDenied, InvalidReportPath, FileNotFoundError) as e:
+        _resolved_energy_report_context(report_number, requested_owner)
+    except _REPORT_STORAGE_EXCEPTIONS as e:
         return _report_storage_error_response(e)
     if not HAS_IFC:
         return jsonify({'error': 'IFC support not available'}), 501
     
     try:
-        report_number = data.get('report_number', 'default')
         context = _energy_report_context(report_number, requested_owner=requested_owner)
         ifc_path = context.report_dir / 'building_model.ifc'
         
@@ -1514,11 +1554,10 @@ def ifc_simulate():
         result['ifc_data'] = sim_data
         
         return jsonify(result)
-    except (ReportAccessDenied, InvalidReportPath, FileNotFoundError) as e:
+    except _REPORT_STORAGE_EXCEPTIONS as e:
         return _report_storage_error_response(e)
     except Exception as e:
-        logger.error(f"IFC simulation error: {e}")
-        return jsonify({'error': str(e)}), 500
+        return _internal_report_error_response("IFC simulation error", e)
 
 
 # ==========================================
@@ -1562,7 +1601,7 @@ def generate_test_files():
         
         return jsonify({'status': 'success', 'files': files, 'directory': test_dir})
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        return _internal_report_error_response("Benchmark fixture generation error", e)
 
 
 # ==========================================

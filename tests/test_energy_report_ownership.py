@@ -299,6 +299,18 @@ class ReportOwnershipHelperTests(unittest.TestCase):
         connection.close()
         self.assertEqual(alice_count, 1)
 
+    def test_update_only_status_helper_never_inserts_a_missing_report(self):
+        updated = self.server._update_report_status_if_exists("alice", "MISSING", "failed")
+
+        self.assertFalse(updated)
+        self.assertIsNone(self.server._report_row("alice", "MISSING"))
+
+        self.server._upsert_report_status("alice", "EXISTS", "created")
+        updated = self.server._update_report_status_if_exists("alice", "EXISTS", "failed")
+
+        self.assertTrue(updated)
+        self.assertEqual(self.server._report_row("alice", "EXISTS")["status"], "failed")
+
 
 class ReportUploadIsolationTests(unittest.TestCase):
     @classmethod
@@ -422,7 +434,7 @@ class ReportUploadIsolationTests(unittest.TestCase):
 
         self.assertEqual(accepted.status_code, 200, accepted.get_json())
         self.assertEqual(own_report.status_code, 200, own_report.get_json())
-        self.assertEqual(denied.status_code, 403, denied.get_json())
+        self.assertEqual(denied.status_code, 404, denied.get_json())
         self.assertTrue(
             (self.upload_root / "energy" / user_storage_key("bob") / "BIM-ADMIN" / "building_plan.png").is_file()
         )
@@ -434,16 +446,95 @@ class ReportUploadIsolationTests(unittest.TestCase):
     def test_failed_upload_updates_only_the_created_composite_report_row(self):
         self.login_as("alice")
 
-        with self.assertLogs(self.server.logger, level="ERROR"):
-            with patch("werkzeug.datastructures.FileStorage.save", side_effect=OSError("disk full")):
+        secret_path = str(
+            self.upload_root / "energy" / user_storage_key("alice") / "BIM-FAIL" / "private-parser-file.dxf"
+        )
+        with self.assertLogs(self.server.logger, level="ERROR") as captured_logs:
+            with patch.object(self.server, "allowed_file", side_effect=RuntimeError(secret_path)):
                 response = self.client.post(
                     "/energy/upload",
                     data={"report_number": "BIM-FAIL", "raster_file": self.image_file()},
                 )
 
         self.assertEqual(response.status_code, 500, response.get_json())
+        self.assertEqual(response.get_json(), {"error": "Internal server error"})
+        self.assertNotIn(secret_path, response.get_data(as_text=True))
+        self.assertIn(secret_path, "\n".join(captured_logs.output))
         self.assertEqual(self.server._report_row("alice", "BIM-FAIL")["status"], "failed")
         self.assertIsNone(self.server._report_row("bob", "BIM-FAIL"))
+
+    def test_worker_failures_are_sanitized_in_job_status_and_logged_with_detail(self):
+        self.login_as("alice")
+        jobs_directory = Path(self.temporary_directory.name) / "jobs"
+        jobs_directory.mkdir()
+        secret_path = str(
+            self.upload_root / "energy" / user_storage_key("alice") / "BIM-JOB" / "private-run.idf"
+        )
+
+        with (
+            patch.object(self.server, "JOBS_DIR", str(jobs_directory)),
+            patch.object(
+                self.server,
+                "_background_energy_report_context",
+                side_effect=RuntimeError(secret_path),
+            ),
+            self.assertLogs(self.server.logger, level="ERROR") as captured_logs,
+        ):
+            responses = []
+            for worker_name in ("simple_simulation_task", "background_simulation_task"):
+                job_id = f"job-sensitive-error-{worker_name}"
+                self.server.simulation_jobs.set(
+                    job_id,
+                    {"status": "processing", "progress": 0, "result": None, "error": None},
+                )
+                getattr(self.server, worker_name)(
+                    job_id,
+                    {"owner_username": "alice", "report_number": "BIM-JOB"},
+                )
+                responses.append(self.client.get(f"/energy/status/{job_id}"))
+
+        for response in responses:
+            self.assertEqual(response.status_code, 200, response.get_json())
+            self.assertEqual(response.get_json()["error"], "Simulation failed")
+            self.assertNotIn(secret_path, response.get_data(as_text=True))
+        self.assertIn(secret_path, "\n".join(captured_logs.output))
+
+    def test_parser_file_error_is_not_misclassified_or_exposed(self):
+        self.login_as("alice")
+        report_dir = self.upload_root / "energy" / user_storage_key("alice") / "BIM-PARSER"
+        report_dir.mkdir(parents=True)
+        (report_dir / "building_plan.dxf").write_bytes(b"dxf")
+        secret_path = str(report_dir / "private-parser-input.dxf")
+
+        with (
+            patch.object(self.server, "ezdxf", create=True) as ezdxf,
+            self.assertLogs(self.server.logger, level="ERROR") as captured_logs,
+        ):
+            ezdxf.readfile.side_effect = FileNotFoundError(secret_path)
+            response = self.client.post(
+                "/energy/geometry",
+                json={"report_number": "BIM-PARSER", "layers": []},
+            )
+
+        self.assertEqual(response.status_code, 500, response.get_json())
+        self.assertEqual(response.get_json(), {"error": "Internal server error"})
+        self.assertNotIn(secret_path, response.get_data(as_text=True))
+        self.assertIn(secret_path, "\n".join(captured_logs.output))
+
+    def test_ifc_routes_reject_malformed_report_before_dependency_gate(self):
+        self.login_as("alice")
+        requests = [
+            ("post", "/energy/upload_ifc", {"data": {"report_number": "../escape"}}),
+            ("get", "/energy/ifc_properties?project=../escape", {}),
+            ("get", "/energy/ifc_walls?project=../escape", {}),
+            ("post", "/energy/ifc_simulate", {"json": {"report_number": "../escape"}}),
+        ]
+
+        with patch.object(self.server, "HAS_IFC", False):
+            for method, url, kwargs in requests:
+                with self.subTest(url=url):
+                    response = getattr(self.client, method)(url, **kwargs)
+                    self.assertEqual(response.status_code, 400, response.get_json())
 
     def test_storage_errors_are_sanitized_and_use_specific_http_statuses(self):
         self.login_as("alice")

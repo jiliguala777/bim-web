@@ -370,6 +370,7 @@ sudo tail -n 100 /var/log/nginx/error.log
    sudo systemctl is-active --quiet bim-web && exit 1
 
    backup_dir=/var/backups/bim-web/user-scope-$(date +%Y%m%d-%H%M%S)
+   [ ! -e "$backup_dir" ]
    sudo install -d -m 0700 "$backup_dir"
    sudo cp -a /var/lib/bim-web/users.db "$backup_dir/users.db"
    sudo cp -a /var/lib/bim-web/uploads "$backup_dir/uploads"
@@ -404,7 +405,8 @@ sudo tail -n 100 /var/log/nginx/error.log
      cd /opt/bim-web/app &&
      /opt/bim-web/venv/bin/python tools/user_report_storage_preflight.py \
        --db /var/lib/bim-web/users.db \
-       --uploads /var/lib/bim-web/uploads
+       --uploads /var/lib/bim-web/uploads \
+       --runtime-root /var/lib/bim-web
    '
    ```
 
@@ -454,11 +456,13 @@ case "$snapshot_dir" in "$backup_root"/*) ;; *) echo 'ABORT: snapshot is outside
 [ -f "$snapshot_dir/users.db" ]
 [ -d "$snapshot_dir/uploads" ]
 [ -f "$snapshot_dir/SHA256SUMS" ]
+[ -f "$snapshot_dir/release-before" ]
 ( cd "$snapshot_dir" && sha256sum -c SHA256SUMS )
 [ -f "$live_root/users.db" ]
 [ -d "$live_root/uploads" ]
 
-rollback_commit='REPLACE_WITH_VERIFIED_COMMIT'
+rollback_commit=$(sed -n 's/^release_before=//p' "$snapshot_dir/release-before")
+[ -n "$rollback_commit" ]
 runuser -u bimweb -- git -C /opt/bim-web/app rev-parse --verify "$rollback_commit^{commit}" >/dev/null
 stash_root="$live_root/failed-user-scope-$(date +%Y%m%d-%H%M%S)"
 [ ! -e "$stash_root" ]

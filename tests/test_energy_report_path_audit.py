@@ -92,6 +92,14 @@ def _render_sql_expression(node, names):
             else:
                 rendered.append("<dynamic>")
         return "".join(rendered)
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "format":
+        template = _render_sql_expression(node.func.value, names)
+        values = [_render_sql_expression(arg, names) for arg in node.args]
+        if template is not None and all(value is not None for value in values):
+            try:
+                return template.format(*values)
+            except (IndexError, KeyError, ValueError):
+                return None
     return None
 
 
@@ -102,9 +110,9 @@ def _is_unsafe_report_sql(query):
     if "where" not in normalized:
         return False
     where_clause = normalized.split("where", 1)[1]
-    if not re.search(r"\breport_number\b\s*=", where_clause):
+    if not re.search(r"\breport_number\b\s*(?:=|in\b|is\b)", where_clause):
         return False
-    return not re.search(r"\busername\b\s*=", where_clause)
+    return not re.search(r"\busername\b\s*(?:=|in\b|is\b)", where_clause)
 
 
 def _unsafe_report_sql_literals(tree):
@@ -127,7 +135,7 @@ def _unsafe_report_sql_literals(tree):
                     if isinstance(target, ast.Name):
                         names[target.id] = rendered
                 candidates.append((node.lineno, rendered))
-        elif isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "execute":
+        elif isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr in {"execute", "executemany"}:
             if node.args:
                 rendered = _render_sql_expression(node.args[0], names)
                 if rendered is not None:
@@ -174,6 +182,12 @@ class _DirectEnergyPathVisitor(ast.NodeVisitor):
                     self._join_aliases.add(imported.asname or imported.name)
         self.generic_visit(node)
 
+    def visit_FunctionDef(self, node):
+        saved_roots, saved_joins = self._upload_root_aliases, self._join_aliases
+        self._upload_root_aliases, self._join_aliases = set(), set(saved_joins)
+        self.generic_visit(node)
+        self._upload_root_aliases, self._join_aliases = saved_roots, saved_joins
+
     def visit_Assign(self, node):
         self._remember_assignment_aliases(node.value, node.targets)
         self.generic_visit(node)
@@ -185,11 +199,20 @@ class _DirectEnergyPathVisitor(ast.NodeVisitor):
 
     def _remember_assignment_aliases(self, value, targets):
         names = [target.id for target in targets if isinstance(target, ast.Name)]
-        if _is_upload_folder_config(value) or (
+        is_path_upload_root = (
+            isinstance(value, ast.Call)
+            and isinstance(value.func, ast.Name)
+            and value.func.id == "Path"
+            and value.args
+            and _is_upload_folder_config(value.args[0])
+        )
+        if _is_upload_folder_config(value) or is_path_upload_root or (
             isinstance(value, ast.Name) and value.id in self._upload_root_aliases
         ):
             self._upload_root_aliases.update(names)
         if isinstance(value, ast.Name) and value.id in self._join_aliases:
+            self._join_aliases.update(names)
+        if isinstance(value, ast.Attribute) and value.attr == "join":
             self._join_aliases.update(names)
 
     def _inspect(self, node):
@@ -253,6 +276,10 @@ legacy_f_string = f"{root}/energy/{report_number}"
 legacy_concatenation = root + "/energy/" + report_number
 annotated_root: str = app.config["UPLOAD_FOLDER"]
 legacy_annotated_root = os.path.join(annotated_root, "energy", report_number)
+joiner = os.path.join
+legacy_joiner = joiner(app.config["UPLOAD_FOLDER"], "energy", report_number)
+path_root = Path(app.config["UPLOAD_FOLDER"])
+legacy_path_root = path_root / "energy" / report_number
 operations = os.path.join(app.config["UPLOAD_FOLDER"], "ops", "bestest")
 """
         )
@@ -269,6 +296,8 @@ operations = os.path.join(app.config["UPLOAD_FOLDER"], "ops", "bestest")
                 (12, "f'{root}/energy/{report_number}'"),
                 (13, "root + '/energy/' + report_number"),
                 (15, "os.path.join(annotated_root, 'energy', report_number)"),
+                (17, "joiner(app.config['UPLOAD_FOLDER'], 'energy', report_number)"),
+                (19, "path_root / 'energy' / report_number"),
             ],
             visitor.violations,
         )
@@ -280,6 +309,10 @@ unsafe_select = "SELECT username FROM reports WHERE report_number = ?"
 unsafe_update = "UPDATE reports SET username = ? WHERE report_number = ?"
 unsafe_parts = "SELECT * FROM " + "reports WHERE report_number = ?"
 unsafe_dynamic = f"SELECT * FROM reports WHERE report_number = {report_number}"
+unsafe_in = "SELECT * FROM reports WHERE report_number IN (?)"
+unsafe_is = "SELECT * FROM reports WHERE report_number IS ?"
+unsafe_format = "SELECT * FROM {} WHERE report_number = ?".format("reports")
+safe_in = "SELECT * FROM reports WHERE username IN (?) AND report_number = ?"
 safe = "SELECT username FROM reports WHERE username = ? AND report_number = ?"
 """
         )
@@ -289,9 +322,24 @@ safe = "SELECT username FROM reports WHERE username = ? AND report_number = ?"
                 (3, "UPDATE reports SET username = ? WHERE report_number = ?"),
                 (4, "SELECT * FROM reports WHERE report_number = ?"),
                 (5, "SELECT * FROM reports WHERE report_number = <dynamic>"),
+                (6, "SELECT * FROM reports WHERE report_number IN (?)"),
+                (7, "SELECT * FROM reports WHERE report_number IS ?"),
+                (8, "SELECT * FROM reports WHERE report_number = ?"),
             ],
             _unsafe_report_sql_literals(tree),
         )
+
+    def test_scope_aliases_do_not_leak_between_functions(self):
+        tree = ast.parse("""
+def first():
+    root = app.config["UPLOAD_FOLDER"]
+    return root
+def second():
+    return os.path.join(root, "energy", report_number)
+""")
+        visitor = _DirectEnergyPathVisitor()
+        visitor.visit(tree)
+        self.assertEqual([], visitor.violations)
 
     def test_read_only_preflight_accepts_only_persisted_owner_keys(self):
         from tools.user_report_storage_preflight import StorageLayoutError, validate_layout
@@ -308,12 +356,12 @@ safe = "SELECT username FROM reports WHERE username = ? AND report_number = ?"
 
             valid_report = uploads / "energy" / "alice-2bd806c9" / "BIM-1"
             valid_report.mkdir(parents=True)
-            validate_layout(db_path, uploads)
+            validate_layout(db_path, uploads, runtime_root=root)
 
             legacy = uploads / "energy" / "BIM-deadbeef"
             legacy.mkdir()
             with self.assertRaisesRegex(StorageLayoutError, "BIM-deadbeef"):
-                validate_layout(db_path, uploads)
+                validate_layout(db_path, uploads, runtime_root=root)
 
     def test_read_only_preflight_rejects_unknown_and_empty_persisted_owners(self):
         from tools.user_report_storage_preflight import StorageLayoutError, validate_layout
@@ -379,6 +427,8 @@ safe = "SELECT username FROM reports WHERE username = ? AND report_number = ?"
                     str(db_path),
                     "--uploads",
                     str(uploads),
+                    "--runtime-root",
+                    str(root),
                 ],
                 cwd=root,
                 capture_output=True,
@@ -437,6 +487,7 @@ safe = "SELECT username FROM reports WHERE username = ? AND report_number = ?"
         )
         positions = [rollout.index(step) for step in ordered_steps]
         self.assertEqual(positions, sorted(positions))
+        self.assertLess(rollout.index('[ ! -e "$backup_dir" ]'), rollout.index('install -d -m 0700 "$backup_dir"'))
         self.assertIn("完成两点比例尺标定", rollout)
         self.assertNotIn("必要时两点比例尺标定", rollout)
 
@@ -450,10 +501,14 @@ safe = "SELECT username FROM reports WHERE username = ? AND report_number = ?"
             "[ ! -e \"$stash_root\" ]",
             "[ -f \"$snapshot_dir/users.db\" ]",
             "[ -d \"$snapshot_dir/uploads\" ]",
+            "[ -f \"$snapshot_dir/release-before\" ]",
+            "rollback_commit=$(sed -n",
         ):
             with self.subTest(required=required):
                 self.assertIn(required, rollback)
         self.assertLess(rollback.index("systemctl stop bim-web"), rollback.index("mv /var/lib/bim-web/users.db"))
+        self.assertLess(rollback.index("release-before"), rollback.index("systemctl stop bim-web"))
+        self.assertNotIn("REPLACE_WITH_VERIFIED_COMMIT", rollback)
 
     def test_generic_update_and_rollback_sections_route_to_safe_procedure(self):
         deploy_guide = (ROOT / "deploy/README.md").read_text(encoding="utf-8")

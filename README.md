@@ -248,24 +248,10 @@ sudo cp -a /var/lib/bim-web/users.db "$backup_dir/users.db"
 sudo cp -a /var/lib/bim-web/uploads "$backup_dir/uploads"
 ```
 
-仅在上述预检通过后才可拉取代码并启动服务；应用会在启动时以事务迁移
-`reports` 的 `(username, report_number)` 身份。若迁移、启动或验证失败，保持服务
-停止，不要让旧代码读取新结构。将代码切回已验证提交，并从同一 `$backup_dir` 恢复
-`users.db` 与 `uploads` 后再启动：
-
-```bash
-sudo systemctl stop bim-web
-runuser -u bimweb -- git -C /opt/bim-web/app switch --detach <已验证提交>
-failed_runtime=/var/lib/bim-web/failed-user-scope-$(date +%Y%m%d-%H%M%S)
-sudo install -d -m 0700 "$failed_runtime"
-sudo mv /var/lib/bim-web/users.db "$failed_runtime/users.db"
-sudo mv /var/lib/bim-web/uploads "$failed_runtime/uploads"
-sudo cp -a "$backup_dir/users.db" /var/lib/bim-web/users.db
-sudo cp -a "$backup_dir/uploads" /var/lib/bim-web/uploads
-sudo chown bimweb:bimweb /var/lib/bim-web/users.db
-sudo chown -R bimweb:bimweb /var/lib/bim-web/uploads
-sudo systemctl start bim-web
-```
+仅在上述预检通过后才可拉取代码、运行源码审计并启动服务；应用会在启动时以事务
+迁移 `reports` 的 `(username, report_number)` 身份。若迁移、启动或验证失败，保持
+服务停止，不要让旧代码读取新结构。回滚必须使用部署指南的 12.2 已校验快照流程，
+不能只切换代码或直接覆盖运行目录。
 
 该发布由应用启动时的 SQLite **事务**迁移完成。上线后应让两个普通账号用相同的
 报告编号测试隔离，确认跨用户请求返回 `HTTP 403`，再让管理员显式访问两人的
@@ -527,37 +513,12 @@ git push origin main
 
 ## 13. 服务器更新网站
 
-本地修改测试并推送 GitHub 后，在服务器以 root 登录，但让仓库 Git 命令
-始终由 `bimweb` 执行：
-
-```bash
-runuser -u bimweb -- \
-  git -C /opt/bim-web/app fetch origin main
-
-runuser -u bimweb -- \
-  git -C /opt/bim-web/app status --short --branch
-
-runuser -u bimweb -- \
-  git -C /opt/bim-web/app pull --ff-only origin main
-
-runuser -u bimweb -- \
-  /opt/bim-web/venv/bin/pip install \
-  -r /opt/bim-web/app/requirements.txt \
-  -c /opt/bim-web/app/requirements-runtime-constraints.txt
-
-systemctl restart bim-web
-systemctl status bim-web --no-pager
-```
-
-验证：
-
-```bash
-curl -I http://127.0.0.1:8000/login
-curl http://127.0.0.1:8000/energy/ai_status
-journalctl -u bim-web -n 50 --no-pager
-```
-
-最后用浏览器验证登录、PDF 选页、识别、材料选择和计算。
+本地修改测试并推送 GitHub 后，服务器更新**只能**执行
+[部署指南 12.1 的用户隔离报告存储发布](deploy/README.md#121-用户隔离报告存储发布必须停服并执行)。
+该流程以 root 协调服务和快照、让 `bimweb` 执行仓库命令，并强制停服、备份、拉取、
+源码审计、只读预检、事务启动以及两用户/管理员/完整 PDF 验证；禁止单独
+`git pull` 后重启。若其中任一步失败，必须转入部署指南 12.2 的已校验快照回滚，
+不能自行改动运行目录。
 
 不要按 Git 的提示给 root 添加全局 `safe.directory`。仓库属于 `bimweb`，
 以后都使用：
@@ -570,11 +531,11 @@ runuser -u bimweb -- git -C /opt/bim-web/app <Git 子命令>
 
 | 修改内容 | 额外操作 |
 |---|---|
-| Python、HTML、CSS、JavaScript | `git pull` 后重启 `bim-web` |
-| `requirements.txt` | 重装依赖后重启 |
-| `deploy/bim-web.service` | 复制到 `/etc/systemd/system/`，`daemon-reload` 后重启 |
-| `deploy/nginx-bim-web.conf` | 复制站点配置，`nginx -t` 后 reload |
-| 正式材料 SQLite 库 | 更新前备份数据库，拉取后重启 |
+| Python、HTML、CSS、JavaScript | 完整执行部署指南 12.1 |
+| `requirements.txt` | 完整执行部署指南 12.1（包含受约束依赖安装） |
+| `deploy/bim-web.service` | 复制服务文件、`daemon-reload`，再完整执行 12.1 |
+| `deploy/nginx-bim-web.conf` | 复制站点配置、`nginx -t`、reload；若同时更新应用，执行 12.1 |
+| 正式材料 SQLite 库 | 先建立一致性快照，再完整执行部署指南 12.1 |
 | ONNX 模型 | 不走 GitHub，按下一节单独上传和切换 |
 
 ## 14. 更新 ONNX 模型
@@ -761,37 +722,12 @@ systemctl status bim-web --no-pager
 
 ## 17. 代码回退
 
-先查看版本：
-
-```bash
-runuser -u bimweb -- \
-  git -C /opt/bim-web/app log --oneline -10
-```
-
-临时切换到确认过的提交：
-
-```bash
-runuser -u bimweb -- \
-  git -C /opt/bim-web/app switch --detach COMMIT_HASH
-
-systemctl restart bim-web
-systemctl status bim-web --no-pager
-```
-
-恢复正式分支：
-
-```bash
-runuser -u bimweb -- \
-  git -C /opt/bim-web/app switch main
-
-runuser -u bimweb -- \
-  git -C /opt/bim-web/app pull --ff-only origin main
-
-systemctl restart bim-web
-```
-
-代码回退不会自动回退模型、用户库、上传结果或环境变量；这些内容需要分别
-管理版本和备份。
+代码、用户库和上传结果必须作为同一版本回滚。禁止只执行 `git switch` 或单独重启；
+使用[部署指南 12.2 的用户隔离报告存储回滚](deploy/README.md#122-用户隔离报告存储回滚)，
+它会在任何移动前验证快照路径、清单、运行目录和暂存目录，再停止服务并一致地恢复
+代码、`users.db` 与 `uploads`。代码回退不会自动回退模型或环境变量；两者需要在
+确认兼容性后另行受控处理。恢复后如需重新发布，仍必须从部署指南 12.1 的完整流程
+开始。
 
 ## 18. 常见问题
 

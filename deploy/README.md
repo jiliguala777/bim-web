@@ -360,10 +360,12 @@ sudo tail -n 100 /var/log/nginx/error.log
 `<...>` 均为需要操作员明确替换的占位符。
 
 1. 记录当前代码，停止服务，完成两个独立的显式备份。停止服务是为了让
-   `users.db` 与 `uploads` 的备份保持同一时点：
+   `users.db` 与 `uploads` 的备份保持同一时点。下面的清单把数据库和上传文件绑定到
+   同一个可验证快照，回滚时必须校验它：
 
    ```bash
-   runuser -u bimweb -- git -C /opt/bim-web/app rev-parse HEAD
+   set -euo pipefail
+   release_before=$(runuser -u bimweb -- git -C /opt/bim-web/app rev-parse HEAD)
    sudo systemctl stop bim-web
    sudo systemctl is-active --quiet bim-web && exit 1
 
@@ -371,51 +373,56 @@ sudo tail -n 100 /var/log/nginx/error.log
    sudo install -d -m 0700 "$backup_dir"
    sudo cp -a /var/lib/bim-web/users.db "$backup_dir/users.db"
    sudo cp -a /var/lib/bim-web/uploads "$backup_dir/uploads"
+   printf 'release_before=%s\n' "$release_before" | sudo tee "$backup_dir/release-before" >/dev/null
+   sudo sh -c "cd '$backup_dir' && find users.db uploads -type f -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS"
+   sudo test -s "$backup_dir/SHA256SUMS"
    sudo ls -ld "$backup_dir" "$backup_dir/users.db" "$backup_dir/uploads"
    ```
 
-2. 在服务仍停止时执行平面目录预检。它只检查并在异常时退出；不会移动、重命名或
-   删除数据。新目录的第一层必须是安全用户名目录键，且该层下只能有报告目录：
-
-   ```bash
-   sudo /opt/bim-web/venv/bin/python - <<'PY'
-   from pathlib import Path
-   import re
-   import sys
-
-   root = Path('/var/lib/bim-web/uploads/energy')
-   owner_key = re.compile(r'.+-[0-9a-f]{8}\Z')
-   problems = []
-   if root.exists():
-       for entry in root.iterdir():
-           if not entry.is_dir() or not owner_key.fullmatch(entry.name):
-               problems.append(str(entry))
-               continue
-           problems.extend(str(child) for child in entry.iterdir() if not child.is_dir())
-   if problems:
-       print('ABORT: detected legacy flat report path or invalid energy layout:', file=sys.stderr)
-       print('\n'.join(problems), file=sys.stderr)
-       raise SystemExit(1)
-   print('Preflight passed: no flat legacy report directories found.')
-   PY
-   ```
-
-   预检失败时保持服务停止，不执行 `git pull`，保留备份，并报告列出的路径。不要以
-   手工移动或删除来绕过门禁。
-
-3. 预检通过后拉取已验证代码并启动服务。应用启动时会在 SQLite **事务**中完成
-   `reports` 的复合身份迁移和索引创建；迁移抛出异常时必须视为发布失败，不应继续
-   写入：
+2. 服务保持停止。拉取待发布代码（以及需要时的 Python 依赖），但不要启动服务：
 
    ```bash
    runuser -u bimweb -- git -C /opt/bim-web/app fetch origin main
    runuser -u bimweb -- git -C /opt/bim-web/app pull --ff-only origin main
+   runuser -u bimweb -- /opt/bim-web/venv/bin/pip install \
+     -r /opt/bim-web/app/requirements.txt \
+     -c /opt/bim-web/app/requirements-runtime-constraints.txt
+   ```
+
+3. 在服务仍停止时，先运行源审计和部署资产测试，再运行只读平面目录预检。预检从
+   实际 `users.db` 的 `reports.username` 计算**精确**安全用户名目录键；例如旧平面
+   报告目录 `BIM-deadbeef` 不会因看起来像哈希后缀而通过。它只读取 SQLite 和目录
+   项，异常时退出；不会移动、重命名或删除数据：
+
+   ```bash
+   runuser -u bimweb -- sh -c '
+     cd /opt/bim-web/app &&
+     /opt/bim-web/venv/bin/python -m unittest \
+       tests.test_energy_report_path_audit tests.test_deployment_assets -v
+   '
+   runuser -u bimweb -- sh -c '
+     cd /opt/bim-web/app &&
+     /opt/bim-web/venv/bin/python tools/user_report_storage_preflight.py \
+       --db /var/lib/bim-web/users.db \
+       --uploads /var/lib/bim-web/uploads
+   '
+   ```
+
+   审计或预检失败时保持服务停止，不执行启动或迁移，保留备份并报告失败信息。不要以
+   手工移动或删除来绕过门禁；若需要撤销尚未启动的新代码，先恢复
+   `$release_before`，再重新评估。
+
+4. 审计和预检均通过后才启动服务。应用启动时会在 SQLite **事务**中完成
+   `reports` 的复合身份迁移和索引创建；迁移抛出异常时必须视为发布失败，不应继续
+   写入：
+
+   ```bash
    sudo systemctl start bim-web
    sudo systemctl status bim-web --no-pager
    sudo journalctl -u bim-web -n 200 --no-pager
    ```
 
-4. 完成以下上线验证，至少保留浏览器截图、报告编号和日志时间戳：
+5. 完成以下上线验证，至少保留浏览器截图、报告编号和日志时间戳：
 
    - 用两个普通测试账号分别创建相同的报告编号；确认它们位于两个不同的
      `<安全用户名目录>/<报告编号>/`，SQLite 也有两条 `(username, report_number)`
@@ -425,29 +432,47 @@ sudo tail -n 100 /var/log/nginx/error.log
    - 用配置好的管理员登录，显式选择并打开两个普通账号的报告；管理员可以查看，
      普通账号不能通过猜测目录或报告编号越权；
    - 对其中一个普通账号完成完整 PDF 流程：上传 PDF、读取并选择页面、AI 识别、
-     必要时两点比例尺标定、材料/参数设置、能耗计算和历史报告读取。确认产物仍在
+     完成两点比例尺标定、材料/参数设置、能耗计算和历史报告读取。确认产物仍在
      该账号的报告目录，重启服务后记录和产物仍存在。
 
-5. 若任一步失败，使用下面的回滚步骤。不要在服务运行时替换数据库或上传目录。
+6. 若任一步失败，使用下面的回滚步骤。不要在服务运行时替换数据库或上传目录。
 
 ### 12.2 用户隔离报告存储回滚
 
-回滚必须同时恢复代码、`users.db` 和 `uploads` 到同一个发布前备份，避免旧代码与
-新结构混用。将 `<已验证提交>` 和 `<发布前备份目录>` 替换为步骤 1 中实际记录的值：
+回滚必须同时恢复代码、`users.db` 和 `uploads` 到同一个已校验发布前快照，避免旧
+代码与新结构混用。下面所有验证都在任何移动前完成；将 `<已验证提交>` 和
+`<发布前备份目录>` 替换为步骤 1 中实际记录的值。
 
 ```bash
+set -euo pipefail
+
+snapshot_input='/var/backups/bim-web/REPLACE_WITH_RELEASE_SNAPSHOT'
+snapshot_dir=$(realpath -e -- "$snapshot_input")
+backup_root=$(realpath -e -- /var/backups/bim-web)
+live_root=$(realpath -e -- /var/lib/bim-web)
+case "$snapshot_dir" in "$backup_root"/*) ;; *) echo 'ABORT: snapshot is outside backup root' >&2; exit 1;; esac
+[ -f "$snapshot_dir/users.db" ]
+[ -d "$snapshot_dir/uploads" ]
+[ -f "$snapshot_dir/SHA256SUMS" ]
+( cd "$snapshot_dir" && sha256sum -c SHA256SUMS )
+[ -f "$live_root/users.db" ]
+[ -d "$live_root/uploads" ]
+
+rollback_commit='REPLACE_WITH_VERIFIED_COMMIT'
+runuser -u bimweb -- git -C /opt/bim-web/app rev-parse --verify "$rollback_commit^{commit}" >/dev/null
+stash_root="$live_root/failed-user-scope-$(date +%Y%m%d-%H%M%S)"
+[ ! -e "$stash_root" ]
+
 sudo systemctl stop bim-web
 sudo systemctl is-active --quiet bim-web && exit 1
-
 runuser -u bimweb -- \
-  git -C /opt/bim-web/app switch --detach <已验证提交>
+  git -C /opt/bim-web/app switch --detach "$rollback_commit"
 
-failed_runtime=/var/lib/bim-web/failed-user-scope-$(date +%Y%m%d-%H%M%S)
-sudo install -d -m 0700 "$failed_runtime"
-sudo mv /var/lib/bim-web/users.db "$failed_runtime/users.db"
-sudo mv /var/lib/bim-web/uploads "$failed_runtime/uploads"
-sudo cp -a <发布前备份目录>/users.db /var/lib/bim-web/users.db
-sudo cp -a <发布前备份目录>/uploads /var/lib/bim-web/uploads
+sudo install -d -m 0700 "$stash_root"
+sudo mv /var/lib/bim-web/users.db "$stash_root/users.db"
+sudo mv /var/lib/bim-web/uploads "$stash_root/uploads"
+sudo cp -a "$snapshot_dir/users.db" /var/lib/bim-web/users.db
+sudo cp -a "$snapshot_dir/uploads" /var/lib/bim-web/uploads
 sudo chown bimweb:bimweb /var/lib/bim-web/users.db
 sudo chown -R bimweb:bimweb /var/lib/bim-web/uploads
 
@@ -457,62 +482,15 @@ sudo journalctl -u bim-web -n 200 --no-pager
 ```
 
 恢复后先用普通账号和管理员登录各验证一次，并重跑一条完整 PDF 流程；确认无误后
-再决定是否回到 `main`。回滚不会删除故障版本的数据副本；`$failed_runtime` 和备份
+再决定是否回到 `main`。回滚不会删除故障版本的数据副本；`$stash_root` 和备份
 目录都应保留给排障。
 
-在本地完成修改、测试并推送私人 GitHub 后，在服务器执行：
-
-```bash
-runuser -u bimweb -- \
-  git -C /opt/bim-web/app fetch origin main
-
-runuser -u bimweb -- \
-  git -C /opt/bim-web/app status --short --branch
-
-runuser -u bimweb -- \
-  git -C /opt/bim-web/app pull --ff-only origin main
-
-runuser -u bimweb -- \
-  /opt/bim-web/venv/bin/pip install \
-  -r /opt/bim-web/app/requirements.txt \
-  -c /opt/bim-web/app/requirements-runtime-constraints.txt
-
-sudo systemctl restart bim-web
-sudo systemctl status bim-web --no-pager
-```
-
-若模型没有变化，不需要重新上传模型。若数据库结构或正式数据库变化，应在更新前单独备份 `/var/lib/bim-web`。
+其他任何代码、依赖或数据更新也必须完整执行 12.1；禁止使用单独的
+`git pull` 加重启来绕过停服、快照、审计和预检门禁。
 
 ## 13. 回退
 
-代码回退前先记录当前版本：
-
-```bash
-runuser -u bimweb -- \
-  git -C /opt/bim-web/app log --oneline -10
-```
-
-选择已经验证过的提交后再切换并重启：
-
-```bash
-runuser -u bimweb -- \
-  git -C /opt/bim-web/app switch --detach <已确认的提交哈希>
-
-sudo systemctl restart bim-web
-sudo systemctl status bim-web --no-pager
-```
-
-模型、上传文件、用户数据库和环境变量均在代码目录之外，不会因代码回退被
-覆盖。完成排障后回到正式发布分支：
-
-```bash
-runuser -u bimweb -- \
-  git -C /opt/bim-web/app switch main
-
-runuser -u bimweb -- \
-  git -C /opt/bim-web/app pull --ff-only origin main
-
-sudo systemctl restart bim-web
-```
-
-不要长期停留在 detached HEAD。
+禁止代码单独回退：它会使代码、数据库和上传目录处于不同版本。所有回退均必须使用
+12.2 的已校验快照恢复流程；它会先验证目标、服务状态、快照完整性和暂存目录，再
+停止服务并一致地恢复三者。不要长期停留在 detached HEAD；完成排障后，仍通过 12.1
+回到正式分支。

@@ -79,7 +79,7 @@ def _render_sql_expression(node, names):
     if isinstance(node, ast.Constant) and isinstance(node.value, str):
         return node.value
     if isinstance(node, ast.Name):
-        return names.get(node.id)
+        return names.get(node.id, "<dynamic>")
     if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
         left = _render_sql_expression(node.left, names)
         right = _render_sql_expression(node.right, names)
@@ -105,7 +105,7 @@ def _render_sql_expression(node, names):
 
 def _is_unsafe_report_sql(query):
     normalized = re.sub(r"\s+", " ", query).lower()
-    if not re.search(r"\b(?:from|update|delete\s+from)\s+reports\b", normalized):
+    if not re.search(r"\b(?:from|update|delete\s+from)\s+(?:reports\b|<dynamic>)", normalized):
         return False
     if "where" not in normalized:
         return False
@@ -184,7 +184,7 @@ class _DirectEnergyPathVisitor(ast.NodeVisitor):
 
     def visit_FunctionDef(self, node):
         saved_roots, saved_joins = self._upload_root_aliases, self._join_aliases
-        self._upload_root_aliases, self._join_aliases = set(), set(saved_joins)
+        self._upload_root_aliases, self._join_aliases = set(saved_roots), set(saved_joins)
         self.generic_visit(node)
         self._upload_root_aliases, self._join_aliases = saved_roots, saved_joins
 
@@ -201,8 +201,7 @@ class _DirectEnergyPathVisitor(ast.NodeVisitor):
         names = [target.id for target in targets if isinstance(target, ast.Name)]
         is_path_upload_root = (
             isinstance(value, ast.Call)
-            and isinstance(value.func, ast.Name)
-            and value.func.id == "Path"
+            and ((isinstance(value.func, ast.Name) and value.func.id == "Path") or (isinstance(value.func, ast.Attribute) and value.func.attr == "Path"))
             and value.args
             and _is_upload_folder_config(value.args[0])
         )
@@ -280,6 +279,15 @@ joiner = os.path.join
 legacy_joiner = joiner(app.config["UPLOAD_FOLDER"], "energy", report_number)
 path_root = Path(app.config["UPLOAD_FOLDER"])
 legacy_path_root = path_root / "energy" / report_number
+module_root = app.config["UPLOAD_FOLDER"]
+def route():
+    return os.path.join(module_root, "energy", report_number)
+def outer():
+    enclosing_root = app.config["UPLOAD_FOLDER"]
+    def inner():
+        return os.path.join(enclosing_root, "energy", report_number)
+pathlib_root = pathlib.Path(app.config["UPLOAD_FOLDER"])
+legacy_pathlib_root = pathlib_root / "energy" / report_number
 operations = os.path.join(app.config["UPLOAD_FOLDER"], "ops", "bestest")
 """
         )
@@ -298,6 +306,9 @@ operations = os.path.join(app.config["UPLOAD_FOLDER"], "ops", "bestest")
                 (15, "os.path.join(annotated_root, 'energy', report_number)"),
                 (17, "joiner(app.config['UPLOAD_FOLDER'], 'energy', report_number)"),
                 (19, "path_root / 'energy' / report_number"),
+                (22, "os.path.join(module_root, 'energy', report_number)"),
+                (26, "os.path.join(enclosing_root, 'energy', report_number)"),
+                (28, "pathlib_root / 'energy' / report_number"),
             ],
             visitor.violations,
         )
@@ -312,6 +323,8 @@ unsafe_dynamic = f"SELECT * FROM reports WHERE report_number = {report_number}"
 unsafe_in = "SELECT * FROM reports WHERE report_number IN (?)"
 unsafe_is = "SELECT * FROM reports WHERE report_number IS ?"
 unsafe_format = "SELECT * FROM {} WHERE report_number = ?".format("reports")
+unsafe_dynamic_format = "SELECT * FROM reports WHERE report_number = {}".format(value)
+unsafe_dynamic_table = "SELECT * FROM {} WHERE report_number = ?".format(table)
 safe_in = "SELECT * FROM reports WHERE username IN (?) AND report_number = ?"
 safe = "SELECT username FROM reports WHERE username = ? AND report_number = ?"
 """
@@ -325,6 +338,8 @@ safe = "SELECT username FROM reports WHERE username = ? AND report_number = ?"
                 (6, "SELECT * FROM reports WHERE report_number IN (?)"),
                 (7, "SELECT * FROM reports WHERE report_number IS ?"),
                 (8, "SELECT * FROM reports WHERE report_number = ?"),
+                (9, "SELECT * FROM reports WHERE report_number = <dynamic>"),
+                (10, "SELECT * FROM <dynamic> WHERE report_number = ?"),
             ],
             _unsafe_report_sql_literals(tree),
         )
@@ -377,7 +392,7 @@ def second():
             conn.close()
             (uploads / "energy" / "unknown-deadbeef").mkdir(parents=True)
             with self.assertRaisesRegex(StorageLayoutError, "unknown-deadbeef"):
-                validate_layout(db_path, uploads)
+                validate_layout(db_path, uploads, runtime_root=root)
 
             (uploads / "energy" / "unknown-deadbeef").rmdir()
             conn = sqlite3.connect(db_path)
@@ -385,7 +400,7 @@ def second():
             conn.commit()
             conn.close()
             with self.assertRaisesRegex(StorageLayoutError, "empty username"):
-                validate_layout(db_path, uploads)
+                validate_layout(db_path, uploads, runtime_root=root)
 
     def test_preflight_does_not_mutate_a_rejected_layout(self):
         from tools.user_report_storage_preflight import StorageLayoutError, validate_layout
@@ -403,7 +418,7 @@ def second():
             legacy.mkdir(parents=True)
             before = sorted(path.relative_to(root).as_posix() for path in root.rglob("*"))
             with self.assertRaises(StorageLayoutError):
-                validate_layout(db_path, uploads)
+                validate_layout(db_path, uploads, runtime_root=root)
             after = sorted(path.relative_to(root).as_posix() for path in root.rglob("*"))
             self.assertEqual(before, after)
 

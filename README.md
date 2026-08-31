@@ -239,14 +239,8 @@ Gunicorn 只监听 `127.0.0.1:8000`，不要在腾讯云防火墙中开放 8000 
 `deploy/README.md` 的“用户隔离报告存储发布”预检。预检发现平面目录时必须中止；
 **不自动移动或删除**旧数据。
 
-```bash
-sudo systemctl stop bim-web
-sudo systemctl is-active --quiet bim-web && exit 1
-backup_dir=/var/backups/bim-web/user-scope-$(date +%Y%m%d-%H%M%S)
-sudo install -d -m 0700 "$backup_dir"
-sudo cp -a /var/lib/bim-web/users.db "$backup_dir/users.db"
-sudo cp -a /var/lib/bim-web/uploads "$backup_dir/uploads"
-```
+不要在本 README 复制执行快照命令；必须使用部署指南 12.1 的唯一、带目标碰撞检查和
+校验清单的快照块。
 
 仅在上述预检通过后才可拉取代码、运行源码审计并启动服务；应用会在启动时以事务
 迁移 `reports` 的 `(username, report_number)` 身份。若迁移、启动或验证失败，保持

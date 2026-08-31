@@ -37,7 +37,7 @@ def _persisted_owner_keys(db_path: Path) -> set[str]:
     return keys
 
 
-def validate_layout(db_path: str | Path, uploads_root: str | Path, *, runtime_root: str | Path | None = None) -> None:
+def validate_layout(db_path: str | Path, uploads_root: str | Path, *, runtime_root: str | Path) -> None:
     """Fail closed unless every top-level energy entry is a persisted owner key.
 
     The function only reads SQLite metadata and directory entries. It never creates,
@@ -46,17 +46,16 @@ def validate_layout(db_path: str | Path, uploads_root: str | Path, *, runtime_ro
 
     db_path = Path(db_path)
     uploads_root = Path(uploads_root)
-    if runtime_root is not None:
-        runtime_root = Path(runtime_root)
-        if runtime_root.is_symlink() or not runtime_root.is_dir():
-            raise StorageLayoutError(f"runtime root is not a real directory: {runtime_root}")
-        runtime_root = runtime_root.resolve(strict=True)
-        if db_path.is_symlink() or uploads_root.is_symlink():
-            raise StorageLayoutError("database and uploads root must not be symlinks")
-        if db_path.parent.resolve(strict=True) != runtime_root or uploads_root.parent.resolve(strict=True) != runtime_root:
-            raise StorageLayoutError("database and uploads root must be direct runtime-root children")
-        if db_path.name != "users.db" or uploads_root.name != "uploads" or not uploads_root.is_dir():
-            raise StorageLayoutError("expected direct users.db file and uploads directory")
+    runtime_root = Path(runtime_root)
+    if runtime_root.is_symlink() or not runtime_root.is_dir():
+        raise StorageLayoutError(f"runtime root is not a real directory: {runtime_root}")
+    runtime_root = runtime_root.resolve(strict=True)
+    if db_path.is_symlink() or uploads_root.is_symlink():
+        raise StorageLayoutError("database and uploads root must not be symlinks")
+    if db_path.parent.resolve(strict=True) != runtime_root or uploads_root.parent.resolve(strict=True) != runtime_root:
+        raise StorageLayoutError("database and uploads root must be direct runtime-root children")
+    if db_path.name != "users.db" or uploads_root.name != "uploads" or not uploads_root.is_dir():
+        raise StorageLayoutError("expected direct users.db file and uploads directory")
     owner_keys = _persisted_owner_keys(db_path)
     energy_root = uploads_root / "energy"
     if not energy_root.exists():

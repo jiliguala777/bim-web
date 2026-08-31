@@ -375,7 +375,7 @@ sudo tail -n 100 /var/log/nginx/error.log
    sudo cp -a /var/lib/bim-web/users.db "$backup_dir/users.db"
    sudo cp -a /var/lib/bim-web/uploads "$backup_dir/uploads"
    printf 'release_before=%s\n' "$release_before" | sudo tee "$backup_dir/release-before" >/dev/null
-   sudo sh -c "cd '$backup_dir' && find users.db uploads -type f -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS"
+   sudo sh -c "cd '$backup_dir' && find users.db uploads release-before -type f -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS"
    sudo test -s "$backup_dir/SHA256SUMS"
    sudo ls -ld "$backup_dir" "$backup_dir/users.db" "$backup_dir/uploads"
    ```

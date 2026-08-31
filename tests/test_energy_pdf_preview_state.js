@@ -14,6 +14,15 @@ const prepareFunctionMatch = html.match(
 const functionMatch = html.match(
   /function pdfPreviewRequestMatchesCurrent\([\s\S]*?\n        \}/
 );
+const normalizedReportNumberMatch = html.match(
+  /function normalizedReportNumber\([\s\S]*?\n        \}/
+);
+const normalizedReportOwnerMatch = html.match(
+  /function normalizedReportOwnerUsername\([\s\S]*?\n        \}/
+);
+const selectionFunctionMatch = html.match(
+  /function currentPdfRecognitionSelection\([\s\S]*?\n        \}/
+);
 
 assert.ok(
   prepareFunctionMatch,
@@ -22,6 +31,18 @@ assert.ok(
 assert.ok(
   functionMatch,
   "energy template must define pdfPreviewRequestMatchesCurrent"
+);
+assert.ok(
+  normalizedReportNumberMatch,
+  "energy template must define normalizedReportNumber"
+);
+assert.ok(
+  normalizedReportOwnerMatch,
+  "energy template must normalize the active report owner"
+);
+assert.ok(
+  selectionFunctionMatch,
+  "energy template must bind recognition state to the active report identity"
 );
 
 const sandbox = {};
@@ -78,6 +99,47 @@ assert.strictEqual(
   previewMatchesCurrent(pageThreeRequest, 8, 16, "upload-a", "3"),
   false,
   "a stale image load callback must fail after a newer preview starts"
+);
+
+const ownerSelectionSandbox = {
+  EnergyPdfRecognitionState: recognitionState,
+  activeReportOwnerUsername: "alice",
+  preparedPdf: { uploadToken: "upload-a" },
+  pdfUploadSessionId: 8,
+  pdfRecognitionMode: "crop_region",
+  pdfCropBBox: [100, 50, 500, 350],
+  pdfPreviewSize: [800, 600],
+  document: {
+    getElementById(id) {
+      return {
+        value: id === "current-report-number" ? "SHARED-REPORT" : "2",
+      };
+    },
+  },
+};
+vm.runInNewContext(
+  `${normalizedReportNumberMatch[0]};
+  ${normalizedReportOwnerMatch[0]};
+  ${selectionFunctionMatch[0]};
+  selectionForActiveOwner = currentPdfRecognitionSelection;`,
+  ownerSelectionSandbox
+);
+const selectionForActiveOwner = ownerSelectionSandbox.selectionForActiveOwner;
+const ownerBoundRequests = recognitionState.createRecognitionRequestState();
+const aliceSelection = selectionForActiveOwner();
+const aliceRequest = ownerBoundRequests.begin(aliceSelection, { abort() {} }).request;
+ownerSelectionSandbox.activeReportOwnerUsername = "bob";
+const bobSelection = selectionForActiveOwner();
+assert.strictEqual(
+  ownerBoundRequests.canCommit(aliceRequest, bobSelection),
+  false,
+  "the pending recognition fingerprint must include the active owner"
+);
+ownerBoundRequests.invalidate();
+assert.strictEqual(
+  ownerBoundRequests.canCommit(aliceRequest, bobSelection),
+  false,
+  "switching owner with the same report number must invalidate pending recognition"
 );
 
 const behaviorFailures = [];

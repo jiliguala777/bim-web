@@ -806,7 +806,7 @@ const context = {
 
     def test_history_restores_new_and_legacy_calculation_scope(self):
         html = Path("templates/energy.html").read_text(encoding="utf-8")
-        history_segment = html[html.index("async function loadReportDetails(repNum)"):html.index("function showLoader(text)")]
+        history_segment = html[html.index("async function loadReportDetails(repNum, ownerUsername)"):html.index("function showLoader(text)")]
 
         self.assertIn("function inferCalculationEnabled", html)
         self.assertIn("typeof section.enabled === 'boolean'", html)
@@ -815,9 +815,34 @@ const context = {
         self.assertIn("document.getElementById('calculate-cooling').checked", history_segment)
         self.assertIn("updateCalculationScopeControls();", history_segment)
 
+    def test_administrator_history_preserves_owner_identity_in_requests(self):
+        html = Path("templates/energy.html").read_text(encoding="utf-8")
+        history_segment = html[
+            html.index("async function openHistoryDrawer()")
+            :html.index("function closeHistoryDrawer()")
+        ]
+        detail_segment = html[
+            html.index("async function loadReportDetails(repNum, ownerUsername)")
+            :html.index("function showLoader(text)")
+        ]
+
+        self.assertIn("activeReportOwnerUsername", html)
+        self.assertIn("item.username", history_segment)
+        self.assertIn("item.report_number", history_segment)
+        self.assertIn("loadReportDetails(item.report_number, item.username)", history_segment)
+        self.assertIn("async function loadReportDetails(repNum, ownerUsername)", html)
+        self.assertIn("owner_username", history_segment)
+        self.assertIn("function reportDetailsUrl", html)
+        self.assertIn("params.set('owner_username', activeReportOwnerUsername)", html)
+        self.assertIn("fetch(reportDetailsUrl(repNum))", detail_segment)
+        self.assertIn("function appendActiveReportOwnerToFormData", html)
+        self.assertIn("function withActiveReportOwner", html)
+        self.assertIn("formData.append('owner_username', activeReportOwnerUsername)", html)
+        self.assertIn("owner_username: activeReportOwnerUsername", html)
+
     def test_results_mark_disabled_calculation_scope_as_not_enabled(self):
         html = Path("templates/energy.html").read_text(encoding="utf-8")
-        display_segment = html[html.index("function displayResults(data)"):html.index("async function loadReportDetails(repNum)")]
+        display_segment = html[html.index("function displayResults(data)"):html.index("async function loadReportDetails(repNum, ownerUsername)")]
 
         self.assertIn("data.calculation_scope", display_segment)
         self.assertIn("未启用（本报告不计算", display_segment)
@@ -864,7 +889,7 @@ const context = {
         html = Path("templates/energy.html").read_text(encoding="utf-8")
         goto_segment = html[html.index("function gotoStep(step)"):html.index("// 上传与识别逻辑")]
         calculate_segment = html[html.index("async function calculateEnergy()"):html.index("function displayResults(data)")]
-        history_segment = html[html.index("async function loadReportDetails(repNum)"):html.index("function showLoader(text)")]
+        history_segment = html[html.index("async function loadReportDetails(repNum, ownerUsername)"):html.index("function showLoader(text)")]
 
         self.assertIn("let energyResultData = null;", html)
         self.assertIn("step === 4 && !energyResultData", goto_segment)

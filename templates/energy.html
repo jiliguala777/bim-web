@@ -844,7 +844,7 @@
         }
     </style>
 </head>
-<body>
+<body data-is-administrator="{{ (session.get('is_admin') is true)|tojson }}">
     <header>
         <div class="logo-container">
             <div class="logo-icon">B</div>
@@ -1702,7 +1702,9 @@
     <script>
         let currentStep = 1;
         let reportNumber = '';
+        let activeReportOwnerUsername = null;
         let acceptedRecognitionReportNumber = null;
+        let acceptedRecognitionOwnerUsername = null;
         let aiResultData = null;
         let pendingExteriorFusion = null;
         let preparedPdf = null;
@@ -1730,6 +1732,7 @@
         let energyCalculationRequestGeneration = 0;
         let activeEnergyCalculationRequestGeneration = null;
         let chartInstance = null;
+        const isAdministrator = document.body?.dataset?.isAdministrator === 'true';
         let wallAssemblyLibrary = [];
         let envelopeLibraries = {
             exterior_wall: [],
@@ -2388,8 +2391,9 @@
                 String(date.getMonth() + 1).padStart(2, '0') + 
                 String(date.getDate()).padStart(2, '0');
             const random = Math.floor(1000 + Math.random() * 9000);
-            reportNumber = `BIM-${yyyymmdd}-${random}`;
-            document.getElementById('current-report-number').value = reportNumber;
+            const nextReportNumber = `BIM-${yyyymmdd}-${random}`;
+            document.getElementById('current-report-number').value = nextReportNumber;
+            setActiveReportIdentity(nextReportNumber, null);
         }
 
         function setupScaleCalibrationCanvas() {
@@ -2534,13 +2538,13 @@
                 const response = await fetch('/energy/scale_calibration', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
+                    body: JSON.stringify(withActiveReportOwner({
                         report_number: acceptedRecognitionReportNumber,
                         point_a: calibrationPoints[0],
                         point_b: calibrationPoints[1],
                         actual_length: actualLength,
                         unit: document.getElementById('manual-scale-unit').value
-                    }),
+                    })),
                     signal: requestController.signal
                 });
                 const data = await response.json();
@@ -2659,15 +2663,86 @@
             return String(value || '').trim();
         }
 
+        function normalizedReportOwnerUsername(value) {
+            const username = String(value || '').trim();
+            return username || null;
+        }
+
+        function reportIdentityMatches(
+            leftOwnerUsername,
+            leftReportNumber,
+            rightOwnerUsername,
+            rightReportNumber
+        ) {
+            return (
+                normalizedReportOwnerUsername(leftOwnerUsername)
+                    === normalizedReportOwnerUsername(rightOwnerUsername)
+                && normalizedReportNumber(leftReportNumber)
+                    === normalizedReportNumber(rightReportNumber)
+            );
+        }
+
+        function appendActiveReportOwnerToFormData(formData) {
+            if (activeReportOwnerUsername) {
+                formData.append('owner_username', activeReportOwnerUsername);
+            }
+            return formData;
+        }
+
+        function withActiveReportOwner(payload) {
+            if (!activeReportOwnerUsername) return payload;
+            return {
+                ...payload,
+                owner_username: activeReportOwnerUsername
+            };
+        }
+
+        function reportDetailsUrl(repNum) {
+            const params = new URLSearchParams();
+            if (activeReportOwnerUsername) {
+                params.set('owner_username', activeReportOwnerUsername);
+            }
+            const query = params.toString();
+            return `/energy/report/${encodeURIComponent(repNum)}${query ? `?${query}` : ''}`;
+        }
+
+        function clearReportIdentityState() {
+            resetPreparedPdfSelection();
+            resetVectorRasterSelection();
+        }
+
+        function setActiveReportIdentity(nextReportNumber, nextOwnerUsername) {
+            const normalizedReport = normalizedReportNumber(nextReportNumber);
+            const normalizedOwner = isAdministrator
+                ? normalizedReportOwnerUsername(nextOwnerUsername)
+                : null;
+            const identityChanged = !reportIdentityMatches(
+                activeReportOwnerUsername,
+                reportNumber,
+                normalizedOwner,
+                normalizedReport
+            );
+            reportNumber = normalizedReport;
+            activeReportOwnerUsername = normalizedOwner;
+            if (identityChanged) {
+                clearReportIdentityState();
+            }
+            updateCalculateEnergyAvailability();
+            return identityChanged;
+        }
+
         function currentPdfRecognitionSelection(reportNumberOverride = null) {
             const selectedReportNumber = normalizedReportNumber(
                 reportNumberOverride ?? document.getElementById('current-report-number').value
             );
+            const selectedOwnerUsername = normalizedReportOwnerUsername(
+                activeReportOwnerUsername
+            ) || '';
             return EnergyPdfRecognitionState.createSelectionFingerprint({
                 uploadSessionId: pdfUploadSessionId,
                 // The helper owns the fingerprint schema, so bind report identity into
                 // its opaque upload-token slot without changing the actual server token.
-                uploadToken: `${selectedReportNumber}\u0000${preparedPdf?.uploadToken || ''}`,
+                uploadToken: `${selectedOwnerUsername}\u0000${selectedReportNumber}\u0000${preparedPdf?.uploadToken || ''}`,
                 pageNumber: preparedPdf
                     ? document.getElementById('pdf-page-select').value
                     : null,
@@ -2684,6 +2759,7 @@
             return Boolean(
                 aiResultData
                 && acceptedRecognitionReportNumber === currentReportNumber
+                && acceptedRecognitionOwnerUsername === activeReportOwnerUsername
                 && (
                     aiResultData.report_number == null
                     || aiResultData.report_number === acceptedRecognitionReportNumber
@@ -2710,8 +2786,16 @@
                 calculationRequest
                 && calculationRequest.generation === energyCalculationRequestGeneration
                 && calculationRequest.generation === activeEnergyCalculationRequestGeneration
-                && calculationRequest.reportNumber === acceptedRecognitionReportNumber
-                && calculationRequest.reportNumber === normalizedReportNumber(
+                && reportIdentityMatches(
+                    calculationRequest.ownerUsername,
+                    calculationRequest.reportNumber,
+                    acceptedRecognitionOwnerUsername,
+                    acceptedRecognitionReportNumber
+                )
+                && reportIdentityMatches(
+                    calculationRequest.ownerUsername,
+                    calculationRequest.reportNumber,
+                    activeReportOwnerUsername,
                     document.getElementById('current-report-number').value
                 )
                 && EnergyPdfRecognitionState.fingerprintsEqual(
@@ -2759,6 +2843,7 @@
             invalidateEnergyCalculationRequest();
             calibrationPoints = derivedState.calibrationPoints;
             acceptedRecognitionReportNumber = null;
+            acceptedRecognitionOwnerUsername = null;
             pendingExteriorFusion = null;
             clearExteriorReviewState();
         }
@@ -3038,27 +3123,16 @@
             const repNumInput = normalizedReportNumber(
                 document.getElementById('current-report-number').value
             );
-            if (repNumInput) reportNumber = repNumInput;
+            if (repNumInput) {
+                setActiveReportIdentity(repNumInput, activeReportOwnerUsername);
+            }
         }
 
         function handleReportNumberInputChange() {
             const nextReportNumber = normalizedReportNumber(
                 document.getElementById('current-report-number').value
             );
-            const identityChanged = nextReportNumber !== reportNumber
-                || (
-                    acceptedRecognitionReportNumber !== null
-                    && nextReportNumber !== acceptedRecognitionReportNumber
-                )
-                || (
-                    pendingExteriorFusion?.report_number != null
-                    && nextReportNumber !== pendingExteriorFusion.report_number
-                );
-            reportNumber = nextReportNumber;
-            if (identityChanged) {
-                invalidatePdfRecognitionSelection({ returnToUpload: false });
-            }
-            updateCalculateEnergyAvailability();
+            setActiveReportIdentity(nextReportNumber, activeReportOwnerUsername);
         }
 
         function advancePdfPreviewRequest() {
@@ -3270,6 +3344,7 @@
             fd.append('report_number', reportNumber);
             fd.append('pdf_upload_token', previewRequest.uploadToken);
             fd.append('pdf_page_number', previewRequest.pageNumber);
+            appendActiveReportOwnerToFormData(fd);
             showLoader('正在生成 PDF 页面预览...');
 
             try {
@@ -3332,6 +3407,7 @@
             const fd = new FormData();
             fd.append('raster_file', file);
             fd.append('report_number', reportNumber);
+            appendActiveReportOwnerToFormData(fd);
             showLoader('正在读取 PDF 页数...');
 
             try {
@@ -3413,11 +3489,22 @@
         ) {
             const pending = pendingExteriorFusion;
             const pendingReportNumber = normalizedReportNumber(pending?.report_number);
+            const pendingOwnerUsername = normalizedReportOwnerUsername(
+                pending?.owner_username
+            );
             if (
                 !pending
                 || !pendingReportNumber
-                || pendingReportNumber !== acceptedRecognitionReportNumber
-                || pendingReportNumber !== normalizedReportNumber(
+                || !reportIdentityMatches(
+                    pendingOwnerUsername,
+                    pendingReportNumber,
+                    acceptedRecognitionOwnerUsername,
+                    acceptedRecognitionReportNumber
+                )
+                || !reportIdentityMatches(
+                    pendingOwnerUsername,
+                    pendingReportNumber,
+                    activeReportOwnerUsername,
                     document.getElementById('current-report-number').value
                 )
                 || !pdfRecognitionRequests.hasAccepted(confirmationSelection)
@@ -3427,7 +3514,7 @@
             const response = await fetch('/energy/vector_pdf_exterior_confirm', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
+                body: JSON.stringify(withActiveReportOwner({
                     report_number: pendingReportNumber,
                     topology_sha256: pending.topology_sha256,
                     scale_m_per_px: scale,
@@ -3435,7 +3522,7 @@
                     confirmed: true,
                     page_number: pending.pdf_page_number,
                     crop_bbox_page_px: pending.crop_bbox_page_px
-                }),
+                })),
                 signal
             });
             const data = await response.json();
@@ -3462,6 +3549,7 @@
 
             aiResultData = data.recognition;
             acceptedRecognitionReportNumber = data.report_number;
+            acceptedRecognitionOwnerUsername = activeReportOwnerUsername;
             reportNumber = data.report_number;
             pendingExteriorFusion = null;
             const exterior = aiResultData.exterior_topology;
@@ -3495,7 +3583,7 @@
                 alert('请输入报告编号。');
                 return false;
             }
-            reportNumber = requestReportNumber;
+            setActiveReportIdentity(requestReportNumber, activeReportOwnerUsername);
             const fd = new FormData();
             if (file) {
                 fd.append('raster_file', file);
@@ -3534,6 +3622,7 @@
             fd.append('preprocessing', 'auto');
             fd.append('model_backend', document.getElementById('model-backend').value);
             fd.append('report_number', requestReportNumber);
+            appendActiveReportOwnerToFormData(fd);
 
             const recognitionSelection = currentPdfRecognitionSelection(requestReportNumber);
             invalidatePdfRecognitionSelection({ returnToUpload: false });
@@ -3585,10 +3674,14 @@
                     return false;
                 }
                 acceptedRecognitionReportNumber = requestReportNumber;
+                acceptedRecognitionOwnerUsername = activeReportOwnerUsername;
 
                 if (data.fusion_debug) {
                     aiResultData = data;
-                    pendingExteriorFusion = data;
+                    pendingExteriorFusion = {
+                        ...data,
+                        owner_username: activeReportOwnerUsername
+                    };
                     const images = data.images || {};
                     document.getElementById('imgOriginal').src = images.original
                         ? 'data:image/png;base64,' + images.original
@@ -3792,6 +3885,7 @@
             }
             const calculationRequest = Object.freeze({
                 generation: energyCalculationRequestGeneration,
+                ownerUsername: activeReportOwnerUsername,
                 reportNumber: calculationReportNumber,
                 selection: currentPdfRecognitionSelection(calculationReportNumber)
             });
@@ -3812,7 +3906,7 @@
                 ? floors
                 : Number(windowRepeatValue);
 
-            const params = {
+            const params = withActiveReportOwner({
                 report_number: calculationReportNumber,
                 calculation_mode: calculationMode,
                 scale: parseFloat(document.getElementById('param-scale').value),
@@ -3877,7 +3971,7 @@
                 equipment_cooling_load_factor: parseFloat(document.getElementById('param-equipment-cooling-load-factor').value),
                 air_density_kg_m3: parseFloat(document.getElementById('param-air-density').value),
                 detailed_envelope: calculationMode === 'detailed' ? detailedEnvelope : {}
-            };
+            });
 
             try {
                 const response = await fetch('/energy/ai_simulate', {
@@ -4127,12 +4221,20 @@
                 list.forEach(item => {
                     const card = document.createElement('div');
                     card.className = 'history-card';
-                    card.onclick = () => loadReportDetails(item.report_number);
+                    if (isAdministrator) {
+                        card.dataset.owner_username = item.username;
+                        card.onclick = () => loadReportDetails(item.report_number, item.username);
+                    } else {
+                        card.onclick = () => loadReportDetails(item.report_number, null);
+                    }
                     
                     const timeStr = new Date(item.created_at).toLocaleString('zh-CN', { hour12: false });
+                    const reportTitle = isAdministrator
+                        ? `${item.username} / ${item.report_number}`
+                        : item.report_number;
                     card.innerHTML = `
                         <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
-                            <span style="font-weight:700; color:var(--primary); font-size:14px;">${item.report_number}</span>
+                            <span style="font-weight:700; color:var(--primary); font-size:14px;">${reportTitle}</span>
                             <span style="background:rgba(255,255,255,0.06); padding:2px 8px; border-radius:4px; font-size:11px; color:var(--text-muted);">${timeStr}</span>
                         </div>
                         <div style="font-size:12px; display:grid; grid-template-columns:1fr 1fr; gap:6px;">
@@ -4158,12 +4260,13 @@
             document.getElementById('historyDrawer').style.display = 'none';
         }
 
-        async function loadReportDetails(repNum) {
+        async function loadReportDetails(repNum, ownerUsername) {
             closeHistoryDrawer();
+            setActiveReportIdentity(repNum, ownerUsername);
             showLoader(`正在加载报告 ${repNum} 的配置参数...`);
 
             try {
-                const response = await fetch(`/energy/report/${repNum}`);
+                const response = await fetch(reportDetailsUrl(repNum));
                 const data = await response.json();
                 
                 if (data.error) {
@@ -4171,7 +4274,7 @@
                 }
 
                 document.getElementById('current-report-number').value = data.report_number;
-                handleReportNumberInputChange();
+                setActiveReportIdentity(data.report_number, data.username);
 
                 const p = data.params || {};
                 const geometry = p.geometry || {};

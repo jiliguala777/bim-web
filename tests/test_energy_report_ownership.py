@@ -681,6 +681,326 @@ class PdfOwnerBindingTests(unittest.TestCase):
         )
 
 
+class ReportOperationAuthorizationTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        import web_server_server
+
+        cls.server = web_server_server
+        cls.server.app.config.update(TESTING=True, SECRET_KEY="report-operation-authorization-test")
+
+    def setUp(self):
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        temporary_root = Path(self.temporary_directory.name)
+        self.database_path = temporary_root / "users.db"
+        self.upload_root = temporary_root / "uploads"
+        self.original_database_path = self.server.DB_PATH
+        self.original_upload_folder = self.server.app.config["UPLOAD_FOLDER"]
+        self.server.DB_PATH = str(self.database_path)
+        self.server.app.config["UPLOAD_FOLDER"] = str(self.upload_root)
+        self.server.init_db()
+
+        connection = self.server.get_db_connection()
+        connection.executemany(
+            "INSERT INTO users (username, password_hash) VALUES (?, ?)",
+            [("alice", "hash"), ("bob", "hash")],
+        )
+        connection.executemany(
+            """
+            INSERT INTO reports (
+                username, report_number, status, created_at, updated_at,
+                geometry_used, params, results
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    "alice", "BIM-1", "recognized",
+                    "2026-01-01 00:00:00", "2026-01-02 00:00:00",
+                    json.dumps({"floor_area_m2": 100}),
+                    json.dumps({"building_type": "alice-office"}),
+                    json.dumps({"summary": {"rating": "A"}}),
+                ),
+                (
+                    "bob", "BIM-1", "bob-ready",
+                    "2026-01-01 00:00:00", "2026-01-03 00:00:00",
+                    json.dumps({"floor_area_m2": 200}),
+                    json.dumps({"building_type": "bob-office"}),
+                    json.dumps({"summary": {"rating": "B"}}),
+                ),
+            ],
+        )
+        connection.commit()
+        connection.close()
+
+        self.alice_report_dir = (
+            self.upload_root / "energy" / user_storage_key("alice") / "BIM-1"
+        )
+        self.alice_report_dir.mkdir(parents=True)
+        self.alice_recognition_path = self.alice_report_dir / "recognition.json"
+        self.alice_recognition_path.write_text(
+            json.dumps({
+                "schema_version": 1,
+                "owner_username": "alice",
+                "model": {"name": "test", "version": "test-v1"},
+                "preprocessing": {"requested": "auto", "use_preprocessing": True},
+                "image_size": [10, 10],
+                "geometry": {"walls": [], "windows": [], "doors": []},
+                "room_topology": {
+                    "status": "closed_rooms",
+                    "room_count": 1,
+                    "rooms": [{"area_px2": 100.0}],
+                    "total_area_px2": 100.0,
+                    "total_area_m2": None,
+                    "load_geometry_ready": False,
+                },
+            }),
+            encoding="utf-8",
+        )
+        self.client = self.server.app.test_client()
+
+    def tearDown(self):
+        self.server.DB_PATH = self.original_database_path
+        self.server.app.config["UPLOAD_FOLDER"] = self.original_upload_folder
+        self.temporary_directory.cleanup()
+
+    def login_as(self, username, is_admin=False):
+        with self.client.session_transaction() as state:
+            state.clear()
+            state.update(logged_in=True, username=username, is_admin=is_admin)
+
+    def test_ordinary_user_cannot_read_or_alter_another_owners_report(self):
+        self.login_as("bob")
+        original_recognition = self.alice_recognition_path.read_bytes()
+        original_alice = dict(self.server._report_row("alice", "BIM-1"))
+
+        requests = [
+            (
+                "post",
+                "/energy/ai_recognize",
+                {"data": {"report_number": "BIM-1", "owner_username": "alice"}},
+            ),
+            (
+                "post",
+                "/energy/scale_calibration",
+                {"json": {
+                    "report_number": "BIM-1",
+                    "owner_username": "alice",
+                    "point_a": [0, 0],
+                    "point_b": [5, 0],
+                    "actual_length": 1,
+                    "unit": "m",
+                }},
+            ),
+            (
+                "post",
+                "/energy/ai_simulate",
+                {"json": {"report_number": "BIM-1", "owner_username": "alice"}},
+            ),
+            (
+                "get",
+                "/energy/report/BIM-1?owner_username=alice",
+                {},
+            ),
+        ]
+
+        with patch.object(self.server, "HAS_FLOORPLAN_AI", True):
+            for method, url, kwargs in requests:
+                with self.subTest(url=url):
+                    response = getattr(self.client, method)(url, **kwargs)
+                    self.assertEqual(response.status_code, 403, response.get_json())
+
+        self.assertEqual(self.alice_recognition_path.read_bytes(), original_recognition)
+        self.assertEqual(dict(self.server._report_row("alice", "BIM-1")), original_alice)
+
+    def test_environment_admin_can_explicitly_access_alices_existing_report(self):
+        with patch.dict(
+            os.environ,
+            {"ADMIN_USER": "admin", "ADMIN_PASSWORD": "secret"},
+            clear=False,
+        ):
+            login = self.client.post(
+                "/login",
+                json={"username": "admin", "password": "secret"},
+            )
+        self.assertEqual(login.status_code, 200, login.get_json())
+
+        calibration = self.client.post(
+            "/energy/scale_calibration",
+            json={
+                "report_number": "BIM-1",
+                "owner_username": "alice",
+                "point_a": [0, 0],
+                "point_b": [5, 0],
+                "actual_length": 1,
+                "unit": "m",
+            },
+        )
+        detail = self.client.get("/energy/report/BIM-1?owner_username=alice")
+
+        self.assertEqual(calibration.status_code, 200, calibration.get_json())
+        self.assertEqual(detail.status_code, 200, detail.get_json())
+        self.assertEqual(detail.get_json()["username"], "alice")
+        self.assertEqual(detail.get_json()["status"], "recognized")
+        self.assertEqual(detail.get_json()["updated_at"], "2026-01-02 00:00:00")
+        saved = json.loads(self.alice_recognition_path.read_text(encoding="utf-8"))
+        self.assertEqual(saved["scale_calibration"]["status"], "confirmed")
+
+    def test_same_number_detail_reads_the_authenticated_owners_row(self):
+        self.login_as("bob")
+
+        response = self.client.get("/energy/report/BIM-1")
+
+        self.assertEqual(response.status_code, 200, response.get_json())
+        self.assertEqual(response.get_json(), {
+            "report_number": "BIM-1",
+            "username": "bob",
+            "status": "bob-ready",
+            "created_at": "2026-01-01 00:00:00",
+            "updated_at": "2026-01-03 00:00:00",
+            "geometry_used": {"floor_area_m2": 200},
+            "params": {"building_type": "bob-office"},
+            "results": {"summary": {"rating": "B"}},
+        })
+
+    def test_ai_simulate_upserts_only_the_authenticated_composite_row(self):
+        self.login_as("alice")
+        calculation = {
+            "success": True,
+            "summary": {
+                "total_energy_kwh": 123,
+                "eui": 12.3,
+                "rating": "A",
+            },
+        }
+
+        with (
+            patch.object(self.server, "HAS_FLOORPLAN_AI", True),
+            patch.object(self.server, "HAS_ENERGY_CALC", True),
+            patch.object(self.server, "HAS_DESIGN_LOAD_CALC", False),
+            patch.object(
+                self.server.energy_calc,
+                "calculate_energy",
+                return_value=calculation,
+            ),
+        ):
+            response = self.client.post(
+                "/energy/ai_simulate",
+                json={"report_number": "BIM-1", "scale": 0.1},
+            )
+
+        self.assertEqual(response.status_code, 200, response.get_json())
+        alice = self.server._report_row("alice", "BIM-1")
+        bob = self.server._report_row("bob", "BIM-1")
+        self.assertEqual(alice["status"], "calculated")
+        self.assertEqual(json.loads(alice["results"])["summary"]["total_energy_kwh"], 123)
+        self.assertAlmostEqual(
+            json.loads(alice["params"])["geometry"]["floor_area_m2"],
+            1.0,
+        )
+        self.assertEqual(bob["status"], "bob-ready")
+        self.assertEqual(json.loads(bob["results"]), {"summary": {"rating": "B"}})
+
+    def test_report_lists_are_owner_scoped_for_users_and_global_for_admins(self):
+        connection = self.server.get_db_connection()
+        connection.execute(
+            """
+            INSERT INTO reports (
+                username, report_number, status, created_at, updated_at,
+                geometry_used, params, results
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "alice", "BIM-OLDER", "calculated",
+                "2025-12-01 00:00:00", "2026-01-01 00:00:00",
+                json.dumps({"floor_area_m2": 50}),
+                json.dumps({"private_path": str(self.upload_root / "secret")}),
+                json.dumps({"summary": {
+                    "total_energy_kwh": 500,
+                    "eui": 10,
+                    "rating": "A",
+                }}),
+            ),
+        )
+        connection.commit()
+        connection.close()
+
+        self.login_as("bob")
+        ordinary = self.client.get("/energy/reports")
+        self.assertEqual(ordinary.status_code, 200, ordinary.get_json())
+        self.assertEqual(len(ordinary.get_json()), 1)
+        self.assertEqual(ordinary.get_json()[0]["username"], "bob")
+        self.assertEqual(ordinary.get_json()[0]["report_number"], "BIM-1")
+        self.assertEqual(ordinary.get_json()[0]["status"], "bob-ready")
+        self.assertEqual(ordinary.get_json()[0]["updated_at"], "2026-01-03 00:00:00")
+
+        with patch.dict(
+            os.environ,
+            {"ADMIN_USER": "admin", "ADMIN_PASSWORD": "secret"},
+            clear=False,
+        ):
+            login = self.client.post(
+                "/login",
+                json={"username": "admin", "password": "secret"},
+            )
+        self.assertEqual(login.status_code, 200, login.get_json())
+        administrator = self.client.get("/energy/reports")
+
+        self.assertEqual(administrator.status_code, 200, administrator.get_json())
+        self.assertEqual(
+            [(item["username"], item["report_number"]) for item in administrator.get_json()],
+            [("bob", "BIM-1"), ("alice", "BIM-1"), ("alice", "BIM-OLDER")],
+        )
+        self.assertEqual(
+            set(administrator.get_json()[0]),
+            {
+                "username", "report_number", "status", "created_at", "updated_at",
+                "floor_area", "total_energy", "eui", "rating",
+            },
+        )
+        serialized = administrator.get_data(as_text=True)
+        self.assertNotIn(str(self.upload_root), serialized)
+        self.assertNotIn(user_storage_key("alice"), serialized)
+
+    def test_report_read_internal_errors_are_sanitized(self):
+        self.login_as("alice")
+        secret = str(self.upload_root / "private-database.db")
+
+        for url in ("/energy/report/BIM-1", "/energy/reports"):
+            with self.subTest(url=url), patch.object(
+                self.server,
+                "get_db_connection",
+                side_effect=RuntimeError(secret),
+            ), self.assertLogs(self.server.logger, level="ERROR"):
+                response = self.client.get(url)
+                self.assertEqual(response.status_code, 500, response.get_json())
+                self.assertEqual(response.get_json(), {"error": "Internal server error"})
+                self.assertNotIn(secret, response.get_data(as_text=True))
+
+    def test_ai_simulate_internal_errors_are_sanitized(self):
+        self.login_as("alice")
+        secret = str(self.alice_report_dir / "private-calculation-input.json")
+
+        with (
+            patch.object(self.server, "HAS_FLOORPLAN_AI", True),
+            patch.object(self.server, "HAS_ENERGY_CALC", True),
+            patch.object(self.server, "HAS_DESIGN_LOAD_CALC", False),
+            patch.object(
+                self.server.energy_calc,
+                "calculate_energy",
+                side_effect=RuntimeError(secret),
+            ),
+            self.assertLogs(self.server.logger, level="ERROR"),
+        ):
+            response = self.client.post(
+                "/energy/ai_simulate",
+                json={"report_number": "BIM-1", "scale": 0.1},
+            )
+
+        self.assertEqual(response.status_code, 500, response.get_json())
+        self.assertEqual(response.get_json(), {"error": "Internal server error"})
+        self.assertNotIn(secret, response.get_data(as_text=True))
+
+
 class ReportUploadIsolationTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

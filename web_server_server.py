@@ -1834,7 +1834,16 @@ def _polyline_total_length(items):
     return total
 
 
-def _build_recognition_payload(result, preprocessing, use_preprocessing, raster_path, overlay_path, mask_path, elapsed_sec):
+def _build_recognition_payload(
+    result,
+    preprocessing,
+    use_preprocessing,
+    raster_path,
+    overlay_path,
+    mask_path,
+    elapsed_sec,
+    owner_username,
+):
     geometry = result.get('geometry') or {'walls': [], 'windows': [], 'doors': []}
     room_topology = result.get('room_topology') or {
         'status': 'no_closed_rooms',
@@ -1865,6 +1874,7 @@ def _build_recognition_payload(result, preprocessing, use_preprocessing, raster_
     }
     return {
         'schema_version': RECOGNITION_SCHEMA_VERSION,
+        'owner_username': owner_username,
         'created_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
         'model': model,
         'preprocessing': {
@@ -1981,7 +1991,20 @@ def _load_recognition_payload(target_dir):
     return payload
 
 
-def _persist_vector_recognition(target_dir, raster_path, result, elapsed_sec):
+def _public_ai_model_info(model):
+    """Return model metadata that is safe to expose through JSON APIs."""
+    if not isinstance(model, dict):
+        return {}
+    return {
+        key: model[key]
+        for key in ('backend', 'name', 'version', 'mIoU', 'classes')
+        if key in model
+    }
+
+
+def _persist_vector_recognition(
+    target_dir, raster_path, result, elapsed_sec, owner_username,
+):
     """Persist the opt-in vector backend in the existing recognition contract."""
     original_bgr = result['source']
     overlay = result['overlay']
@@ -2007,6 +2030,7 @@ def _persist_vector_recognition(target_dir, raster_path, result, elapsed_sec):
     })
     recognition_payload = _build_recognition_payload(
         result, 'none', False, raster_path, overlay_path, mask_path, elapsed_sec,
+        owner_username,
     )
     recognition_path = _save_recognition_payload(target_dir, recognition_payload)
     _, overlay_buf = cv2.imencode('.jpg', overlay, [cv2.IMWRITE_JPEG_QUALITY, 85])
@@ -2018,7 +2042,7 @@ def _persist_vector_recognition(target_dir, raster_path, result, elapsed_sec):
         'status': 'success',
         'source': 'AI',
         'model': result['model']['name'],
-        'model_info': result['model'],
+        'model_info': _public_ai_model_info(result['model']),
         'elapsed_sec': elapsed_sec,
         'image_size': [w, h],
         'stats': result['stats'],
@@ -3338,6 +3362,7 @@ def vector_pdf_exterior_confirm():
         geometry = {'walls': walls, 'windows': windows, 'doors': doors}
         recognition = {
             'schema_version': RECOGNITION_SCHEMA_VERSION,
+            'owner_username': context.owner_username,
             'report_number': report_number,
             'exterior_generation': {
                 'generation': generation_marker['generation'],
@@ -3552,6 +3577,7 @@ def ai_recognize():
             })
             return _persist_vector_recognition(
                 target_dir, raster_path, result, round(_time.time() - t0, 3),
+                context.owner_username,
             )
 
         scale_calibration = {
@@ -3830,6 +3856,7 @@ def ai_recognize():
             overlay_path,
             mask_path,
             elapsed,
+            context.owner_username,
         )
         recognition_path = _save_recognition_payload(target_dir, recognition_payload)
 
@@ -3885,33 +3912,44 @@ def ai_recognize():
 @app.route('/energy/ai_status')
 def ai_status():
     """检查 AI 识别模块状态"""
+    legacy_model = _public_ai_model_info({
+        'backend': LEGACY_ONNX_BACKEND,
+        'name': FLOORPLAN_MODEL_NAME,
+        'version': FLOORPLAN_MODEL_VERSION,
+        'mIoU': FLOORPLAN_MODEL_MIOU,
+        'classes': ['background', 'wall', 'window', 'door'],
+    })
+    vector_model = _public_ai_model_info({
+        'backend': VECTOR_PYTORCH_BACKEND,
+        'name': 'vector-resnet34-unet',
+        'version': (
+            _vector_platform_config.checkpoint_path.name
+            if HAS_VECTOR_FLOORPLAN_AI else None
+        ),
+    })
+    backends = {
+        LEGACY_ONNX_BACKEND: {
+            'available': HAS_FLOORPLAN_AI,
+            'model': legacy_model.get('name') if HAS_FLOORPLAN_AI else None,
+            'model_version': legacy_model.get('version') if HAS_FLOORPLAN_AI else None,
+        },
+        VECTOR_PYTORCH_BACKEND: {
+            'available': HAS_VECTOR_FLOORPLAN_AI,
+            'model': vector_model.get('name') if HAS_VECTOR_FLOORPLAN_AI else None,
+            'model_version': vector_model.get('version') if HAS_VECTOR_FLOORPLAN_AI else None,
+        },
+    }
+    active_model = (
+        legacy_model if HAS_FLOORPLAN_AI
+        else (vector_model if HAS_VECTOR_FLOORPLAN_AI else {})
+    )
     return jsonify({
         'available': HAS_FLOORPLAN_AI or HAS_VECTOR_FLOORPLAN_AI,
-        'model': (
-            FLOORPLAN_MODEL_NAME if HAS_FLOORPLAN_AI
-            else ('vector-resnet34-unet' if HAS_VECTOR_FLOORPLAN_AI else None)
-        ),
-        'model_version': (
-            FLOORPLAN_MODEL_VERSION if HAS_FLOORPLAN_AI
-            else (_vector_platform_config.checkpoint_path.name if HAS_VECTOR_FLOORPLAN_AI else None)
-        ),
+        'model': active_model.get('name') if active_model else None,
+        'model_version': active_model.get('version') if active_model else None,
         'mIoU': FLOORPLAN_MODEL_MIOU if HAS_FLOORPLAN_AI else None,
         'classes': ['background', 'wall', 'window', 'door'] if HAS_FLOORPLAN_AI else [],
-        'backends': {
-            LEGACY_ONNX_BACKEND: {
-                'available': HAS_FLOORPLAN_AI,
-                'model': FLOORPLAN_MODEL_NAME if HAS_FLOORPLAN_AI else None,
-                'model_version': FLOORPLAN_MODEL_VERSION if HAS_FLOORPLAN_AI else None,
-            },
-            VECTOR_PYTORCH_BACKEND: {
-                'available': HAS_VECTOR_FLOORPLAN_AI,
-                'model': 'vector-resnet34-unet' if HAS_VECTOR_FLOORPLAN_AI else None,
-                'model_version': (
-                    _vector_platform_config.checkpoint_path.name
-                    if HAS_VECTOR_FLOORPLAN_AI else None
-                ),
-            },
-        },
+        'backends': backends,
     })
 
 
@@ -4005,14 +4043,18 @@ def ai_simulate():
     """
     使用 AI 识别结果结合详细参数进行能耗计算
     """
-    if not (HAS_FLOORPLAN_AI or HAS_VECTOR_FLOORPLAN_AI):
-        return jsonify({'error': 'AI module not available'}), 501
-
     exterior_lock_context = None
     exterior_lock_acquired = False
     try:
         data = request.get_json() or {}
-        report_number = data.get('report_number', 'default')
+        context = _resolved_energy_report_context(
+            data.get('report_number', 'default'),
+            _requested_owner_username(data),
+        )
+        report_number = context.report_number
+        target_dir = context.report_dir
+        if not (HAS_FLOORPLAN_AI or HAS_VECTOR_FLOORPLAN_AI):
+            return jsonify({'error': 'AI module not available'}), 501
         scale = float(data.get('scale', 0.01))  # 默认 1px = 1cm
         height = float(data.get('height', 3.0))
         floors = int(data.get('floors', 1))
@@ -4116,8 +4158,6 @@ def ai_simulate():
         lighting_cooling_load_factor = parse_finite_number("lighting_cooling_load_factor", 1.0, minimum=0.0)
         equipment_cooling_load_factor = parse_finite_number("equipment_cooling_load_factor", 1.0, minimum=0.0)
         air_density = parse_finite_number("air_density_kg_m3", 1.13, minimum=0.000001)
-
-        target_dir = os.path.join(app.config['UPLOAD_FOLDER'], 'energy', report_number)
 
         # 查找已有的 AI 识别结果图
         recognition = _load_recognition_payload(target_dir)
@@ -4356,37 +4396,43 @@ def ai_simulate():
             res["scale_source"] = scale_source
 
             # 将计算结果、输入参数、几何信息持久化到 SQLite 数据库中
+            conn = get_db_connection()
             try:
-                username = session.get('username', 'guest')
-                conn = get_db_connection()
-                existing = conn.execute('SELECT id FROM reports WHERE report_number = ?', (report_number,)).fetchone()
-                if existing:
-                    conn.execute('''
-                        UPDATE reports 
-                        SET username = ?, geometry_used = ?, params = ?, results = ?, created_at = datetime('now')
-                        WHERE report_number = ?
-                    ''', (username, json.dumps(calc_params.get('geometry', {})), json.dumps(calc_params), json.dumps(res), report_number))
-                else:
-                    conn.execute('''
-                        INSERT INTO reports (username, report_number, geometry_used, params, results)
-                        VALUES (?, ?, ?, ?, ?)
-                    ''', (username, report_number, json.dumps(calc_params.get('geometry', {})), json.dumps(calc_params), json.dumps(res)))
+                conn.execute('''
+                    INSERT INTO reports (
+                        username, report_number, status, updated_at,
+                        geometry_used, params, results
+                    )
+                    VALUES (?, ?, 'calculated', datetime('now'), ?, ?, ?)
+                    ON CONFLICT(username, report_number) DO UPDATE SET
+                        status = 'calculated',
+                        updated_at = datetime('now'),
+                        geometry_used = excluded.geometry_used,
+                        params = excluded.params,
+                        results = excluded.results
+                ''', (
+                    context.owner_username,
+                    report_number,
+                    json.dumps(calc_params.get('geometry', {})),
+                    json.dumps(calc_params),
+                    json.dumps(res),
+                ))
                 conn.commit()
+            finally:
                 conn.close()
-            except Exception as db_err:
-                logger.error(f"Database save report error: {db_err}", exc_info=True)
 
             return jsonify(res)
         else:
             return jsonify({'error': 'Energy calculation engine missing on server'}), 500
 
-    except ExteriorGenerationConflict as e:
-        return jsonify({'error': str(e)}), 409
+    except _REPORT_STORAGE_EXCEPTIONS as exc:
+        return _report_storage_error_response(exc)
+    except ExteriorGenerationConflict as exc:
+        return jsonify({'error': str(exc)}), 409
     except ValueError as e:
         return jsonify({'error': str(e)}), 400
-    except Exception as e:
-        logger.error(f"AI simulate error: {e}", exc_info=True)
-        return jsonify({'error': str(e)}), 500
+    except Exception as exc:
+        return _internal_report_error_response('AI simulate error', exc)
     finally:
         if exterior_lock_acquired:
             exterior_lock_context.__exit__(None, None, None)
@@ -4398,23 +4444,39 @@ def get_energy_report(report_number):
     """
     根据 report_number 获取历史能效报告
     """
+    conn = None
     try:
+        context = _resolved_energy_report_context(
+            report_number,
+            _requested_owner_username(),
+        )
         conn = get_db_connection()
-        row = conn.execute('SELECT * FROM reports WHERE report_number = ?', (report_number,)).fetchone()
-        conn.close()
+        row = conn.execute('''
+            SELECT username, report_number, status, created_at, updated_at,
+                   geometry_used, params, results
+            FROM reports
+            WHERE username = ? AND report_number = ?
+        ''', (context.owner_username, context.report_number)).fetchone()
         if not row:
             return jsonify({'error': 'Report not found'}), 404
 
         return jsonify({
             'report_number': row['report_number'],
             'username': row['username'],
+            'status': row['status'],
             'created_at': row['created_at'],
+            'updated_at': row['updated_at'],
             'geometry_used': json.loads(row['geometry_used'] or '{}'),
             'params': json.loads(row['params'] or '{}'),
             'results': json.loads(row['results'] or '{}')
         })
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+    except _REPORT_STORAGE_EXCEPTIONS as exc:
+        return _report_storage_error_response(exc)
+    except Exception as exc:
+        return _internal_report_error_response('Report detail error', exc)
+    finally:
+        if conn is not None:
+            conn.close()
 
 
 @app.route('/energy/reports', methods=['GET'])
@@ -4423,27 +4485,49 @@ def get_user_reports():
     """
     获取当前用户所有的历史能效报告列表
     """
+    conn = None
     try:
-        username = session.get('username', 'guest')
         conn = get_db_connection()
-        rows = conn.execute('SELECT report_number, created_at, geometry_used, results FROM reports WHERE username = ? ORDER BY created_at DESC', (username,)).fetchall()
-        conn.close()
+        if session.get('is_admin') is True:
+            rows = conn.execute('''
+                SELECT username, report_number, status, created_at, updated_at,
+                       geometry_used, results
+                FROM reports
+                ORDER BY updated_at DESC, id DESC
+            ''').fetchall()
+        else:
+            username = _effective_report_owner()
+            rows = conn.execute('''
+                SELECT username, report_number, status, created_at, updated_at,
+                       geometry_used, results
+                FROM reports
+                WHERE username = ?
+                ORDER BY updated_at DESC, id DESC
+            ''', (username,)).fetchall()
 
         results = []
         for r in rows:
             res_data = json.loads(r['results'] or '{}')
             summary = res_data.get('summary', {})
             results.append({
+                'username': r['username'],
                 'report_number': r['report_number'],
+                'status': r['status'],
                 'created_at': r['created_at'],
+                'updated_at': r['updated_at'],
                 'floor_area': json.loads(r['geometry_used'] or '{}').get('floor_area_m2', 0),
                 'total_energy': summary.get('total_energy_kwh', 0),
                 'eui': summary.get('eui', 0),
                 'rating': summary.get('rating', '-')
             })
         return jsonify(results)
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+    except _REPORT_STORAGE_EXCEPTIONS as exc:
+        return _report_storage_error_response(exc)
+    except Exception as exc:
+        return _internal_report_error_response('Report list error', exc)
+    finally:
+        if conn is not None:
+            conn.close()
 
 
 if __name__ == '__main__':

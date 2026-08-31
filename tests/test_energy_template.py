@@ -2346,7 +2346,9 @@ class EnergyRouteClientTests(unittest.TestCase):
         }
         temporary = tempfile.TemporaryDirectory()
         upload_root = Path(temporary.name)
-        report_dir = upload_root / "energy" / "EXT-ENERGY"
+        report_dir = (
+            upload_root / "energy" / user_storage_key("test-user") / "EXT-ENERGY"
+        )
         report_dir.mkdir(parents=True)
         (report_dir / "recognition.json").write_text(
             json.dumps(recognition), encoding="utf-8",
@@ -2627,6 +2629,7 @@ class EnergyRouteClientTests(unittest.TestCase):
             self.assertTrue(recognition_path.exists())
             recognition = json.loads(recognition_path.read_text(encoding="utf-8"))
             self.assertEqual(recognition["schema_version"], 1)
+            self.assertEqual(recognition["owner_username"], "test-user")
             self.assertEqual(recognition["model"]["version"], self.server.FLOORPLAN_MODEL_VERSION)
             self.assertEqual(recognition["preprocessing"]["requested"], "auto")
             self.assertEqual(recognition["image_size"], [2, 2])
@@ -2635,6 +2638,64 @@ class EnergyRouteClientTests(unittest.TestCase):
             self.assertEqual(recognition["mask"]["path"], "ai_mask.png")
             self.assertEqual(response.get_json()["room_topology"]["room_count"], 1)
             self.assertIn("recognition", response.get_json())
+
+    def test_vector_recognition_response_does_not_expose_internal_model_paths(self):
+        with tempfile.TemporaryDirectory(dir=r"D:\Projects") as upload_root:
+            internal_path = str(
+                Path(upload_root) / "energy" / user_storage_key("test-user")
+                / "VECTOR-SAFE" / "vector-prediction-secret"
+            )
+            result = {
+                "source": np.zeros((2, 2, 3), dtype=np.uint8),
+                "overlay": np.zeros((2, 2, 3), dtype=np.uint8),
+                "mask": np.zeros((2, 2), dtype=np.uint8),
+                "model": {
+                    "backend": self.server.VECTOR_PYTORCH_BACKEND,
+                    "name": "vector-resnet34-unet",
+                    "version": "checkpoint-hash",
+                    "path": internal_path,
+                    "classes": ["footprint", "room", "wall", "door", "window"],
+                },
+                "stats": {},
+                "geometry": {"walls": [], "windows": [], "doors": []},
+                "room_topology": {
+                    "status": "no_closed_rooms",
+                    "room_count": 0,
+                    "rooms": [],
+                    "total_area_px2": 0.0,
+                    "total_area_m2": None,
+                    "load_geometry_ready": False,
+                },
+                "scale_calibration": {"status": "manual_required"},
+                "vector_geometry": {},
+                "vector_measurements": {},
+                "vector_inference": {},
+            }
+            adapter = MagicMock()
+            adapter.predict.return_value = result
+            previous_upload = self.server.app.config["UPLOAD_FOLDER"]
+            self.server.app.config["UPLOAD_FOLDER"] = upload_root
+            try:
+                with (
+                    patch.object(self.server, "HAS_VECTOR_FLOORPLAN_AI", True),
+                    patch.object(self.server, "_vector_platform_adapter", adapter),
+                ):
+                    response = self.client.post(
+                        "/energy/ai_recognize",
+                        data={
+                            "report_number": "VECTOR-SAFE",
+                            "model_backend": self.server.VECTOR_PYTORCH_BACKEND,
+                            "raster_file": (io.BytesIO(b"fake image"), "plan.png"),
+                        },
+                        content_type="multipart/form-data",
+                    )
+            finally:
+                self.server.app.config["UPLOAD_FOLDER"] = previous_upload
+
+            self.assertEqual(response.status_code, 200, response.get_json())
+            self.assertNotIn("path", response.get_json()["model_info"])
+            self.assertNotIn(internal_path, response.get_data(as_text=True))
+            self.assertNotIn(user_storage_key("test-user"), response.get_data(as_text=True))
 
     def test_vector_pdf_recognition_persists_confirmed_scale_and_masks_dimensions(self):
         from reportlab.pdfgen import canvas
@@ -2840,7 +2901,9 @@ class EnergyRouteClientTests(unittest.TestCase):
 
     def test_ai_simulate_reuses_saved_recognition_without_second_prediction(self):
         with tempfile.TemporaryDirectory(dir=r"D:\Projects") as upload_root:
-            report_dir = Path(upload_root) / "energy" / "REUSE"
+            report_dir = (
+                Path(upload_root) / "energy" / user_storage_key("test-user") / "REUSE"
+            )
             report_dir.mkdir(parents=True)
             recognition = {
                 "schema_version": 1,

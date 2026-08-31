@@ -151,6 +151,163 @@ def _unsafe_report_sql_literals(tree):
     return unsafe
 
 
+def _target_names(target):
+    if isinstance(target, ast.Name):
+        return {target.id}
+    if isinstance(target, ast.Starred):
+        return _target_names(target.value)
+    if isinstance(target, (ast.List, ast.Tuple)):
+        return {name for item in target.elts for name in _target_names(item)}
+    return set()
+
+
+def _function_outer_expressions(node):
+    yield from node.decorator_list
+    yield from node.args.defaults
+    yield from (default for default in node.args.kw_defaults if default is not None)
+    arguments = node.args.posonlyargs + node.args.args + node.args.kwonlyargs
+    if node.args.vararg is not None:
+        arguments.append(node.args.vararg)
+    if node.args.kwarg is not None:
+        arguments.append(node.args.kwarg)
+    yield from (argument.annotation for argument in arguments if argument.annotation is not None)
+    if node.returns is not None:
+        yield node.returns
+    yield from getattr(node, "type_params", ())
+
+
+class _FunctionLocalBindingCollector(ast.NodeVisitor):
+    """Collect names that Python binds across an entire function scope."""
+
+    def __init__(self, node):
+        self.bound = {
+            argument.arg
+            for argument in node.args.posonlyargs + node.args.args + node.args.kwonlyargs
+        }
+        if node.args.vararg is not None:
+            self.bound.add(node.args.vararg.arg)
+        if node.args.kwarg is not None:
+            self.bound.add(node.args.kwarg.arg)
+        self.global_names = set()
+        self.nonlocal_names = set()
+        for statement in node.body:
+            self.visit(statement)
+
+    @property
+    def local_names(self):
+        return self.bound - self.global_names - self.nonlocal_names
+
+    def _bind_target(self, target):
+        self.bound.update(_target_names(target))
+
+    def _visit_nested_function_header(self, node):
+        for expression in _function_outer_expressions(node):
+            self.visit(expression)
+
+    def visit_FunctionDef(self, node):
+        self.bound.add(node.name)
+        self._visit_nested_function_header(node)
+
+    def visit_AsyncFunctionDef(self, node):
+        self.visit_FunctionDef(node)
+
+    def visit_ClassDef(self, node):
+        self.bound.add(node.name)
+        for expression in (*node.decorator_list, *node.bases):
+            self.visit(expression)
+        for keyword in node.keywords:
+            self.visit(keyword.value)
+        for type_param in getattr(node, "type_params", ()):
+            self.visit(type_param)
+
+    def visit_Lambda(self, node):
+        for default in (*node.args.defaults, *node.args.kw_defaults):
+            if default is not None:
+                self.visit(default)
+
+    def visit_Global(self, node):
+        self.global_names.update(node.names)
+
+    def visit_Nonlocal(self, node):
+        self.nonlocal_names.update(node.names)
+
+    def visit_Assign(self, node):
+        for target in node.targets:
+            self._bind_target(target)
+        self.visit(node.value)
+
+    def visit_AnnAssign(self, node):
+        self._bind_target(node.target)
+        self.visit(node.annotation)
+        if node.value is not None:
+            self.visit(node.value)
+
+    def visit_AugAssign(self, node):
+        self._bind_target(node.target)
+        self.visit(node.value)
+
+    def visit_NamedExpr(self, node):
+        self._bind_target(node.target)
+        self.visit(node.value)
+
+    def visit_For(self, node):
+        self._bind_target(node.target)
+        self.visit(node.iter)
+        for statement in (*node.body, *node.orelse):
+            self.visit(statement)
+
+    def visit_AsyncFor(self, node):
+        self.visit_For(node)
+
+    def visit_With(self, node):
+        for item in node.items:
+            self.visit(item.context_expr)
+            if item.optional_vars is not None:
+                self._bind_target(item.optional_vars)
+        for statement in node.body:
+            self.visit(statement)
+
+    def visit_AsyncWith(self, node):
+        self.visit_With(node)
+
+    def visit_ExceptHandler(self, node):
+        if node.name is not None:
+            self.bound.add(node.name)
+        if node.type is not None:
+            self.visit(node.type)
+        for statement in node.body:
+            self.visit(statement)
+
+    def visit_Import(self, node):
+        self.bound.update(imported.asname or imported.name.split(".", 1)[0] for imported in node.names)
+
+    def visit_ImportFrom(self, node):
+        self.bound.update(
+            imported.asname or imported.name
+            for imported in node.names
+            if imported.name != "*"
+        )
+
+    def visit_Delete(self, node):
+        for target in node.targets:
+            self._bind_target(target)
+
+    def visit_MatchAs(self, node):
+        if node.name is not None:
+            self.bound.add(node.name)
+        if node.pattern is not None:
+            self.visit(node.pattern)
+
+    def visit_MatchStar(self, node):
+        if node.name is not None:
+            self.bound.add(node.name)
+
+    def visit_MatchMapping(self, node):
+        if node.rest is not None:
+            self.bound.add(node.rest)
+        self.generic_visit(node)
+
+
 class _DirectEnergyPathVisitor(ast.NodeVisitor):
     """Find direct UPLOAD_FOLDER/energy construction outside the resolver."""
 
@@ -176,17 +333,40 @@ class _DirectEnergyPathVisitor(ast.NodeVisitor):
         self.generic_visit(node)
 
     def visit_ImportFrom(self, node):
+        bound_names = {
+            imported.asname or imported.name
+            for imported in node.names
+            if imported.name != "*"
+        }
+        self._forget_aliases(bound_names)
         if node.module == "os.path":
             for imported in node.names:
                 if imported.name == "join":
                     self._join_aliases.add(imported.asname or imported.name)
-        self.generic_visit(node)
+
+    def visit_Import(self, node):
+        self._forget_aliases(
+            {imported.asname or imported.name.split(".", 1)[0] for imported in node.names}
+        )
 
     def visit_FunctionDef(self, node):
+        self._visit_function(node)
+
+    def visit_AsyncFunctionDef(self, node):
+        self._visit_function(node)
+
+    def _visit_function(self, node):
+        for expression in _function_outer_expressions(node):
+            self.visit(expression)
+
         saved_roots, saved_joins = self._upload_root_aliases, self._join_aliases
-        self._upload_root_aliases, self._join_aliases = set(saved_roots), set(saved_joins)
-        self.generic_visit(node)
+        local_names = _FunctionLocalBindingCollector(node).local_names
+        self._upload_root_aliases = set(saved_roots) - local_names - {node.name}
+        self._join_aliases = set(saved_joins) - local_names - {node.name}
+        for statement in node.body:
+            self.visit(statement)
         self._upload_root_aliases, self._join_aliases = saved_roots, saved_joins
+        self._forget_aliases({node.name})
 
     def visit_Assign(self, node):
         self._remember_assignment_aliases(node.value, node.targets)
@@ -198,6 +378,7 @@ class _DirectEnergyPathVisitor(ast.NodeVisitor):
         self.generic_visit(node)
 
     def _remember_assignment_aliases(self, value, targets):
+        bound_names = {name for target in targets for name in _target_names(target)}
         names = [target.id for target in targets if isinstance(target, ast.Name)]
         is_path_upload_root = (
             isinstance(value, ast.Call)
@@ -205,14 +386,21 @@ class _DirectEnergyPathVisitor(ast.NodeVisitor):
             and value.args
             and _is_upload_folder_config(value.args[0])
         )
-        if _is_upload_folder_config(value) or is_path_upload_root or (
+        is_upload_root = _is_upload_folder_config(value) or is_path_upload_root or (
             isinstance(value, ast.Name) and value.id in self._upload_root_aliases
-        ):
+        )
+        is_join = (
+            isinstance(value, ast.Name) and value.id in self._join_aliases
+        ) or (isinstance(value, ast.Attribute) and value.attr == "join")
+        self._forget_aliases(bound_names)
+        if is_upload_root:
             self._upload_root_aliases.update(names)
-        if isinstance(value, ast.Name) and value.id in self._join_aliases:
+        if is_join:
             self._join_aliases.update(names)
-        if isinstance(value, ast.Attribute) and value.attr == "join":
-            self._join_aliases.update(names)
+
+    def _forget_aliases(self, names):
+        self._upload_root_aliases.difference_update(names)
+        self._join_aliases.difference_update(names)
 
     def _inspect(self, node):
         is_join_alias = isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and (
@@ -355,6 +543,70 @@ def second():
         visitor = _DirectEnergyPathVisitor()
         visitor.visit(tree)
         self.assertEqual([], visitor.violations)
+
+    def test_function_parameter_shadows_module_upload_root_alias(self):
+        tree = ast.parse("""
+root = app.config["UPLOAD_FOLDER"]
+def route(root):
+    return os.path.join(root, "energy", report_number)
+""")
+        visitor = _DirectEnergyPathVisitor()
+        visitor.visit(tree)
+        self.assertEqual([], visitor.violations)
+
+    def test_function_local_non_upload_bindings_shadow_module_aliases(self):
+        tree = ast.parse("""
+root = app.config["UPLOAD_FOLDER"]
+def assigned_route():
+    root = "unrelated"
+    return os.path.join(root, "energy", report_number)
+def assigned_after_use_route():
+    result = os.path.join(root, "energy", report_number)
+    root = "unrelated"
+    return result
+def imported_route():
+    from unrelated import root
+    return os.path.join(root, "energy", report_number)
+""")
+        visitor = _DirectEnergyPathVisitor()
+        visitor.visit(tree)
+        self.assertEqual([], visitor.violations)
+
+    def test_async_function_aliases_do_not_leak_between_siblings(self):
+        tree = ast.parse("""
+async def first():
+    root = app.config["UPLOAD_FOLDER"]
+    return root
+async def second():
+    return os.path.join(root, "energy", report_number)
+""")
+        visitor = _DirectEnergyPathVisitor()
+        visitor.visit(tree)
+        self.assertEqual([], visitor.violations)
+
+    def test_unshadowed_enclosing_and_async_local_upload_aliases_are_detected(self):
+        tree = ast.parse("""
+module_root = app.config["UPLOAD_FOLDER"]
+async def module_route():
+    return os.path.join(module_root, "energy", report_number)
+def outer():
+    enclosing_root = app.config["UPLOAD_FOLDER"]
+    async def inner():
+        return os.path.join(enclosing_root, "energy", report_number)
+async def local_route():
+    local_root = app.config["UPLOAD_FOLDER"]
+    return os.path.join(local_root, "energy", report_number)
+""")
+        visitor = _DirectEnergyPathVisitor()
+        visitor.visit(tree)
+        self.assertEqual(
+            [
+                (4, "os.path.join(module_root, 'energy', report_number)"),
+                (8, "os.path.join(enclosing_root, 'energy', report_number)"),
+                (11, "os.path.join(local_root, 'energy', report_number)"),
+            ],
+            visitor.violations,
+        )
 
     def test_read_only_preflight_accepts_only_persisted_owner_keys(self):
         from tools.user_report_storage_preflight import StorageLayoutError, validate_layout

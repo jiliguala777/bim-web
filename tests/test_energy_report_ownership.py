@@ -1,4 +1,5 @@
 import io
+import json
 import os
 import sqlite3
 import tempfile
@@ -349,6 +350,14 @@ class PdfOwnerBindingTests(unittest.TestCase):
             state.clear()
             state.update(logged_in=True, username=username, is_admin=False)
 
+    def symlink_or_skip(self, link, target, *, target_is_directory=False):
+        try:
+            link.symlink_to(target, target_is_directory=target_is_directory)
+        except OSError as error:
+            if getattr(error, "winerror", None) == 1314:
+                self.skipTest("creating symlinks requires Windows developer mode or privilege")
+            raise
+
     @staticmethod
     def pdf_form(report_number):
         from reportlab.pdfgen import canvas
@@ -391,6 +400,116 @@ class PdfOwnerBindingTests(unittest.TestCase):
             )
 
         self.assertIn(response.status_code, {400, 403})
+
+    def test_report_child_file_validator_rejects_a_regular_file_outside_the_report(self):
+        report_dir = self.upload_root / "energy" / user_storage_key("alice") / "BIM-CHILD"
+        report_dir.mkdir(parents=True)
+        outside = self.upload_root / "outside.pdf"
+        outside.write_bytes(b"outside")
+        validator = getattr(
+            self.server,
+            "_validated_report_child_file",
+            lambda *_args, **_kwargs: None,
+        )
+
+        with self.assertRaises(self.server.InvalidReportPath):
+            validator(report_dir, outside)
+
+    def test_report_child_directory_validator_rejects_a_directory_outside_the_report(self):
+        report_dir = self.upload_root / "energy" / user_storage_key("alice") / "BIM-CHILD"
+        report_dir.mkdir(parents=True)
+        outside = self.upload_root / "outside-artifacts"
+        outside.mkdir()
+        validator = getattr(
+            self.server,
+            "_validated_report_child_directory",
+            lambda *_args, **_kwargs: None,
+        )
+
+        with self.assertRaises(self.server.InvalidReportPath):
+            validator(report_dir, outside)
+
+    def test_prepared_pdf_symlink_cannot_escape_the_owner_report(self):
+        import numpy as np
+
+        self.login_as("alice")
+        prepared_response = self.client.post(
+            "/energy/pdf_prepare",
+            data=self.pdf_form("BIM-PDF-SYMLINK"),
+            content_type="multipart/form-data",
+        )
+        self.assertEqual(prepared_response.status_code, 200, prepared_response.get_json())
+        prepared = prepared_response.get_json()
+        report_dir = (
+            self.upload_root / "energy" / user_storage_key("alice") / "BIM-PDF-SYMLINK"
+        )
+        stored_pdf = next(report_dir.glob("building_plan_prepared_*.pdf"))
+        outside_pdf = self.upload_root / "outside.pdf"
+        outside_pdf.write_bytes(stored_pdf.read_bytes())
+        stored_pdf.unlink()
+        self.symlink_or_skip(stored_pdf, outside_pdf)
+
+        with patch.object(
+            self.server,
+            "render_pdf_page_preview",
+            return_value=np.zeros((2, 2, 3), dtype=np.uint8),
+        ) as render:
+            response = self.client.post(
+                "/energy/pdf_page_preview",
+                data={
+                    "report_number": "BIM-PDF-SYMLINK",
+                    "pdf_upload_token": prepared["upload_token"],
+                    "pdf_page_number": "1",
+                },
+            )
+
+        self.assertEqual(response.status_code, 400, response.get_json())
+        self.assertEqual(response.get_json()["error"], "Invalid report path")
+        self.assertNotIn(str(outside_pdf), response.get_data(as_text=True))
+        render.assert_not_called()
+
+    def test_scale_calibration_rejects_a_symlinked_recognition_artifact(self):
+        self.login_as("alice")
+        report_dir = (
+            self.upload_root / "energy" / user_storage_key("alice")
+            / "BIM-RECOGNITION-SYMLINK"
+        )
+        report_dir.mkdir(parents=True)
+        outside_recognition = self.upload_root / "outside-recognition.json"
+        original_payload = {
+            "schema_version": 1,
+            "model": {"name": "test", "version": "test-v1"},
+            "preprocessing": {"requested": "auto", "use_preprocessing": True},
+            "image_size": [100, 100],
+            "geometry": {"walls": [], "windows": [], "doors": []},
+            "room_topology": {
+                "status": "closed_rooms",
+                "room_count": 1,
+                "rooms": [{"area_px2": 100.0}],
+                "total_area_px2": 100.0,
+                "total_area_m2": None,
+                "load_geometry_ready": False,
+            },
+        }
+        outside_recognition.write_text(json.dumps(original_payload), encoding="utf-8")
+        original_bytes = outside_recognition.read_bytes()
+        self.symlink_or_skip(report_dir / "recognition.json", outside_recognition)
+
+        response = self.client.post(
+            "/energy/scale_calibration",
+            json={
+                "report_number": "BIM-RECOGNITION-SYMLINK",
+                "point_a": [10, 10],
+                "point_b": [20, 10],
+                "actual_length": 1,
+                "unit": "m",
+            },
+        )
+
+        self.assertEqual(response.status_code, 400, response.get_json())
+        self.assertEqual(response.get_json()["error"], "Invalid report path")
+        self.assertNotIn(str(outside_recognition), response.get_data(as_text=True))
+        self.assertEqual(outside_recognition.read_bytes(), original_bytes)
 
     def test_pdf_prepare_parse_error_does_not_expose_the_owner_storage_path(self):
         self.login_as("alice")

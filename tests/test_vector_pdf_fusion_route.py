@@ -26,6 +26,67 @@ class VectorPdfFusionRouteTests(unittest.TestCase):
             session["username"] = "test-user"
             session["is_admin"] = False
 
+    def symlink_or_skip(self, link, target, *, target_is_directory=False):
+        try:
+            link.symlink_to(target, target_is_directory=target_is_directory)
+        except OSError as error:
+            if getattr(error, "winerror", None) == 1314:
+                self.skipTest("creating symlinks requires Windows developer mode or privilege")
+            raise
+
+    def test_route_rejects_a_symlinked_vector_artifact_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            upload_root = Path(directory)
+            report_dir = (
+                upload_root / "energy" / user_storage_key("test-user") / "FUSION-SYMLINK"
+            )
+            report_dir.mkdir(parents=True)
+            (report_dir / "prepared.pdf").write_bytes(b"pdf")
+            outside = upload_root / "outside-vector-artifacts"
+            outside.mkdir()
+            self.symlink_or_skip(
+                report_dir / "vector_pdf_fusion",
+                outside,
+                target_is_directory=True,
+            )
+            token = self.server._make_pdf_upload_token(
+                "test-user", "FUSION-SYMLINK", "prepared.pdf", 1,
+            )
+            previous_upload = self.server.app.config["UPLOAD_FOLDER"]
+            self.server.app.config["UPLOAD_FOLDER"] = str(upload_root)
+
+            def write_outside_then_fail(*args, **kwargs):
+                (outside / "escaped.txt").write_text("escaped", encoding="utf-8")
+                raise RuntimeError("pipeline followed vector artifact directory alias")
+
+            try:
+                with (
+                    mock.patch.object(self.server, "HAS_VECTOR_PDF_FUSION", True),
+                    mock.patch.object(self.server, "_vector_pdf_fusion_config", object()),
+                    mock.patch.object(
+                        self.server,
+                        "analyze_vector_pdf_page",
+                        side_effect=write_outside_then_fail,
+                    ) as analyze,
+                ):
+                    response = self.client.post(
+                        "/energy/vector_pdf_fusion",
+                        data={
+                            "report_number": "FUSION-SYMLINK",
+                            "pdf_upload_token": token,
+                            "pdf_page_number": "1",
+                            "recognition_mode": "full_page",
+                        },
+                    )
+            finally:
+                self.server.app.config["UPLOAD_FOLDER"] = previous_upload
+
+            self.assertEqual(response.status_code, 400, response.get_json())
+            self.assertEqual(response.get_json()["error"], "Invalid report path")
+            self.assertNotIn(str(outside), response.get_data(as_text=True))
+            self.assertFalse((outside / "escaped.txt").exists())
+            analyze.assert_not_called()
+
     def test_route_uses_new_pipeline_without_writing_recognition_or_calling_onnx(self):
         with tempfile.TemporaryDirectory() as directory:
             upload_root = Path(directory)

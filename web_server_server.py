@@ -1746,6 +1746,74 @@ def _recognition_json_path(target_dir):
     return os.path.join(target_dir, 'recognition.json')
 
 
+def _canonical_report_directory(report_dir):
+    report_path = Path(report_dir)
+    if report_path.is_symlink() or not report_path.is_dir():
+        raise InvalidReportPath('report directory is invalid')
+    try:
+        return report_path.resolve(strict=True)
+    except OSError as exc:
+        raise InvalidReportPath('report directory is invalid') from exc
+
+
+def _validated_report_child_file(report_dir, child_path, *, required=True):
+    """Return one regular, non-aliased file directly below *report_dir*."""
+    canonical_report = _canonical_report_directory(report_dir)
+    candidate = Path(child_path)
+    if candidate.is_symlink():
+        raise InvalidReportPath('report child file is invalid')
+    try:
+        resolved = candidate.resolve(strict=True)
+    except FileNotFoundError:
+        if required:
+            raise
+        try:
+            parent = candidate.parent.resolve(strict=True)
+        except OSError as exc:
+            raise InvalidReportPath('report child file is invalid') from exc
+        if parent != canonical_report:
+            raise InvalidReportPath('report child file is invalid')
+        return canonical_report / candidate.name
+    except OSError as exc:
+        raise InvalidReportPath('report child file is invalid') from exc
+    if resolved.parent != canonical_report or not resolved.is_file():
+        raise InvalidReportPath('report child file is invalid')
+    return resolved
+
+
+def _validated_report_child_directory(report_dir, child_path, *, create=False):
+    """Return one non-aliased directory directly below *report_dir*."""
+    canonical_report = _canonical_report_directory(report_dir)
+    candidate = Path(child_path)
+    if candidate.is_symlink():
+        raise InvalidReportPath('report child directory is invalid')
+    try:
+        resolved = candidate.resolve(strict=True)
+    except FileNotFoundError:
+        if not create:
+            raise
+        try:
+            parent = candidate.parent.resolve(strict=True)
+        except OSError as exc:
+            raise InvalidReportPath('report child directory is invalid') from exc
+        if parent != canonical_report:
+            raise InvalidReportPath('report child directory is invalid')
+        try:
+            candidate.mkdir()
+        except FileExistsError:
+            pass
+        return _validated_report_child_directory(
+            canonical_report,
+            candidate,
+            create=False,
+        )
+    except OSError as exc:
+        raise InvalidReportPath('report child directory is invalid') from exc
+    if resolved.parent != canonical_report or not resolved.is_dir():
+        raise InvalidReportPath('report child directory is invalid')
+    return resolved
+
+
 def _geometry_summary(geometry):
     geometry = geometry or {}
     return {
@@ -1868,9 +1936,12 @@ def _build_recognition_payload(result, preprocessing, use_preprocessing, raster_
 
 
 def _save_recognition_payload(target_dir, payload):
-    path = _recognition_json_path(target_dir)
-    with open(path, 'w', encoding='utf-8') as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2)
+    path = _validated_report_child_file(
+        target_dir,
+        _recognition_json_path(target_dir),
+        required=False,
+    )
+    _atomic_write_json(path, payload)
     return path
 
 
@@ -1886,10 +1957,16 @@ def _enforce_topology_repair_readiness(topology, topology_repair):
 
 
 def _load_recognition_payload(target_dir):
-    path = _recognition_json_path(target_dir)
-    if not os.path.exists(path):
+    if not Path(target_dir).exists():
         return None
-    with open(path, 'r', encoding='utf-8') as f:
+    try:
+        path = _validated_report_child_file(
+            target_dir,
+            _recognition_json_path(target_dir),
+        )
+    except FileNotFoundError:
+        return None
+    with path.open('r', encoding='utf-8') as f:
         payload = json.load(f)
     if payload.get('schema_version') != RECOGNITION_SCHEMA_VERSION:
         return None
@@ -2017,8 +2094,12 @@ def _validated_prepared_pdf(owner_username, report_number, pdf_upload_token, pdf
         report_number,
         requested_owner=owner_username,
     )
-    pdf_path = context.report_dir / stored_filename
-    if not pdf_path.is_file():
+    try:
+        pdf_path = _validated_report_child_file(
+            context.report_dir,
+            context.report_dir / stored_filename,
+        )
+    except FileNotFoundError:
         raise ValueError('Prepared PDF file no longer exists')
     return pdf_path, page_number, page_count
 
@@ -2031,18 +2112,21 @@ def _require_exterior_report_dir(context):
     """Resolve one literal report directory without accepting aliases or links."""
     if not isinstance(context, EnergyReportContext):
         raise ValueError('report context is invalid')
-    report_path = context.report_dir
-    if not report_path.is_dir():
-        raise FileNotFoundError('Report does not exist')
-    resolved_report = report_path.resolve(strict=True)
-    if report_path.is_symlink() or resolved_report.parent != context.owner_root.resolve(strict=True):
+    try:
+        resolved_report = _canonical_report_directory(context.report_dir)
+    except InvalidReportPath:
+        if not context.report_dir.exists():
+            raise FileNotFoundError('Report does not exist') from None
+        raise
+    if resolved_report.parent != context.owner_root.resolve(strict=True):
         raise ValueError('report path is invalid')
-    artifact_path = resolved_report / 'vector_pdf_fusion'
-    if not artifact_path.is_dir():
+    try:
+        resolved_artifacts = _validated_report_child_directory(
+            resolved_report,
+            resolved_report / 'vector_pdf_fusion',
+        )
+    except FileNotFoundError:
         raise FileNotFoundError('Vector PDF fusion artifacts do not exist')
-    resolved_artifacts = artifact_path.resolve(strict=True)
-    if artifact_path.is_symlink() or resolved_artifacts.parent != resolved_report:
-        raise ValueError('Vector PDF fusion artifact path is invalid')
     return resolved_report, resolved_artifacts
 
 
@@ -2999,7 +3083,14 @@ def vector_pdf_fusion():
         return jsonify({'error': str(exc)}), 400
 
     report_dir = context.report_dir
-    target_dir = report_dir / 'vector_pdf_fusion'
+    try:
+        target_dir = _validated_report_child_directory(
+            report_dir,
+            report_dir / 'vector_pdf_fusion',
+            create=True,
+        )
+    except _REPORT_STORAGE_EXCEPTIONS as exc:
+        return _report_storage_error_response(exc)
     generation_marker = _new_exterior_generation(report_number)
     _write_exterior_generation(report_dir, generation_marker)
     try:
@@ -3313,7 +3404,7 @@ def vector_pdf_exterior_confirm():
             topology_sha256=current_hash,
             expected_generation=generation_marker['generation'],
         )
-        _atomic_write_json(report_dir / 'recognition.json', recognition)
+        _save_recognition_payload(report_dir, recognition)
         _require_current_exterior_generation(
             report_dir,
             report_number,

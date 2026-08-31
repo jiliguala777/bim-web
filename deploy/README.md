@@ -323,6 +323,143 @@ sudo tail -n 100 /var/log/nginx/error.log
 
 ## 12. 后续更新
 
+### 12.1 用户隔离报告存储发布（必须停服并执行）
+
+本版本把用户报告从旧的平面目录改为按用户隔离的目录。生产目录结构为：
+
+```text
+/var/lib/bim-web/uploads/
+├── energy/
+│   └── <安全用户名目录>/
+│       └── <报告编号>/
+│           ├── recognition.json
+│           ├── building_plan_prepared_*.pdf
+│           └── ...识别与计算产物
+└── ops/
+    └── bestest/                  非用户报告的运维基准夹具
+```
+
+即用户报告的唯一合法位置是：
+
+```text
+/var/lib/bim-web/uploads/energy/<安全用户名目录>/<报告编号>/
+```
+
+`<安全用户名目录>` 是服务端根据用户名生成的稳定目录键，不能由客户端指定。
+`uploads/ops/` 仅用于 BESTEST 等运维夹具，不是用户报告，也不得用作兼容旧目录的
+后备位置。
+
+此发布不迁移、读取或兼容旧的：
+
+```text
+/var/lib/bim-web/uploads/energy/<报告编号>/
+```
+
+若预检发现旧平面目录，必须中止发布。**不自动移动或删除**任何旧目录或文件；由
+数据负责人确认后，另行制定迁移方案。以下命令不包含密码、令牌或密钥，所有
+`<...>` 均为需要操作员明确替换的占位符。
+
+1. 记录当前代码，停止服务，完成两个独立的显式备份。停止服务是为了让
+   `users.db` 与 `uploads` 的备份保持同一时点：
+
+   ```bash
+   runuser -u bimweb -- git -C /opt/bim-web/app rev-parse HEAD
+   sudo systemctl stop bim-web
+   sudo systemctl is-active --quiet bim-web && exit 1
+
+   backup_dir=/var/backups/bim-web/user-scope-$(date +%Y%m%d-%H%M%S)
+   sudo install -d -m 0700 "$backup_dir"
+   sudo cp -a /var/lib/bim-web/users.db "$backup_dir/users.db"
+   sudo cp -a /var/lib/bim-web/uploads "$backup_dir/uploads"
+   sudo ls -ld "$backup_dir" "$backup_dir/users.db" "$backup_dir/uploads"
+   ```
+
+2. 在服务仍停止时执行平面目录预检。它只检查并在异常时退出；不会移动、重命名或
+   删除数据。新目录的第一层必须是安全用户名目录键，且该层下只能有报告目录：
+
+   ```bash
+   sudo /opt/bim-web/venv/bin/python - <<'PY'
+   from pathlib import Path
+   import re
+   import sys
+
+   root = Path('/var/lib/bim-web/uploads/energy')
+   owner_key = re.compile(r'.+-[0-9a-f]{8}\Z')
+   problems = []
+   if root.exists():
+       for entry in root.iterdir():
+           if not entry.is_dir() or not owner_key.fullmatch(entry.name):
+               problems.append(str(entry))
+               continue
+           problems.extend(str(child) for child in entry.iterdir() if not child.is_dir())
+   if problems:
+       print('ABORT: detected legacy flat report path or invalid energy layout:', file=sys.stderr)
+       print('\n'.join(problems), file=sys.stderr)
+       raise SystemExit(1)
+   print('Preflight passed: no flat legacy report directories found.')
+   PY
+   ```
+
+   预检失败时保持服务停止，不执行 `git pull`，保留备份，并报告列出的路径。不要以
+   手工移动或删除来绕过门禁。
+
+3. 预检通过后拉取已验证代码并启动服务。应用启动时会在 SQLite **事务**中完成
+   `reports` 的复合身份迁移和索引创建；迁移抛出异常时必须视为发布失败，不应继续
+   写入：
+
+   ```bash
+   runuser -u bimweb -- git -C /opt/bim-web/app fetch origin main
+   runuser -u bimweb -- git -C /opt/bim-web/app pull --ff-only origin main
+   sudo systemctl start bim-web
+   sudo systemctl status bim-web --no-pager
+   sudo journalctl -u bim-web -n 200 --no-pager
+   ```
+
+4. 完成以下上线验证，至少保留浏览器截图、报告编号和日志时间戳：
+
+   - 用两个普通测试账号分别创建相同的报告编号；确认它们位于两个不同的
+     `<安全用户名目录>/<报告编号>/`，SQLite 也有两条 `(username, report_number)`
+     记录；
+   - 用第一个普通账号尝试以第二个账号的 `owner_username` 读取、识别或计算报告，
+     必须返回 `HTTP 403`，且不产生任何文件；
+   - 用配置好的管理员登录，显式选择并打开两个普通账号的报告；管理员可以查看，
+     普通账号不能通过猜测目录或报告编号越权；
+   - 对其中一个普通账号完成完整 PDF 流程：上传 PDF、读取并选择页面、AI 识别、
+     必要时两点比例尺标定、材料/参数设置、能耗计算和历史报告读取。确认产物仍在
+     该账号的报告目录，重启服务后记录和产物仍存在。
+
+5. 若任一步失败，使用下面的回滚步骤。不要在服务运行时替换数据库或上传目录。
+
+### 12.2 用户隔离报告存储回滚
+
+回滚必须同时恢复代码、`users.db` 和 `uploads` 到同一个发布前备份，避免旧代码与
+新结构混用。将 `<已验证提交>` 和 `<发布前备份目录>` 替换为步骤 1 中实际记录的值：
+
+```bash
+sudo systemctl stop bim-web
+sudo systemctl is-active --quiet bim-web && exit 1
+
+runuser -u bimweb -- \
+  git -C /opt/bim-web/app switch --detach <已验证提交>
+
+failed_runtime=/var/lib/bim-web/failed-user-scope-$(date +%Y%m%d-%H%M%S)
+sudo install -d -m 0700 "$failed_runtime"
+sudo mv /var/lib/bim-web/users.db "$failed_runtime/users.db"
+sudo mv /var/lib/bim-web/uploads "$failed_runtime/uploads"
+sudo cp -a <发布前备份目录>/users.db /var/lib/bim-web/users.db
+sudo cp -a <发布前备份目录>/uploads /var/lib/bim-web/uploads
+sudo chown bimweb:bimweb /var/lib/bim-web/users.db
+sudo chown -R bimweb:bimweb /var/lib/bim-web/uploads
+
+sudo systemctl start bim-web
+sudo systemctl status bim-web --no-pager
+sudo journalctl -u bim-web -n 200 --no-pager
+```
+
+恢复后先用普通账号和管理员登录各验证一次，并重跑一条完整 PDF 流程；确认无误后
+再决定是否回到 `main`。回滚不会删除故障版本的数据副本；`$failed_runtime` 和备份
+目录都应保留给排障。
+
 在本地完成修改、测试并推送私人 GitHub 后，在服务器执行：
 
 ```bash

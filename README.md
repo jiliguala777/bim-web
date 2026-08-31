@@ -212,6 +212,71 @@ Gunicorn 只监听 `127.0.0.1:8000`，不要在腾讯云防火墙中开放 8000 
 `users.db`、`uploads/`、模型和环境文件都在代码发布范围之外，正常
 `git pull` 不会覆盖这些内容。
 
+### 6.1 用户隔离报告目录、发布门禁与回滚
+
+用户报告必须保存在下列目录，用户名目录键由服务端生成；客户端不得提交或猜测该
+目录键：
+
+```text
+/var/lib/bim-web/uploads/
+├── energy/
+│   └── <安全用户名目录>/
+│       └── <报告编号>/
+│           └── 识别、PDF、标定和能耗计算产物
+└── ops/
+    └── bestest/                  仅运维基准夹具
+```
+
+因此正式用户报告路径为：
+
+```text
+/var/lib/bim-web/uploads/energy/<安全用户名目录>/<报告编号>/
+```
+
+`uploads/ops/` 是已记录的运维例外，不能保存用户报告。旧的平面目录
+`uploads/energy/<报告编号>/` 不受支持，也不会自动迁移。发布前必须停止服务，
+分别备份 `/var/lib/bim-web/users.db` 和 `/var/lib/bim-web/uploads`，并运行
+`deploy/README.md` 的“用户隔离报告存储发布”预检。预检发现平面目录时必须中止；
+**不自动移动或删除**旧数据。
+
+```bash
+sudo systemctl stop bim-web
+sudo systemctl is-active --quiet bim-web && exit 1
+backup_dir=/var/backups/bim-web/user-scope-$(date +%Y%m%d-%H%M%S)
+sudo install -d -m 0700 "$backup_dir"
+sudo cp -a /var/lib/bim-web/users.db "$backup_dir/users.db"
+sudo cp -a /var/lib/bim-web/uploads "$backup_dir/uploads"
+```
+
+仅在上述预检通过后才可拉取代码并启动服务；应用会在启动时以事务迁移
+`reports` 的 `(username, report_number)` 身份。若迁移、启动或验证失败，保持服务
+停止，不要让旧代码读取新结构。将代码切回已验证提交，并从同一 `$backup_dir` 恢复
+`users.db` 与 `uploads` 后再启动：
+
+```bash
+sudo systemctl stop bim-web
+runuser -u bimweb -- git -C /opt/bim-web/app switch --detach <已验证提交>
+failed_runtime=/var/lib/bim-web/failed-user-scope-$(date +%Y%m%d-%H%M%S)
+sudo install -d -m 0700 "$failed_runtime"
+sudo mv /var/lib/bim-web/users.db "$failed_runtime/users.db"
+sudo mv /var/lib/bim-web/uploads "$failed_runtime/uploads"
+sudo cp -a "$backup_dir/users.db" /var/lib/bim-web/users.db
+sudo cp -a "$backup_dir/uploads" /var/lib/bim-web/uploads
+sudo chown bimweb:bimweb /var/lib/bim-web/users.db
+sudo chown -R bimweb:bimweb /var/lib/bim-web/uploads
+sudo systemctl start bim-web
+```
+
+该发布由应用启动时的 SQLite **事务**迁移完成。上线后应让两个普通账号用相同的
+报告编号测试隔离，确认跨用户请求返回 `HTTP 403`，再让管理员显式访问两人的
+报告；随后至少完成一次完整 PDF 流程（上传、选页、识别、比例尺、能耗计算和
+历史读取）。
+
+失败时先停止 `bim-web`，然后按部署指南恢复同一备份时点的代码、`users.db` 和
+`uploads`，再启动服务并重新完成普通用户、管理员和完整 PDF 流程验证。详见
+[Ubuntu 24.04 部署指南](deploy/README.md#121-用户隔离报告存储发布必须停服并执行)
+中的安全备份、预检、验证和回滚命令；命令不包含任何密码或密钥。
+
 ## 7. 环境变量
 
 `.env.example` 中的生产变量：

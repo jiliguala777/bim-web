@@ -4508,14 +4508,21 @@ def get_user_reports():
         results = []
         for r in rows:
             res_data = json.loads(r['results'] or '{}')
+            if not isinstance(res_data, dict):
+                res_data = {}
             summary = res_data.get('summary', {})
+            if not isinstance(summary, dict):
+                summary = {}
+            geometry_data = json.loads(r['geometry_used'] or '{}')
+            if not isinstance(geometry_data, dict):
+                geometry_data = {}
             results.append({
                 'username': r['username'],
                 'report_number': r['report_number'],
                 'status': r['status'],
                 'created_at': r['created_at'],
                 'updated_at': r['updated_at'],
-                'floor_area': json.loads(r['geometry_used'] or '{}').get('floor_area_m2', 0),
+                'floor_area': geometry_data.get('floor_area_m2', 0),
                 'total_energy': summary.get('total_energy_kwh', 0),
                 'eui': summary.get('eui', 0),
                 'rating': summary.get('rating', '-')

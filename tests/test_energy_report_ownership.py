@@ -961,6 +961,76 @@ class ReportOperationAuthorizationTests(unittest.TestCase):
         self.assertNotIn(str(self.upload_root), serialized)
         self.assertNotIn(user_storage_key("alice"), serialized)
 
+    def test_report_lists_default_valid_non_object_json_for_users_and_admins(self):
+        connection = self.server.get_db_connection()
+        connection.executemany(
+            """
+            INSERT INTO reports (
+                username, report_number, status, created_at, updated_at,
+                geometry_used, results
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    "bob", "NULL-PAYLOAD", "recognized",
+                    "2026-02-01 00:00:00", "2026-02-01 00:00:00",
+                    json.dumps(None), json.dumps(None),
+                ),
+                (
+                    "bob", "NULL-SUMMARY", "calculated",
+                    "2026-02-02 00:00:00", "2026-02-02 00:00:00",
+                    json.dumps({}), json.dumps({"summary": None}),
+                ),
+                (
+                    "bob", "LIST-SUMMARY", "calculated",
+                    "2026-02-03 00:00:00", "2026-02-03 00:00:00",
+                    json.dumps({}), json.dumps({"summary": []}),
+                ),
+            ],
+        )
+        connection.commit()
+        connection.close()
+
+        self.login_as("bob")
+        ordinary = self.client.get("/energy/reports")
+        self.assertEqual(ordinary.status_code, 200, ordinary.get_json())
+
+        with patch.dict(
+            os.environ,
+            {"ADMIN_USER": "admin", "ADMIN_PASSWORD": "secret"},
+            clear=False,
+        ):
+            login = self.client.post(
+                "/login",
+                json={"username": "admin", "password": "secret"},
+            )
+        self.assertEqual(login.status_code, 200, login.get_json())
+        administrator = self.client.get("/energy/reports")
+        self.assertEqual(administrator.status_code, 200, administrator.get_json())
+
+        for response in (ordinary, administrator):
+            reports = {
+                item["report_number"]: item
+                for item in response.get_json()
+            }
+            for report_number, status in (
+                ("NULL-PAYLOAD", "recognized"),
+                ("NULL-SUMMARY", "calculated"),
+                ("LIST-SUMMARY", "calculated"),
+            ):
+                with self.subTest(
+                    role="admin" if response is administrator else "ordinary",
+                    report_number=report_number,
+                ):
+                    item = reports[report_number]
+                    self.assertEqual(item["username"], "bob")
+                    self.assertEqual(item["report_number"], report_number)
+                    self.assertEqual(item["status"], status)
+                    self.assertEqual(item["floor_area"], 0)
+                    self.assertEqual(item["total_energy"], 0)
+                    self.assertEqual(item["eui"], 0)
+                    self.assertEqual(item["rating"], "-")
+
     def test_report_read_internal_errors_are_sanitized(self):
         self.login_as("alice")
         secret = str(self.upload_root / "private-database.db")

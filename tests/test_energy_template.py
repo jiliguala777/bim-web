@@ -834,7 +834,7 @@ const context = {
         self.assertIn("owner_username", history_segment)
         self.assertIn("function reportDetailsUrl", html)
         self.assertIn("params.set('owner_username', activeReportOwnerUsername)", html)
-        self.assertIn("fetch(reportDetailsUrl(repNum))", detail_segment)
+        self.assertIn("fetch(reportDetailsUrl(requestedReportNumber))", detail_segment)
         self.assertIn("function appendActiveReportOwnerToFormData", html)
         self.assertIn("function withActiveReportOwner", html)
         self.assertIn("formData.append('owner_username', activeReportOwnerUsername)", html)

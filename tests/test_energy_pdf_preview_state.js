@@ -424,8 +424,278 @@ behavior("the energy template wires the executable state helper", () => {
   );
 });
 
-if (behaviorFailures.length) {
-  throw new Error(`recognition state behavior failures:\n${behaviorFailures.join("\n")}`);
+function inlineEnergyScript() {
+  return [...html.matchAll(/<script(?:[^>]*)>([\s\S]*?)<\/script>/g)]
+    .map((match) => match[1])
+    .find(Boolean);
 }
 
-console.log("energy PDF preview state tests passed");
+class FakeElement {
+  constructor(tagName, innerHtmlWrites) {
+    this.tagName = tagName;
+    this.children = [];
+    this.dataset = {};
+    this.style = {};
+    this.className = "";
+    this.value = "";
+    this.checked = false;
+    this.disabled = false;
+    this._textContent = "";
+    this._innerHTML = "";
+    this.innerHtmlWrites = innerHtmlWrites;
+    this.classList = { add() {}, remove() {}, toggle() {} };
+  }
+
+  set innerHTML(value) {
+    this._innerHTML = String(value);
+    this.innerHtmlWrites.push(this._innerHTML);
+    this.children = [];
+    this._textContent = "";
+  }
+
+  get innerHTML() {
+    return this._innerHTML;
+  }
+
+  set textContent(value) {
+    this._textContent = String(value);
+    this.children = [];
+    this._innerHTML = "";
+  }
+
+  get textContent() {
+    return this._textContent + this.children.map((child) => child.textContent).join("");
+  }
+
+  set innerText(value) {
+    this.textContent = value;
+  }
+
+  get innerText() {
+    return this.textContent;
+  }
+
+  appendChild(child) {
+    this.children.push(child);
+    return child;
+  }
+
+  addEventListener() {}
+  setAttribute() {}
+  removeAttribute() {}
+  querySelectorAll() { return []; }
+}
+
+function createEnergyTemplateContext({ isAdministrator = true, fetch }) {
+  const innerHtmlWrites = [];
+  const elements = new Proxy({}, {
+    get(target, key) {
+      if (!target[key]) target[key] = new FakeElement("div", innerHtmlWrites);
+      return target[key];
+    },
+  });
+  const document = {
+    body: { dataset: { isAdministrator: String(isAdministrator) } },
+    addEventListener() {},
+    getElementById(id) { return elements[id]; },
+    querySelectorAll() { return []; },
+    createElement(tagName) { return new FakeElement(tagName, innerHtmlWrites); },
+  };
+  const context = {
+    EnergyPdfRecognitionState: recognitionState,
+    URLSearchParams,
+    AbortController,
+    FormData,
+    Chart: function Chart() {},
+    alert() {},
+    console,
+    document,
+    fetch,
+    window: { addEventListener() {}, scrollTo() {} },
+  };
+  vm.createContext(context);
+  vm.runInContext(inlineEnergyScript(), context);
+  return { context, elements, innerHtmlWrites };
+}
+
+async function historyCardsKeepServerValuesAsText() {
+  const malicious = {
+    username: '<img src=x onerror="steal()">',
+    report_number: '<svg onload="steal()">',
+    created_at: "2026-08-31T12:00:00Z",
+    floor_area: '<iframe src="javascript:steal()">',
+    eui: '<script>steal()</script>',
+    total_energy: 1234,
+    rating: '<a onclick="steal()">A</a>',
+  };
+  const harness = createEnergyTemplateContext({
+    fetch: async () => ({ json: async () => [malicious] }),
+  });
+
+  await vm.runInContext("openHistoryDrawer()", harness.context);
+
+  const container = harness.elements.historyListContainer;
+  assert.strictEqual(container.children.length, 1, "one report must render one card");
+  const renderedText = container.children[0].textContent;
+  for (const literal of [
+    malicious.username,
+    malicious.report_number,
+    malicious.floor_area,
+    malicious.eui,
+    malicious.rating,
+  ]) {
+    assert.ok(renderedText.includes(literal), `history value must remain literal text: ${literal}`);
+  }
+  assert.ok(
+    harness.innerHtmlWrites.every((write) => !write.includes("steal()")),
+    "server-supplied history values must never reach innerHTML",
+  );
+
+  const maliciousError = '<img src=x onerror="stealError()">';
+  const errorHarness = createEnergyTemplateContext({
+    fetch: async () => { throw new Error(maliciousError); },
+  });
+  await vm.runInContext("openHistoryDrawer()", errorHarness.context);
+  assert.ok(
+    errorHarness.elements.historyListContainer.textContent.includes(maliciousError),
+    "history errors must remain visible as literal text",
+  );
+  assert.ok(
+    errorHarness.innerHtmlWrites.every((write) => !write.includes("stealError()")),
+    "server-supplied error text must never reach innerHTML",
+  );
+
+  const ordinaryHarness = createEnergyTemplateContext({
+    isAdministrator: false,
+    fetch: async () => ({
+      json: async () => [{
+        ...malicious,
+        username: "hidden-owner",
+        report_number: "USER-REPORT",
+        floor_area: 120,
+        eui: 45,
+        rating: "A",
+      }],
+    }),
+  });
+  ordinaryHarness.context.selected = [];
+  vm.runInContext(
+    "loadReportDetails = (reportNumber, ownerUsername) => selected.push([reportNumber, ownerUsername]);",
+    ordinaryHarness.context,
+  );
+  await vm.runInContext("openHistoryDrawer()", ordinaryHarness.context);
+  const ordinaryCard = ordinaryHarness.elements.historyListContainer.children[0];
+  assert.ok(ordinaryCard.textContent.includes("USER-REPORT"));
+  assert.ok(!ordinaryCard.textContent.includes("hidden-owner"));
+  ordinaryCard.onclick();
+  assert.strictEqual(ordinaryHarness.context.selected[0].join("\0"), "USER-REPORT\0");
+}
+
+function deferred() {
+  let resolve;
+  const promise = new Promise((done) => { resolve = done; });
+  return { promise, resolve };
+}
+
+async function staleReportDetailsCannotReplaceNewerSelection() {
+  const requests = [];
+  const harness = createEnergyTemplateContext({
+    fetch(url) {
+      const response = deferred();
+      requests.push({ url, response });
+      return response.promise;
+    },
+  });
+  const tracking = { displays: [], identities: [], steps: [], alerts: [] };
+  harness.context.tracking = tracking;
+  vm.runInContext(`
+    closeHistoryDrawer = () => {};
+    showLoader = () => {};
+    hideLoader = () => {};
+    alert = message => tracking.alerts.push(message);
+    setActiveReportIdentity = (nextReportNumber, nextOwnerUsername) => {
+      reportNumber = String(nextReportNumber || '').trim();
+      activeReportOwnerUsername = nextOwnerUsername || null;
+      tracking.identities.push([activeReportOwnerUsername, reportNumber]);
+    };
+    normalizeDetailedEnvelope = () => ({});
+    initializeDetailedEnvelope = () => {};
+    renderDetailedOrientationCards = () => {};
+    setCalculationMode = () => {};
+    updateBoundaryControlState = () => {};
+    inferCalculationEnabled = () => true;
+    heatingSystemEfficiencyDefault = () => 1;
+    updateCalculationScopeControls = () => {};
+    updatePhysicalLengths = () => {};
+    updateAnnualUsePreview = () => {};
+    updateDesignTemperatureNotice = () => {};
+    displayResults = data => tracking.displays.push(data.marker);
+    gotoStep = step => tracking.steps.push(step);
+  `, harness.context);
+
+  const loadA = vm.runInContext("loadReportDetails('SHARED-REPORT', 'alice')", harness.context);
+  const loadB = vm.runInContext("loadReportDetails('SHARED-REPORT', 'bob')", harness.context);
+  assert.deepStrictEqual(
+    requests.map((request) => request.url),
+    [
+      "/energy/report/SHARED-REPORT?owner_username=alice",
+      "/energy/report/SHARED-REPORT?owner_username=bob",
+    ],
+  );
+
+  requests[1].response.resolve({
+    json: async () => ({
+      report_number: "SHARED-REPORT",
+      username: "bob",
+      params: {},
+      results: { marker: "bob result" },
+    }),
+  });
+  await loadB;
+  requests[0].response.resolve({
+    json: async () => ({
+      report_number: "SHARED-REPORT",
+      username: "alice",
+      params: {},
+      results: { marker: "alice result" },
+    }),
+  });
+  await loadA;
+
+  assert.strictEqual(harness.elements["current-report-number"].value, "SHARED-REPORT");
+  assert.deepStrictEqual(tracking.displays, ["bob result"]);
+  assert.deepStrictEqual(tracking.steps, [4]);
+  assert.strictEqual(tracking.identities.at(-1).join("\0"), "bob\0SHARED-REPORT");
+  assert.deepStrictEqual(tracking.alerts, []);
+
+  const loadC = vm.runInContext("loadReportDetails('REPORT-C', 'carol')", harness.context);
+  requests[2].response.resolve({
+    json: async () => ({ error: "current detail failure" }),
+  });
+  await loadC;
+  assert.strictEqual(tracking.alerts.length, 1);
+  assert.ok(tracking.alerts[0].includes("current detail failure"));
+}
+
+async function main() {
+  const failures = [...behaviorFailures];
+  for (const [name, run] of [
+    ["history cards keep server values as text", historyCardsKeepServerValuesAsText],
+    ["stale report details cannot replace newer selection", staleReportDetailsCannotReplaceNewerSelection],
+  ]) {
+    try {
+      await run();
+    } catch (error) {
+      failures.push(`${name}: ${error.message}`);
+    }
+  }
+  if (failures.length) {
+    throw new Error(`energy template behavior failures:\n${failures.join("\n")}`);
+  }
+  console.log("energy PDF preview state tests passed");
+}
+
+main().catch((error) => {
+  console.error(error);
+  process.exitCode = 1;
+});

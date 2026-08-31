@@ -312,6 +312,256 @@ class ReportOwnershipHelperTests(unittest.TestCase):
         self.assertEqual(self.server._report_row("alice", "EXISTS")["status"], "failed")
 
 
+class PdfOwnerBindingTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        import web_server_server
+
+        cls.server = web_server_server
+        cls.server.app.config.update(TESTING=True, SECRET_KEY="pdf-owner-binding-test")
+
+    def setUp(self):
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        temporary_root = Path(self.temporary_directory.name)
+        self.database_path = temporary_root / "users.db"
+        self.upload_root = temporary_root / "uploads"
+        self.original_database_path = self.server.DB_PATH
+        self.original_upload_folder = self.server.app.config["UPLOAD_FOLDER"]
+        self.server.DB_PATH = str(self.database_path)
+        self.server.app.config["UPLOAD_FOLDER"] = str(self.upload_root)
+        self.server.init_db()
+        connection = self.server.get_db_connection()
+        connection.executemany(
+            "INSERT INTO users (username, password_hash) VALUES (?, ?)",
+            [("alice", "hash"), ("bob", "hash")],
+        )
+        connection.commit()
+        connection.close()
+        self.client = self.server.app.test_client()
+
+    def tearDown(self):
+        self.server.DB_PATH = self.original_database_path
+        self.server.app.config["UPLOAD_FOLDER"] = self.original_upload_folder
+        self.temporary_directory.cleanup()
+
+    def login_as(self, username):
+        with self.client.session_transaction() as state:
+            state.clear()
+            state.update(logged_in=True, username=username, is_admin=False)
+
+    @staticmethod
+    def pdf_form(report_number):
+        from reportlab.pdfgen import canvas
+
+        pdf = io.BytesIO()
+        document = canvas.Canvas(pdf)
+        document.drawString(72, 720, "owner-bound prepared PDF")
+        document.save()
+        pdf.seek(0)
+        return {
+            "report_number": report_number,
+            "raster_file": (pdf, "floor.pdf"),
+        }
+
+    def test_pdf_token_cannot_be_reused_by_another_user(self):
+        import numpy as np
+
+        self.login_as("alice")
+        prepared_response = self.client.post(
+            "/energy/pdf_prepare",
+            data=self.pdf_form("BIM-1"),
+            content_type="multipart/form-data",
+        )
+        self.assertEqual(prepared_response.status_code, 200, prepared_response.get_json())
+        prepared = prepared_response.get_json()
+
+        self.login_as("bob")
+        with patch.object(
+            self.server,
+            "render_pdf_page_preview",
+            return_value=np.zeros((2, 2, 3), dtype=np.uint8),
+        ):
+            response = self.client.post(
+                "/energy/pdf_page_preview",
+                data={
+                    "report_number": "BIM-1",
+                    "pdf_upload_token": prepared["upload_token"],
+                    "pdf_page_number": "1",
+                },
+            )
+
+        self.assertIn(response.status_code, {400, 403})
+
+    def test_pdf_prepare_parse_error_does_not_expose_the_owner_storage_path(self):
+        self.login_as("alice")
+        leaked_path = self.upload_root / "energy" / user_storage_key("alice") / "BIM-SECRET"
+
+        with patch("pdfplumber.open", side_effect=RuntimeError(str(leaked_path))):
+            response = self.client.post(
+                "/energy/pdf_prepare",
+                data=self.pdf_form("BIM-SECRET"),
+                content_type="multipart/form-data",
+            )
+
+        self.assertEqual(response.status_code, 400, response.get_json())
+        self.assertEqual(response.get_json()["error"], "Cannot read PDF")
+        self.assertNotIn(str(leaked_path), response.get_data(as_text=True))
+
+    def test_pdf_preview_internal_error_does_not_expose_the_prepared_file_path(self):
+        self.login_as("alice")
+        prepared = self.client.post(
+            "/energy/pdf_prepare",
+            data=self.pdf_form("BIM-PREVIEW-SECRET"),
+            content_type="multipart/form-data",
+        ).get_json()
+        leaked_path = (
+            self.upload_root / "energy" / user_storage_key("alice")
+            / "BIM-PREVIEW-SECRET" / "prepared.pdf"
+        )
+
+        with patch.object(
+            self.server,
+            "render_pdf_page_preview",
+            side_effect=RuntimeError(str(leaked_path)),
+        ):
+            response = self.client.post(
+                "/energy/pdf_page_preview",
+                data={
+                    "report_number": "BIM-PREVIEW-SECRET",
+                    "pdf_upload_token": prepared["upload_token"],
+                    "pdf_page_number": "1",
+                },
+            )
+
+        self.assertEqual(response.status_code, 500, response.get_json())
+        self.assertEqual(response.get_json()["error"], "Internal server error")
+        self.assertNotIn(str(leaked_path), response.get_data(as_text=True))
+
+    def test_ai_recognition_pdf_conversion_error_does_not_expose_the_owner_storage_path(self):
+        self.login_as("alice")
+        prepared = self.client.post(
+            "/energy/pdf_prepare",
+            data=self.pdf_form("BIM-CONVERSION-SECRET"),
+            content_type="multipart/form-data",
+        ).get_json()
+        leaked_path = (
+            self.upload_root / "energy" / user_storage_key("alice")
+            / "BIM-CONVERSION-SECRET" / "building_plan_ai.png"
+        )
+
+        with (
+            patch.object(self.server, "HAS_FLOORPLAN_AI", True),
+            patch.object(
+                self.server,
+                "_floorplan_segmenter",
+                MagicMock(),
+                create=True,
+            ),
+            patch.object(
+                self.server,
+                "prepare_pdf_page",
+                side_effect=RuntimeError(str(leaked_path)),
+            ),
+        ):
+            response = self.client.post(
+                "/energy/ai_recognize",
+                data={
+                    "report_number": "BIM-CONVERSION-SECRET",
+                    "pdf_upload_token": prepared["upload_token"],
+                    "pdf_page_number": "1",
+                },
+            )
+
+        self.assertEqual(response.status_code, 500, response.get_json())
+        self.assertEqual(response.get_json()["error"], "Internal server error")
+        self.assertNotIn(str(leaked_path), response.get_data(as_text=True))
+
+    def test_ai_recognition_status_updates_only_the_authenticated_report_owner(self):
+        import numpy as np
+
+        self.server._upsert_report_status("alice", "BIM-STATUS", "created")
+        self.server._upsert_report_status("bob", "BIM-STATUS", "created")
+        self.login_as("alice")
+
+        def prediction(*args, **kwargs):
+            self.assertEqual(
+                self.server._report_row("alice", "BIM-STATUS")["status"],
+                "recognizing",
+            )
+            self.assertEqual(
+                self.server._report_row("bob", "BIM-STATUS")["status"],
+                "created",
+            )
+            return {
+                "mask": np.zeros((2, 2), dtype=np.uint8),
+                "overlay": np.zeros((2, 2, 3), dtype=np.uint8),
+                "stats": {},
+                "geometry": {"walls": [], "windows": [], "doors": []},
+                "room_topology": {
+                    "status": "no_closed_rooms",
+                    "room_count": 0,
+                    "rooms": [],
+                    "total_area_px2": 0.0,
+                    "total_area_m2": None,
+                    "load_geometry_ready": False,
+                },
+                "image_size": [2, 2],
+            }
+
+        segmenter = MagicMock()
+        segmenter.predict.side_effect = prediction
+        with (
+            patch.object(self.server, "HAS_FLOORPLAN_AI", True),
+            patch.object(self.server, "_floorplan_segmenter", segmenter, create=True),
+            patch.object(
+                self.server.cv2,
+                "imread",
+                return_value=np.zeros((2, 2, 3), dtype=np.uint8),
+            ),
+        ):
+            response = self.client.post(
+                "/energy/ai_recognize",
+                data={
+                    "report_number": "BIM-STATUS",
+                    "raster_file": (io.BytesIO(b"image"), "plan.png"),
+                },
+                content_type="multipart/form-data",
+            )
+
+        self.assertEqual(response.status_code, 200, response.get_json())
+        self.assertEqual(
+            self.server._report_row("alice", "BIM-STATUS")["status"],
+            "recognized",
+        )
+        self.assertEqual(
+            self.server._report_row("bob", "BIM-STATUS")["status"],
+            "created",
+        )
+
+    def test_ai_recognition_failure_updates_only_the_authenticated_report_owner(self):
+        self.server._upsert_report_status("alice", "BIM-FAIL-STATUS", "created")
+        self.server._upsert_report_status("bob", "BIM-FAIL-STATUS", "created")
+        self.login_as("alice")
+
+        response = self.client.post(
+            "/energy/ai_recognize",
+            data={
+                "report_number": "BIM-FAIL-STATUS",
+                "model_backend": "unsupported",
+            },
+        )
+
+        self.assertEqual(response.status_code, 400, response.get_json())
+        self.assertEqual(
+            self.server._report_row("alice", "BIM-FAIL-STATUS")["status"],
+            "failed",
+        )
+        self.assertEqual(
+            self.server._report_row("bob", "BIM-FAIL-STATUS")["status"],
+            "created",
+        )
+
+
 class ReportUploadIsolationTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

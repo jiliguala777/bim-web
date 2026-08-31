@@ -6,6 +6,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from energy_report_storage import user_storage_key
+
 
 class VectorPdfExteriorConfirmRouteTests(unittest.TestCase):
     @classmethod
@@ -19,6 +21,8 @@ class VectorPdfExteriorConfirmRouteTests(unittest.TestCase):
         self.client = self.server.app.test_client()
         with self.client.session_transaction() as session:
             session["logged_in"] = True
+            session["username"] = "test-user"
+            session["is_admin"] = False
 
     @staticmethod
     def _artifacts(report_dir):
@@ -200,7 +204,7 @@ class VectorPdfExteriorConfirmRouteTests(unittest.TestCase):
     def test_confirm_reloads_hashed_artifacts_and_writes_ready_recognition(self):
         with tempfile.TemporaryDirectory() as directory:
             upload_root = Path(directory)
-            report_dir = upload_root / "energy" / "EXT-1"
+            report_dir = upload_root / "energy" / user_storage_key("test-user") / "EXT-1"
             _, _, topology_path = self._artifacts(report_dir)
             previous = self.server.app.config["UPLOAD_FOLDER"]
             self.server.app.config["UPLOAD_FOLDER"] = str(upload_root)
@@ -271,7 +275,7 @@ class VectorPdfExteriorConfirmRouteTests(unittest.TestCase):
     def test_confirm_rejects_marker_hash_mismatch_without_overwriting_recognition(self):
         with tempfile.TemporaryDirectory() as directory:
             upload_root = Path(directory)
-            report_dir = upload_root / "energy" / "EXT-1"
+            report_dir = upload_root / "energy" / user_storage_key("test-user") / "EXT-1"
             _, _, topology_path = self._artifacts(report_dir)
             marker_path = report_dir / "exterior_generation.json"
             marker = json.loads(marker_path.read_text("utf-8"))
@@ -297,7 +301,7 @@ class VectorPdfExteriorConfirmRouteTests(unittest.TestCase):
     def test_confirm_revalidates_generation_before_persisting(self):
         with tempfile.TemporaryDirectory() as directory:
             upload_root = Path(directory)
-            report_dir = upload_root / "energy" / "EXT-1"
+            report_dir = upload_root / "energy" / user_storage_key("test-user") / "EXT-1"
             _, _, topology_path = self._artifacts(report_dir)
             marker_path = report_dir / "exterior_generation.json"
             recognition_path = report_dir / "recognition.json"
@@ -335,7 +339,7 @@ class VectorPdfExteriorConfirmRouteTests(unittest.TestCase):
     def test_confirm_rejects_hash_mismatch_without_overwriting_recognition(self):
         with tempfile.TemporaryDirectory() as directory:
             upload_root = Path(directory)
-            report_dir = upload_root / "energy" / "EXT-1"
+            report_dir = upload_root / "energy" / user_storage_key("test-user") / "EXT-1"
             _, _, topology_path = self._artifacts(report_dir)
             recognition_path = report_dir / "recognition.json"
             recognition_path.write_bytes(b'{"sentinel": true}\n')
@@ -357,7 +361,7 @@ class VectorPdfExteriorConfirmRouteTests(unittest.TestCase):
         for field, value in (("kind", "window"), ("confidence", 0.1)):
             with self.subTest(field=field), tempfile.TemporaryDirectory() as directory:
                 upload_root = Path(directory)
-                report_dir = upload_root / "energy" / "EXT-1"
+                report_dir = upload_root / "energy" / user_storage_key("test-user") / "EXT-1"
                 topology, openings, topology_path = self._artifacts(report_dir)
                 opening_path = topology_path.parent / "pdf_opening_candidates.json"
 
@@ -389,7 +393,7 @@ class VectorPdfExteriorConfirmRouteTests(unittest.TestCase):
         for digest in (None, "0" * 63, "g" * 64, "A" * 64):
             with self.subTest(digest=digest), tempfile.TemporaryDirectory() as directory:
                 upload_root = Path(directory)
-                report_dir = upload_root / "energy" / "EXT-1"
+                report_dir = upload_root / "energy" / user_storage_key("test-user") / "EXT-1"
                 topology, _, topology_path = self._artifacts(report_dir)
                 topology["opening_artifact_sha256"] = digest
                 topology_path.write_text(json.dumps(topology), encoding="utf-8")
@@ -414,7 +418,7 @@ class VectorPdfExteriorConfirmRouteTests(unittest.TestCase):
         for label in cases:
             with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
                 upload_root = Path(directory)
-                report_dir = upload_root / "energy" / "EXT-1"
+                report_dir = upload_root / "energy" / user_storage_key("test-user") / "EXT-1"
                 topology, openings, topology_path = self._artifacts(report_dir)
                 if label == "duplicate topology opening id":
                     topology["opening_ids"].append("opening-door")
@@ -437,7 +441,7 @@ class VectorPdfExteriorConfirmRouteTests(unittest.TestCase):
         for label in cases:
             with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
                 upload_root = Path(directory)
-                report_dir = upload_root / "energy" / "EXT-1"
+                report_dir = upload_root / "energy" / user_storage_key("test-user") / "EXT-1"
                 topology, openings, topology_path = self._artifacts(report_dir)
                 if label == "endpoint mismatch":
                     openings["accepted_openings"][0]["start_px"] = [21, 0]
@@ -462,7 +466,7 @@ class VectorPdfExteriorConfirmRouteTests(unittest.TestCase):
         for label in cases:
             with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
                 upload_root = Path(directory)
-                report_dir = upload_root / "energy" / "EXT-1"
+                report_dir = upload_root / "energy" / user_storage_key("test-user") / "EXT-1"
                 topology, openings, topology_path = self._artifacts(report_dir)
                 if label == "self intersection":
                     topology["polygon_px"] = [
@@ -492,7 +496,7 @@ class VectorPdfExteriorConfirmRouteTests(unittest.TestCase):
     def test_confirm_persists_recomputed_polygon_metrics(self):
         with tempfile.TemporaryDirectory() as directory:
             upload_root = Path(directory)
-            report_dir = upload_root / "energy" / "EXT-1"
+            report_dir = upload_root / "energy" / user_storage_key("test-user") / "EXT-1"
             topology, openings, topology_path = self._artifacts(report_dir)
             topology["area_px2"] = math.nextafter(5000.0, math.inf)
             topology["perimeter_px"] = math.nextafter(300.0, math.inf)
@@ -509,7 +513,7 @@ class VectorPdfExteriorConfirmRouteTests(unittest.TestCase):
     def test_confirm_accepts_supported_inferred_boundary_without_persisting_it_as_real_wall(self):
         with tempfile.TemporaryDirectory() as directory:
             upload_root = Path(directory)
-            report_dir = upload_root / "energy" / "EXT-1"
+            report_dir = upload_root / "energy" / user_storage_key("test-user") / "EXT-1"
             topology, openings, topology_path = self._artifacts(report_dir)
             inferred = self._add_inferred_boundary_segment(topology)
 
@@ -582,7 +586,7 @@ class VectorPdfExteriorConfirmRouteTests(unittest.TestCase):
     def test_confirm_accepts_calculation_only_endpoint_link_over_inference_limits(self):
         with tempfile.TemporaryDirectory() as directory:
             upload_root = Path(directory)
-            report_dir = upload_root / "energy" / "EXT-1"
+            report_dir = upload_root / "energy" / user_storage_key("test-user") / "EXT-1"
             topology, openings, topology_path = self._artifacts(report_dir)
             inferred = self._add_inferred_boundary_segment(topology)
             topology["closure_method"] = "calculation_only_endpoint_link"
@@ -618,7 +622,7 @@ class VectorPdfExteriorConfirmRouteTests(unittest.TestCase):
         for label in cases:
             with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
                 upload_root = Path(directory)
-                report_dir = upload_root / "energy" / "EXT-1"
+                report_dir = upload_root / "energy" / user_storage_key("test-user") / "EXT-1"
                 topology, openings, topology_path = self._artifacts(report_dir)
                 inferred = self._add_inferred_boundary_segment(topology)
                 if label == "forged total":
@@ -667,7 +671,7 @@ class VectorPdfExteriorConfirmRouteTests(unittest.TestCase):
         for label in cases:
             with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
                 upload_root = Path(directory)
-                report_dir = upload_root / "energy" / "EXT-1"
+                report_dir = upload_root / "energy" / user_storage_key("test-user") / "EXT-1"
                 topology, openings, topology_path = self._artifacts(report_dir)
                 if label == "missing bridge":
                     topology["bridges"].pop()
@@ -700,7 +704,7 @@ class VectorPdfExteriorConfirmRouteTests(unittest.TestCase):
         for label in cases:
             with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
                 upload_root = Path(directory)
-                report_dir = upload_root / "energy" / "EXT-1"
+                report_dir = upload_root / "energy" / user_storage_key("test-user") / "EXT-1"
                 topology, openings, topology_path = self._artifacts(report_dir)
                 if label == "bridge partial overlap":
                     repair = topology["bridges"][1]
@@ -731,7 +735,7 @@ class VectorPdfExteriorConfirmRouteTests(unittest.TestCase):
         for label in cases:
             with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
                 upload_root = Path(directory)
-                report_dir = upload_root / "energy" / "EXT-1"
+                report_dir = upload_root / "energy" / user_storage_key("test-user") / "EXT-1"
                 topology, openings, topology_path = self._artifacts(report_dir)
                 if label == "mixed numeric types":
                     openings["provenance"]["analysis_size_px"] = [100.0, 50.0]
@@ -768,7 +772,7 @@ class VectorPdfExteriorConfirmRouteTests(unittest.TestCase):
         for label, overrides, expected_status in cases:
             with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
                 upload_root = Path(directory)
-                report_dir = upload_root / "energy" / "EXT-1"
+                report_dir = upload_root / "energy" / user_storage_key("test-user") / "EXT-1"
                 _, _, topology_path = self._artifacts(report_dir)
                 recognition_path = report_dir / "recognition.json"
                 recognition_path.write_bytes(b"preserve")
@@ -789,7 +793,7 @@ class VectorPdfExteriorConfirmRouteTests(unittest.TestCase):
         for label, scale in cases:
             with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
                 upload_root = Path(directory)
-                report_dir = upload_root / "energy" / "EXT-1"
+                report_dir = upload_root / "energy" / user_storage_key("test-user") / "EXT-1"
                 topology, _, topology_path = self._artifacts(report_dir)
                 if label == "nonclosed":
                     topology.update(status="exterior_not_closed", polygon_px=[])
@@ -811,7 +815,7 @@ class VectorPdfExteriorConfirmRouteTests(unittest.TestCase):
     def test_confirm_rejects_mismatched_report_path(self):
         with tempfile.TemporaryDirectory() as directory:
             upload_root = Path(directory)
-            report_dir = upload_root / "energy" / "EXT-1"
+            report_dir = upload_root / "energy" / user_storage_key("test-user") / "EXT-1"
             _, _, topology_path = self._artifacts(report_dir)
             recognition_path = report_dir / "recognition.json"
             recognition_path.write_bytes(b"preserve")
@@ -830,7 +834,7 @@ class VectorPdfExteriorConfirmRouteTests(unittest.TestCase):
     def test_confirm_requires_explicit_null_crop_for_full_page(self):
         with tempfile.TemporaryDirectory() as directory:
             upload_root = Path(directory)
-            report_dir = upload_root / "energy" / "EXT-1"
+            report_dir = upload_root / "energy" / user_storage_key("test-user") / "EXT-1"
             topology, openings, topology_path = self._artifacts(report_dir)
             topology["provenance"]["crop_bbox_page_px"] = None
             openings["provenance"]["crop_bbox_page_px"] = None

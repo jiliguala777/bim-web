@@ -12,7 +12,7 @@ import zipfile
 import threading
 import uuid
 import time
-from flask import Flask, request, render_template, jsonify, send_file, send_from_directory, session, redirect, url_for
+from flask import Flask, after_this_request, request, render_template, jsonify, send_file, send_from_directory, session, redirect, url_for
 from itsdangerous import BadSignature, URLSafeSerializer
 from werkzeug.utils import secure_filename
 from functools import wraps
@@ -1972,8 +1972,9 @@ def _pdf_upload_serializer():
     return URLSafeSerializer(app.secret_key, salt='energy-pdf-upload-v1')
 
 
-def _make_pdf_upload_token(report_number, stored_filename, page_count):
+def _make_pdf_upload_token(owner_username, report_number, stored_filename, page_count):
     return _pdf_upload_serializer().dumps({
+        'owner_username': owner_username,
         'report_number': report_number,
         'stored_filename': stored_filename,
         'page_count': int(page_count),
@@ -1990,9 +1991,11 @@ def _load_pdf_upload_token(token):
     return payload
 
 
-def _validated_prepared_pdf(report_number, pdf_upload_token, pdf_page_number):
+def _validated_prepared_pdf(owner_username, report_number, pdf_upload_token, pdf_page_number):
     """Return a validated stored PDF path, selected page, and page count."""
     prepared_pdf = _load_pdf_upload_token(pdf_upload_token)
+    if prepared_pdf.get('owner_username') != owner_username:
+        raise ValueError('PDF upload token does not match this report owner')
     if prepared_pdf.get('report_number') != report_number:
         raise ValueError('PDF upload token does not match this report')
 
@@ -2007,7 +2010,14 @@ def _validated_prepared_pdf(report_number, pdf_upload_token, pdf_page_number):
     if page_number < 1 or page_number > page_count:
         raise ValueError(f'PDF page number must be between 1 and {page_count}')
 
-    pdf_path = Path(app.config['UPLOAD_FOLDER']) / 'energy' / report_number / stored_filename
+    context = resolve_energy_report_context(
+        app.config['UPLOAD_FOLDER'],
+        owner_username,
+        False,
+        report_number,
+        requested_owner=owner_username,
+    )
+    pdf_path = context.report_dir / stored_filename
     if not pdf_path.is_file():
         raise ValueError('Prepared PDF file no longer exists')
     return pdf_path, page_number, page_count
@@ -2017,19 +2027,16 @@ def _sha256_file(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
-def _require_exterior_report_dir(report_number):
+def _require_exterior_report_dir(context):
     """Resolve one literal report directory without accepting aliases or links."""
-    if not isinstance(report_number, str) or not report_number:
-        raise ValueError('report_number is required')
-    if secure_filename(report_number) != report_number:
-        raise ValueError('report_number is invalid')
-    energy_root = (Path(app.config['UPLOAD_FOLDER']) / 'energy').resolve()
-    report_path = energy_root / report_number
+    if not isinstance(context, EnergyReportContext):
+        raise ValueError('report context is invalid')
+    report_path = context.report_dir
     if not report_path.is_dir():
         raise FileNotFoundError('Report does not exist')
     resolved_report = report_path.resolve(strict=True)
-    if report_path.is_symlink() or resolved_report.parent != energy_root:
-        raise ValueError('report_number is invalid')
+    if report_path.is_symlink() or resolved_report.parent != context.owner_root.resolve(strict=True):
+        raise ValueError('report path is invalid')
     artifact_path = resolved_report / 'vector_pdf_fusion'
     if not artifact_path.is_dir():
         raise FileNotFoundError('Vector PDF fusion artifacts do not exist')
@@ -2810,11 +2817,14 @@ def _serialized_exterior_report(route):
             supplied = (request.get_json(silent=True) or {}).get('report_number')
         else:
             supplied = request.form.get('report_number', 'default')
-        report_number = secure_filename(supplied or '') if isinstance(supplied, str) else ''
-        if not report_number or report_number != supplied:
-            return jsonify({'error': 'report_number is invalid'}), 400
-        report_dir = Path(app.config['UPLOAD_FOLDER']) / 'energy' / report_number
-        with _exterior_report_lock(report_dir):
+        try:
+            context = _energy_report_context(
+                supplied,
+                _requested_owner_username(),
+            )
+        except _REPORT_STORAGE_EXCEPTIONS as exc:
+            return _report_storage_error_response(exc)
+        with _exterior_report_lock(context.report_dir):
             return route(*args, **kwargs)
     return wrapped
 
@@ -2823,7 +2833,15 @@ def _serialized_exterior_report(route):
 @login_required
 def prepare_energy_pdf():
     """Persist one PDF upload and return its page count for page selection."""
-    report_number = secure_filename(request.form.get('report_number', 'default')) or 'default'
+    report_number = request.form.get('report_number', 'default')
+    try:
+        context = _resolved_energy_report_context(
+            report_number,
+            _requested_owner_username(request.form),
+            create=True,
+        )
+    except _REPORT_STORAGE_EXCEPTIONS as exc:
+        return _report_storage_error_response(exc)
     uploaded = request.files.get('raster_file')
     if not uploaded or not uploaded.filename:
         return jsonify({'error': 'No PDF file provided'}), 400
@@ -2833,10 +2851,9 @@ def prepare_energy_pdf():
     if extension != 'pdf':
         return jsonify({'error': 'Only PDF files can be prepared'}), 400
 
-    target_dir = os.path.join(app.config['UPLOAD_FOLDER'], 'energy', report_number)
-    os.makedirs(target_dir, exist_ok=True)
+    target_dir = context.report_dir
     stored_filename = f'building_plan_prepared_{uuid.uuid4().hex}.pdf'
-    stored_path = os.path.join(target_dir, stored_filename)
+    stored_path = target_dir / stored_filename
     uploaded.save(stored_path)
 
     try:
@@ -2849,11 +2866,17 @@ def prepare_energy_pdf():
     except Exception as exc:
         if os.path.isfile(stored_path):
             os.remove(stored_path)
-        return jsonify({'error': f'Cannot read PDF: {exc}'}), 400
+        logger.warning('Cannot read prepared PDF: %s', exc)
+        return jsonify({'error': 'Cannot read PDF'}), 400
 
     return jsonify({
         'success': True,
-        'upload_token': _make_pdf_upload_token(report_number, stored_filename, page_count),
+        'upload_token': _make_pdf_upload_token(
+            context.owner_username,
+            context.report_number,
+            stored_filename,
+            page_count,
+        ),
         'page_count': page_count,
         'filename': original_filename,
     })
@@ -2863,13 +2886,19 @@ def prepare_energy_pdf():
 @login_required
 def preview_energy_pdf_page():
     """Render a selected prepared-PDF page for client-side region selection."""
-    report_number = secure_filename(request.form.get('report_number', 'default')) or 'default'
     try:
+        context = _resolved_energy_report_context(
+            request.form.get('report_number', 'default'),
+            _requested_owner_username(request.form),
+        )
         pdf_path, page_number, page_count = _validated_prepared_pdf(
-            report_number,
+            context.owner_username,
+            context.report_number,
             request.form.get('pdf_upload_token', '').strip(),
             request.form.get('pdf_page_number', '1'),
         )
+    except _REPORT_STORAGE_EXCEPTIONS as exc:
+        return _report_storage_error_response(exc)
     except ValueError as exc:
         return jsonify({'error': str(exc)}), 400
 
@@ -2888,7 +2917,7 @@ def preview_energy_pdf_page():
         if not encoded:
             raise ValueError('Cannot encode PDF preview')
     except Exception as exc:
-        return jsonify({'error': f'PDF preview failed: {exc}'}), 500
+        return _internal_report_error_response('PDF preview failed', exc)
 
     height, width = preview_bgr.shape[:2]
     return jsonify({
@@ -2927,11 +2956,19 @@ def energy_pdf_recognition_state_helper():
 @_serialized_exterior_report
 def vector_pdf_fusion():
     """Publish isolated native-PDF/model diagnostics without energy geometry."""
+    try:
+        context = _energy_report_context(
+            request.form.get('report_number', 'default'),
+            _requested_owner_username(request.form),
+        )
+    except _REPORT_STORAGE_EXCEPTIONS as exc:
+        return _report_storage_error_response(exc)
     if not HAS_VECTOR_PDF_FUSION or _vector_pdf_fusion_config is None:
         return jsonify({'error': 'Vector PDF fusion module is not configured'}), 501
-    report_number = secure_filename(request.form.get('report_number', 'default')) or 'default'
+    report_number = context.report_number
     try:
         pdf_path, page_number, page_count = _validated_prepared_pdf(
+            context.owner_username,
             report_number,
             request.form.get('pdf_upload_token', '').strip(),
             request.form.get('pdf_page_number', '1'),
@@ -2956,10 +2993,12 @@ def vector_pdf_fusion():
                 region_request['preview_size'],
                 render_size,
             )
+    except _REPORT_STORAGE_EXCEPTIONS as exc:
+        return _report_storage_error_response(exc)
     except ValueError as exc:
         return jsonify({'error': str(exc)}), 400
 
-    report_dir = Path(app.config['UPLOAD_FOLDER']) / 'energy' / report_number
+    report_dir = context.report_dir
     target_dir = report_dir / 'vector_pdf_fusion'
     generation_marker = _new_exterior_generation(report_number)
     _write_exterior_generation(report_dir, generation_marker)
@@ -3002,7 +3041,7 @@ def vector_pdf_fusion():
         _update_exterior_generation_if_current(
             report_dir, generation_marker['generation'], status='failed',
         )
-        return jsonify({'error': f'Vector PDF fusion failed: {exc}'}), 500
+        return _internal_report_error_response('Vector PDF fusion failed', exc)
 
     exterior_topology = result.get('exterior_topology') or {}
     opening_candidates = result.get('opening_candidates') or {}
@@ -3117,14 +3156,20 @@ def vector_pdf_exterior_confirm():
             int(supplied_hash, 16)
         except ValueError:
             raise ValueError('topology_sha256 must be a SHA-256 hex digest') from None
-        report_number = payload.get('report_number')
-        report_dir, artifact_dir = _require_exterior_report_dir(report_number)
+        context = _energy_report_context(
+            payload.get('report_number'),
+            _requested_owner_username(payload),
+        )
+        report_number = context.report_number
+        report_dir, artifact_dir = _require_exterior_report_dir(context)
         topology_raw, topology = _read_exterior_artifact(
             artifact_dir, 'pdf_exterior_topology.json',
         )
         opening_raw, opening_artifact = _read_exterior_artifact(
             artifact_dir, 'pdf_opening_candidates.json',
         )
+    except _REPORT_STORAGE_EXCEPTIONS as exc:
+        return _report_storage_error_response(exc)
     except FileNotFoundError as exc:
         return jsonify({'error': str(exc)}), 404
     except ValueError as exc:
@@ -3281,7 +3326,7 @@ def vector_pdf_exterior_confirm():
     except (RuntimeError, ValueError) as exc:
         return jsonify({'error': str(exc)}), 409
     except Exception as exc:
-        return jsonify({'error': f'Cannot persist exterior recognition: {exc}'}), 500
+        return _internal_report_error_response('Cannot persist exterior recognition', exc)
 
     return jsonify({
         'success': True,
@@ -3306,6 +3351,27 @@ def ai_recognize():
     与 DXF 上传同步：用户可选择 DXF 矢量 或 图片AI识别
     """
     try:
+        context = _resolved_energy_report_context(
+            request.form.get('report_number', 'default'),
+            _requested_owner_username(request.form),
+            create=True,
+        )
+    except _REPORT_STORAGE_EXCEPTIONS as exc:
+        return _report_storage_error_response(exc)
+
+    _update_report_status_if_exists(
+        context.owner_username, context.report_number, 'recognizing',
+    )
+
+    @after_this_request
+    def update_recognition_status(response):
+        status = 'recognized' if 200 <= response.status_code < 300 else 'failed'
+        _update_report_status_if_exists(
+            context.owner_username, context.report_number, status,
+        )
+        return response
+
+    try:
         t0 = _time.time()
         model_backend = request.form.get('model_backend', LEGACY_ONNX_BACKEND)
         if model_backend not in {LEGACY_ONNX_BACKEND, VECTOR_PYTORCH_BACKEND}:
@@ -3314,10 +3380,8 @@ def ai_recognize():
             return jsonify({'error': 'Legacy ONNX recognition module is not available'}), 501
         if model_backend == VECTOR_PYTORCH_BACKEND and not HAS_VECTOR_FLOORPLAN_AI:
             return jsonify({'error': 'Vector recognition module is not configured'}), 501
-        report_number = request.form.get('report_number', 'default')
-        report_number = secure_filename(report_number) or 'default'
-        target_dir = os.path.join(app.config['UPLOAD_FOLDER'], 'energy', report_number)
-        os.makedirs(target_dir, exist_ok=True)
+        report_number = context.report_number
+        target_dir = context.report_dir
 
         preprocessing = request.form.get('preprocessing', 'auto')
         use_preprocessing = preprocessing != 'none'
@@ -3346,10 +3410,13 @@ def ai_recognize():
         if pdf_upload_token:
             try:
                 prepared_pdf_path, pdf_page_number, pdf_page_count = _validated_prepared_pdf(
+                    context.owner_username,
                     report_number,
                     pdf_upload_token,
                     request.form.get('pdf_page_number', '1'),
                 )
+            except _REPORT_STORAGE_EXCEPTIONS as exc:
+                return _report_storage_error_response(exc)
             except ValueError as exc:
                 return jsonify({'error': str(exc)}), 400
             raster_path = os.fspath(prepared_pdf_path)
@@ -3435,8 +3502,8 @@ def ai_recognize():
                 vector_cleanup = dict(prepared_page.vector_cleanup)
                 png_path = os.path.join(target_dir, 'building_plan_ai.png')
                 raster_path = png_path
-            except Exception as e:
-                return jsonify({'error': f'PDF conversion failed: {e}'}), 500
+            except Exception as exc:
+                return _internal_report_error_response('PDF conversion failed', exc)
 
         # AI 推理
         img_bgr = (
@@ -3718,9 +3785,10 @@ def ai_recognize():
             },
         })
 
-    except Exception as e:
-        logger.error(f"AI recognize error: {e}", exc_info=True)
-        return jsonify({'error': str(e)}), 500
+    except _REPORT_STORAGE_EXCEPTIONS as exc:
+        return _report_storage_error_response(exc)
+    except Exception as exc:
+        return _internal_report_error_response('AI recognize error', exc)
 
 
 @app.route('/energy/ai_status')
@@ -3762,10 +3830,11 @@ def save_scale_calibration():
     """Persist a manual two-point scale when automatic PDF evidence is unavailable."""
     try:
         data = request.get_json() or {}
-        report_number = secure_filename(str(data.get('report_number') or ''))
-        if not report_number:
-            raise ValueError('report_number is required')
-        target_dir = os.path.join(app.config['UPLOAD_FOLDER'], 'energy', report_number)
+        context = _resolved_energy_report_context(
+            data.get('report_number'),
+            _requested_owner_username(data),
+        )
+        target_dir = context.report_dir
         recognition = _load_recognition_payload(target_dir)
         if recognition is None:
             return jsonify({'error': 'No current recognition.json found. Run AI recognition first.'}), 404
@@ -3831,8 +3900,12 @@ def save_scale_calibration():
             'scale_calibration': calibration,
             'room_topology': recognition['room_topology'],
         })
+    except _REPORT_STORAGE_EXCEPTIONS as exc:
+        return _report_storage_error_response(exc)
     except (TypeError, ValueError) as exc:
         return jsonify({'error': str(exc)}), 400
+    except Exception as exc:
+        return _internal_report_error_response('Scale calibration error', exc)
 
 
 @app.route('/energy/ai_simulate', methods=['POST'])

@@ -13,6 +13,8 @@ from unittest.mock import MagicMock, patch
 import cv2
 import numpy as np
 
+from energy_report_storage import user_storage_key
+
 
 class EnergyTemplateTests(unittest.TestCase):
     def test_recognition_ui_uses_closed_room_area_instead_of_image_rectangle_guess(self):
@@ -964,7 +966,8 @@ class EnergyRouteClientTests(unittest.TestCase):
         self.client = self.server.app.test_client()
         with self.client.session_transaction() as sess:
             sess["logged_in"] = True
-            sess["username"] = "route-test"
+            sess["username"] = "test-user"
+            sess["is_admin"] = False
 
     def test_partial_closure_never_enables_load_geometry(self):
         topology = {"room_count": 5, "load_geometry_ready": True}
@@ -1024,7 +1027,9 @@ class EnergyRouteClientTests(unittest.TestCase):
             self.assertEqual(body["page_count"], 2)
             self.assertEqual(body["filename"], "floors.pdf")
             self.assertTrue(body["upload_token"])
-            prepared_files = list((Path(upload_root) / "energy" / "MULTIPAGE").glob("building_plan_prepared_*.pdf"))
+            prepared_files = list((
+                Path(upload_root) / "energy" / user_storage_key("test-user") / "MULTIPAGE"
+            ).glob("building_plan_prepared_*.pdf"))
             self.assertEqual(len(prepared_files), 1)
 
     def test_pdf_prepare_rejects_non_pdf_and_unreadable_pdf(self):
@@ -1107,7 +1112,7 @@ class EnergyRouteClientTests(unittest.TestCase):
             self.assertIsNotNone(jpeg)
             self.assertEqual(jpeg.shape[:2], (600, 800))
             stored_pdf = next(
-                (Path(upload_root) / "energy" / "REGION-PREVIEW").glob(
+                (Path(upload_root) / "energy" / user_storage_key("test-user") / "REGION-PREVIEW").glob(
                     "building_plan_prepared_*.pdf"
                 )
             )
@@ -1220,11 +1225,12 @@ class EnergyRouteClientTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as upload_root:
             previous_upload = self.server.app.config["UPLOAD_FOLDER"]
             self.server.app.config["UPLOAD_FOLDER"] = upload_root
-            report_dir = Path(upload_root) / "energy" / "CROP-INVALID"
+            report_dir = Path(upload_root) / "energy" / user_storage_key("test-user") / "CROP-INVALID"
             report_dir.mkdir(parents=True)
             stored_filename = "building_plan_prepared_test.pdf"
             (report_dir / stored_filename).write_bytes(b"%PDF-1.4")
             upload_token = self.server._make_pdf_upload_token(
+                "test-user",
                 "CROP-INVALID",
                 stored_filename,
                 1,
@@ -1354,11 +1360,12 @@ class EnergyRouteClientTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as upload_root:
             previous_upload = self.server.app.config["UPLOAD_FOLDER"]
             self.server.app.config["UPLOAD_FOLDER"] = upload_root
-            report_dir = Path(upload_root) / "energy" / "LEGACY-PDF"
+            report_dir = Path(upload_root) / "energy" / user_storage_key("test-user") / "LEGACY-PDF"
             report_dir.mkdir(parents=True)
             stored_filename = "building_plan_prepared_test.pdf"
             (report_dir / stored_filename).write_bytes(b"%PDF-1.4")
             upload_token = self.server._make_pdf_upload_token(
+                "test-user",
                 "LEGACY-PDF",
                 stored_filename,
                 1,
@@ -1531,7 +1538,7 @@ class EnergyRouteClientTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as upload_root:
             previous_upload = self.server.app.config["UPLOAD_FOLDER"]
             self.server.app.config["UPLOAD_FOLDER"] = upload_root
-            report_dir = Path(upload_root) / "energy" / "CROP-INTEGRATION"
+            report_dir = Path(upload_root) / "energy" / user_storage_key("test-user") / "CROP-INTEGRATION"
             report_dir.mkdir(parents=True)
             stale_mask_path = report_dir / "pdf_nonstructural_mask.png"
             self.assertTrue(
@@ -1543,6 +1550,7 @@ class EnergyRouteClientTests(unittest.TestCase):
             stored_filename = "building_plan_prepared_test.pdf"
             (report_dir / stored_filename).write_bytes(b"%PDF-1.4")
             upload_token = self.server._make_pdf_upload_token(
+                "test-user",
                 "CROP-INTEGRATION",
                 stored_filename,
                 1,
@@ -1751,7 +1759,9 @@ class EnergyRouteClientTests(unittest.TestCase):
 
             self.assertEqual(response.status_code, 200, response.get_json())
             run_analysis.assert_called_once_with(
-                next((Path(upload_root) / "energy" / "PAGE-TWO").glob("building_plan_prepared_*.pdf")).resolve(),
+                next((
+                    Path(upload_root) / "energy" / user_storage_key("test-user") / "PAGE-TWO"
+                ).glob("building_plan_prepared_*.pdf")).resolve(),
                 page_index=1,
                 dpi=100,
                 timeout_seconds=30.0,
@@ -1763,7 +1773,10 @@ class EnergyRouteClientTests(unittest.TestCase):
             self.assertEqual(body["pdf_page_number"], 2)
             self.assertEqual(body["pdf_page_count"], 2)
             saved = json.loads(
-                (Path(upload_root) / "energy" / "PAGE-TWO" / "recognition.json").read_text(encoding="utf-8")
+                (
+                    Path(upload_root) / "energy" / user_storage_key("test-user")
+                    / "PAGE-TWO" / "recognition.json"
+                ).read_text(encoding="utf-8")
             )
             self.assertEqual(saved["pdf_page_number"], 2)
             self.assertEqual(saved["pdf_page_count"], 2)
@@ -1868,7 +1881,10 @@ class EnergyRouteClientTests(unittest.TestCase):
             self.assertEqual(body["vector_cleanup"]["building_roi"], roi)
             self.assertEqual(body["scale_calibration"]["method"], "test")
             saved_model_input = cv2.imread(
-                str(Path(upload_root) / "energy" / "SHARED-PAGE" / "pdf_model_input.png")
+                str(
+                    Path(upload_root) / "energy" / user_storage_key("test-user")
+                    / "SHARED-PAGE" / "pdf_model_input.png"
+                )
             )
             self.assertIsNotNone(saved_model_input)
             self.assertEqual(int(saved_model_input.max()), 0)
@@ -1981,7 +1997,7 @@ class EnergyRouteClientTests(unittest.TestCase):
                 self.server.app.config["UPLOAD_FOLDER"] = previous_upload
 
             self.assertEqual(response.status_code, 200, response.get_json())
-            target = upload_root / "energy" / "UNICODE-WRITES"
+            target = upload_root / "energy" / user_storage_key("test-user") / "UNICODE-WRITES"
             artifact_names = (
                 "building_plan_ai.png",
                 "pdf_nonstructural_mask.png",
@@ -2157,7 +2173,7 @@ class EnergyRouteClientTests(unittest.TestCase):
             body = response.get_json()
             self.assertTrue(body["vector_cleanup"]["nonstructural_mask"]["enabled"])
             self.assertEqual(body["vector_cleanup"]["building_roi"]["bbox_px"], [10, 10, 110, 90])
-            report_dir = Path(upload_root) / "energy" / "VECTOR-CLEANUP"
+            report_dir = Path(upload_root) / "energy" / user_storage_key("test-user") / "VECTOR-CLEANUP"
             self.assertTrue((report_dir / "pdf_nonstructural_mask.png").exists())
             self.assertTrue((report_dir / "pdf_model_input.png").exists())
             self.assertTrue((report_dir / "pdf_building_roi.json").exists())
@@ -2189,6 +2205,15 @@ class EnergyRouteClientTests(unittest.TestCase):
                 ],
             },
         }
+        upload_root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        previous_upload = self.server.app.config["UPLOAD_FOLDER"]
+        self.addCleanup(
+            self.server.app.config.__setitem__, "UPLOAD_FOLDER", previous_upload,
+        )
+        self.server.app.config["UPLOAD_FOLDER"] = str(upload_root)
+        (
+            upload_root / "energy" / user_storage_key("test-user") / "EXT-REVIEW"
+        ).mkdir(parents=True)
         with (
             patch.object(self.server, "HAS_VECTOR_PDF_FUSION", True),
             patch.object(self.server, "_vector_pdf_fusion_config", object()),
@@ -2595,7 +2620,10 @@ class EnergyRouteClientTests(unittest.TestCase):
                 self.server.app.config["UPLOAD_FOLDER"] = previous_upload
 
             self.assertEqual(response.status_code, 200, response.get_json())
-            recognition_path = Path(upload_root) / "energy" / "JSON-1" / "recognition.json"
+            recognition_path = (
+                Path(upload_root) / "energy" / user_storage_key("test-user")
+                / "JSON-1" / "recognition.json"
+            )
             self.assertTrue(recognition_path.exists())
             recognition = json.loads(recognition_path.read_text(encoding="utf-8"))
             self.assertEqual(recognition["schema_version"], 1)
@@ -2688,7 +2716,10 @@ class EnergyRouteClientTests(unittest.TestCase):
             self.assertTrue(body["room_topology"]["load_geometry_ready"])
             expected_area = 100.0 * body["scale_calibration"]["scale_m_per_px"] ** 2
             self.assertAlmostEqual(body["room_topology"]["total_area_m2"], expected_area)
-            recognition_path = Path(upload_root) / "energy" / "VECTOR-PDF" / "recognition.json"
+            recognition_path = (
+                Path(upload_root) / "energy" / user_storage_key("test-user")
+                / "VECTOR-PDF" / "recognition.json"
+            )
             saved = json.loads(recognition_path.read_text(encoding="utf-8"))
             self.assertEqual(saved["scale_calibration"]["status"], "confirmed")
             self.assertAlmostEqual(saved["room_topology"]["total_area_m2"], expected_area)
@@ -2955,7 +2986,9 @@ class EnergyRouteClientTests(unittest.TestCase):
 
     def test_manual_two_point_scale_calibration_is_saved_and_updates_room_area(self):
         with tempfile.TemporaryDirectory(dir=r"D:\Projects") as upload_root:
-            report_dir = Path(upload_root) / "energy" / "MANUAL-SCALE"
+            report_dir = (
+                Path(upload_root) / "energy" / user_storage_key("test-user") / "MANUAL-SCALE"
+            )
             report_dir.mkdir(parents=True)
             recognition = {
                 "schema_version": 1,

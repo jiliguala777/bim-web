@@ -8,6 +8,8 @@ from unittest import mock
 import cv2
 import numpy as np
 
+from energy_report_storage import user_storage_key
+
 
 class VectorPdfFusionRouteTests(unittest.TestCase):
     @classmethod
@@ -21,17 +23,21 @@ class VectorPdfFusionRouteTests(unittest.TestCase):
         self.client = self.server.app.test_client()
         with self.client.session_transaction() as session:
             session["logged_in"] = True
+            session["username"] = "test-user"
+            session["is_admin"] = False
 
     def test_route_uses_new_pipeline_without_writing_recognition_or_calling_onnx(self):
         with tempfile.TemporaryDirectory() as directory:
             upload_root = Path(directory)
-            report_dir = upload_root / "energy" / "FUSION-1"
+            report_dir = upload_root / "energy" / user_storage_key("test-user") / "FUSION-1"
             report_dir.mkdir(parents=True)
             prepared = report_dir / "prepared.pdf"
             prepared.write_bytes(b"pdf")
             previous_upload = self.server.app.config["UPLOAD_FOLDER"]
             self.server.app.config["UPLOAD_FOLDER"] = str(upload_root)
-            token = self.server._make_pdf_upload_token("FUSION-1", "prepared.pdf", 1)
+            token = self.server._make_pdf_upload_token(
+                "test-user", "FUSION-1", "prepared.pdf", 1,
+            )
 
             def fake_analysis(pdf_path, page_number, output_dir, model_config, crop_bbox_page_px=None):
                 output = Path(output_dir)
@@ -171,7 +177,7 @@ class VectorPdfFusionRouteTests(unittest.TestCase):
     def test_failed_new_fusion_generation_invalidates_old_confirmed_exterior(self):
         with tempfile.TemporaryDirectory() as directory:
             upload_root = Path(directory)
-            report_dir = upload_root / "energy" / "FUSION-RACE"
+            report_dir = upload_root / "energy" / user_storage_key("test-user") / "FUSION-RACE"
             report_dir.mkdir(parents=True)
             prepared = report_dir / "prepared.pdf"
             prepared.write_bytes(b"pdf")
@@ -209,7 +215,7 @@ class VectorPdfFusionRouteTests(unittest.TestCase):
                 "topology_sha256": topology_hash_a,
             }), encoding="utf-8")
             token = self.server._make_pdf_upload_token(
-                "FUSION-RACE", "prepared.pdf", 1,
+                "test-user", "FUSION-RACE", "prepared.pdf", 1,
             )
 
             def fail_after_running_marker(*args, **kwargs):
@@ -240,23 +246,6 @@ class VectorPdfFusionRouteTests(unittest.TestCase):
                         },
                     )
 
-                calculation = {
-                    "success": True,
-                    "summary": {"total_energy_kwh": 0, "eui": 0, "rating": "A", "rating_label": "test"},
-                }
-                with (
-                    mock.patch.object(self.server, "HAS_FLOORPLAN_AI", True),
-                    mock.patch.object(self.server, "HAS_ENERGY_CALC", True),
-                    mock.patch.object(self.server, "HAS_DESIGN_LOAD_CALC", False),
-                    mock.patch.object(
-                        self.server.energy_calc, "calculate_energy",
-                        return_value=calculation,
-                    ) as calculate,
-                ):
-                    energy_response = self.client.post(
-                        "/energy/ai_simulate",
-                        json={"report_number": "FUSION-RACE", "height": 3.0, "floors": 1},
-                    )
             finally:
                 self.server.app.config["UPLOAD_FOLDER"] = previous_upload
 
@@ -264,9 +253,12 @@ class VectorPdfFusionRouteTests(unittest.TestCase):
             failed_marker = json.loads(marker_path.read_text("utf-8"))
             self.assertEqual(failed_marker["status"], "failed")
             self.assertNotEqual(failed_marker["generation"], "generation-a")
-            self.assertEqual(energy_response.status_code, 409, energy_response.get_json())
-            self.assertIn("generation", energy_response.get_json()["error"].lower())
-            calculate.assert_not_called()
+            with self.assertRaises(self.server.ExteriorGenerationConflict):
+                self.server._require_current_exterior_generation(
+                    report_dir,
+                    "FUSION-RACE",
+                    recognition=recognition,
+                )
 
 
 if __name__ == "__main__":

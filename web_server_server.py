@@ -1279,7 +1279,7 @@ def simple_simulation_task(job_id, data):
 @login_required
 def energy_status(job_id):
     job = simulation_jobs.get(job_id)
-    if not job:
+    if not isinstance(job, dict):
         return jsonify({'error': 'Job not found'}), 404
     job_owner = job.get('owner_username')
     job_report_number = job.get('report_number')
@@ -1292,8 +1292,8 @@ def energy_status(job_id):
         )
         if context.owner_username != job_owner:
             raise ReportAccessDenied('job belongs to another report owner')
-    except _REPORT_STORAGE_EXCEPTIONS as exc:
-        return _report_storage_error_response(exc)
+    except _REPORT_STORAGE_EXCEPTIONS:
+        return jsonify({'error': 'Job not found'}), 404
     return jsonify(job)
 
 def background_simulation_task(job_id, data):
@@ -2978,7 +2978,21 @@ def prepare_energy_pdf():
     target_dir = context.report_dir
     stored_filename = f'building_plan_prepared_{uuid.uuid4().hex}.pdf'
     stored_path = target_dir / stored_filename
-    uploaded.save(stored_path)
+
+    def discard_partial_upload():
+        try:
+            stored_path.unlink(missing_ok=True)
+        except OSError:
+            logger.error('Cannot remove partial prepared PDF', exc_info=True)
+
+    try:
+        uploaded.save(stored_path)
+    except Exception as exc:
+        discard_partial_upload()
+        _update_report_status_if_exists(
+            context.owner_username, context.report_number, 'failed',
+        )
+        return _internal_report_error_response('Cannot save prepared PDF', exc)
 
     try:
         import pdfplumber
@@ -2988,8 +3002,10 @@ def prepare_energy_pdf():
         if page_count < 1:
             raise ValueError('PDF contains no pages')
     except Exception as exc:
-        if os.path.isfile(stored_path):
-            os.remove(stored_path)
+        discard_partial_upload()
+        _update_report_status_if_exists(
+            context.owner_username, context.report_number, 'failed',
+        )
         logger.warning('Cannot read prepared PDF: %s', exc)
         return jsonify({'error': 'Cannot read PDF'}), 400
 

@@ -527,6 +527,7 @@ class PdfOwnerBindingTests(unittest.TestCase):
         self.assertEqual(outside_recognition.read_bytes(), original_bytes)
 
     def test_pdf_prepare_parse_error_does_not_expose_the_owner_storage_path(self):
+        self.server._upsert_report_status("bob", "BIM-SECRET", "created")
         self.login_as("alice")
         leaked_path = self.upload_root / "energy" / user_storage_key("alice") / "BIM-SECRET"
 
@@ -540,6 +541,40 @@ class PdfOwnerBindingTests(unittest.TestCase):
         self.assertEqual(response.status_code, 400, response.get_json())
         self.assertEqual(response.get_json()["error"], "Cannot read PDF")
         self.assertNotIn(str(leaked_path), response.get_data(as_text=True))
+        self.assertEqual(self.server._report_row("alice", "BIM-SECRET")["status"], "failed")
+        self.assertEqual(self.server._report_row("bob", "BIM-SECRET")["status"], "created")
+        self.assertEqual(list(leaked_path.glob("building_plan_prepared_*.pdf")), [])
+
+    def test_pdf_prepare_save_failure_marks_only_owner_failed_and_removes_partial_file(self):
+        from werkzeug.datastructures import FileStorage
+
+        report_number = "BIM-SAVE-FAIL"
+        self.server._upsert_report_status("bob", report_number, "created")
+        self.login_as("alice")
+        report_dir = self.upload_root / "energy" / user_storage_key("alice") / report_number
+        secret = str(report_dir / "private-partial.pdf")
+
+        def fail_after_partial_write(_storage, destination, *_args, **_kwargs):
+            Path(destination).write_bytes(b"partial prepared PDF")
+            raise RuntimeError(secret)
+
+        with (
+            patch.dict(self.server.app.config, {"PROPAGATE_EXCEPTIONS": False}),
+            patch.object(FileStorage, "save", autospec=True, side_effect=fail_after_partial_write),
+            self.assertLogs(self.server.logger, level="ERROR"),
+        ):
+            response = self.client.post(
+                "/energy/pdf_prepare",
+                data=self.pdf_form(report_number),
+                content_type="multipart/form-data",
+            )
+
+        self.assertEqual(response.status_code, 500)
+        self.assertEqual(response.get_json(), {"error": "Internal server error"})
+        self.assertNotIn(secret, response.get_data(as_text=True))
+        self.assertEqual(self.server._report_row("alice", report_number)["status"], "failed")
+        self.assertEqual(self.server._report_row("bob", report_number)["status"], "created")
+        self.assertEqual(list(report_dir.glob("building_plan_prepared_*.pdf")), [])
 
     def test_pdf_preview_internal_error_does_not_expose_the_prepared_file_path(self):
         self.login_as("alice")
@@ -1301,6 +1336,7 @@ class ReportUploadIsolationTests(unittest.TestCase):
         jobs_directory = Path(self.temporary_directory.name) / "owner-jobs"
         jobs_directory.mkdir()
         job_id = "alice-private-job"
+        legacy_job_id = "legacy-metadata-free-job"
         job = {
             "owner_username": "alice",
             "report_number": "BIM-JOB",
@@ -1312,10 +1348,19 @@ class ReportUploadIsolationTests(unittest.TestCase):
 
         with patch.object(self.server, "JOBS_DIR", str(jobs_directory)):
             self.server.simulation_jobs.set(job_id, job)
+            self.server.simulation_jobs.set(
+                legacy_job_id,
+                {"status": "completed", "progress": 100, "result": {"legacy": True}},
+            )
             self.login_as("alice")
             own_response = self.client.get(f"/energy/status/{job_id}")
             self.login_as("bob")
             cross_owner_response = self.client.get(f"/energy/status/{job_id}")
+            spoofed_owner_response = self.client.get(
+                f"/energy/status/{job_id}?owner_username=alice"
+            )
+            missing_response = self.client.get("/energy/status/missing-job")
+            legacy_response = self.client.get(f"/energy/status/{legacy_job_id}")
             self.login_as("admin", is_admin=True)
             implicit_admin_response = self.client.get(f"/energy/status/{job_id}")
             explicit_admin_response = self.client.get(
@@ -1323,9 +1368,18 @@ class ReportUploadIsolationTests(unittest.TestCase):
             )
 
         self.assertEqual(own_response.status_code, 200, own_response.get_json())
-        self.assertEqual(cross_owner_response.status_code, 403, cross_owner_response.get_json())
-        self.assertEqual(implicit_admin_response.status_code, 403, implicit_admin_response.get_json())
         self.assertEqual(explicit_admin_response.status_code, 200, explicit_admin_response.get_json())
+        hidden_responses = (
+            cross_owner_response,
+            spoofed_owner_response,
+            missing_response,
+            legacy_response,
+            implicit_admin_response,
+        )
+        for response in hidden_responses:
+            with self.subTest(response=response):
+                self.assertEqual(response.status_code, 404, response.get_json())
+                self.assertEqual(response.get_json(), {"error": "Job not found"})
 
     def test_parser_file_error_is_not_misclassified_or_exposed(self):
         self.login_as("alice")

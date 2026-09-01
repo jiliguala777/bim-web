@@ -6,6 +6,7 @@ import io
 import json
 import os
 import subprocess
+import sys
 import tempfile
 from contextlib import nullcontext, redirect_stderr, redirect_stdout
 from unittest.mock import MagicMock, patch
@@ -981,11 +982,32 @@ const context = {
 class EnergyRouteClientTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+        cls.database_directory = tempfile.TemporaryDirectory()
+        temporary_database = str(Path(cls.database_directory.name) / "users.db")
+        module_was_loaded = "web_server_server" in sys.modules
+        configured_database = os.environ.get(
+            "DB_PATH",
+            str(Path(__file__).resolve().parents[1] / "users.db"),
+        )
+        with (
+            patch.dict(os.environ, {"DB_PATH": temporary_database}),
+            redirect_stdout(io.StringIO()),
+            redirect_stderr(io.StringIO()),
+        ):
             import web_server_server
 
         cls.server = web_server_server
         cls.server.app.config.update(TESTING=True, SECRET_KEY="test-secret")
+        cls.original_database_path = (
+            cls.server.DB_PATH if module_was_loaded else configured_database
+        )
+        cls.server.DB_PATH = temporary_database
+        cls.server.init_db()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.DB_PATH = cls.original_database_path
+        cls.database_directory.cleanup()
 
     def setUp(self):
         self.client = self.server.app.test_client()
@@ -993,6 +1015,11 @@ class EnergyRouteClientTests(unittest.TestCase):
             sess["logged_in"] = True
             sess["username"] = "test-user"
             sess["is_admin"] = False
+
+    def test_energy_route_tests_do_not_use_the_worktree_database(self):
+        worktree_database = Path(self.server.BASE_DIR) / "users.db"
+
+        self.assertNotEqual(Path(self.server.DB_PATH).resolve(), worktree_database.resolve())
 
     def test_partial_closure_never_enables_load_geometry(self):
         topology = {"room_count": 5, "load_geometry_ready": True}

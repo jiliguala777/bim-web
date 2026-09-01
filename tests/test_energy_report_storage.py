@@ -29,6 +29,14 @@ class UserStorageKeyTests(unittest.TestCase):
             with self.subTest(value=value), self.assertRaises(InvalidReportPath):
                 validate_report_number(value)
 
+    def test_accepts_ascii_and_unicode_report_numbers_at_the_255_byte_limit(self):
+        from energy_report_storage import validate_report_number
+
+        for value in ("R" * 255, "界" * 85):
+            with self.subTest(value=value):
+                self.assertEqual(len(value.encode("utf-8")), 255)
+                self.assertEqual(validate_report_number(value), value)
+
 
 class EnergyReportStorageResolutionTests(unittest.TestCase):
     def _symlink_or_skip(self, link: Path, target: Path):

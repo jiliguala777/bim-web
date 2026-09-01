@@ -32,39 +32,48 @@ def _is_upload_folder_config(node):
     )
 
 
-def _path_parts(node):
+def _path_parts(node, path_aliases=()):
     """Flatten direct path-building expressions into their AST components."""
 
     if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Div, ast.Add)):
-        return _path_parts(node.left) + _path_parts(node.right)
+        return _path_parts(node.left, path_aliases) + _path_parts(node.right, path_aliases)
     if isinstance(node, ast.Call) and (
-        (isinstance(node.func, ast.Name) and node.func.id == "Path")
+        (isinstance(node.func, ast.Name) and node.func.id in path_aliases)
         or (isinstance(node.func, ast.Attribute) and node.func.attr == "Path")
     ):
-        return [part for arg in node.args for part in _path_parts(arg)]
+        return [part for arg in node.args for part in _path_parts(arg, path_aliases)]
     if (
         isinstance(node, ast.Call)
         and isinstance(node.func, ast.Attribute)
         and node.func.attr in {"join", "joinpath"}
     ):
-        receiver = _path_parts(node.func.value) if node.func.attr == "joinpath" else []
-        return receiver + [part for arg in node.args for part in _path_parts(arg)]
+        receiver = (
+            _path_parts(node.func.value, path_aliases)
+            if node.func.attr == "joinpath"
+            else []
+        )
+        return receiver + [
+            part for arg in node.args for part in _path_parts(arg, path_aliases)
+        ]
     if isinstance(node, ast.JoinedStr):
         return [
             part
             for value in node.values
-            for part in _path_parts(value.value if isinstance(value, ast.FormattedValue) else value)
+            for part in _path_parts(
+                value.value if isinstance(value, ast.FormattedValue) else value,
+                path_aliases,
+            )
         ]
     return [node]
 
 
-def _is_path_constructor(node):
+def _is_path_constructor(node, path_aliases=()):
     if isinstance(node, (ast.BinOp, ast.JoinedStr)) and (
         not isinstance(node, ast.BinOp) or isinstance(node.op, (ast.Div, ast.Add))
     ):
         return True
     if isinstance(node, ast.Call):
-        if isinstance(node.func, ast.Name) and node.func.id == "Path":
+        if isinstance(node.func, ast.Name) and node.func.id in path_aliases:
             return True
         if isinstance(node.func, ast.Attribute) and node.func.attr == "Path":
             return True
@@ -308,17 +317,97 @@ class _FunctionLocalBindingCollector(ast.NodeVisitor):
         self.generic_visit(node)
 
 
+class _ScopeAliasDefinitionCollector(ast.NodeVisitor):
+    """Collect alias-producing expressions without entering child scopes."""
+
+    def __init__(self, statements):
+        self.assignments = []
+        self.imported_paths = set()
+        self.imported_joins = set()
+        for statement in statements:
+            self.visit(statement)
+
+    def _visit_child_scope_header(self, node):
+        for expression in _function_outer_expressions(node):
+            self.visit(expression)
+
+    def visit_FunctionDef(self, node):
+        self._visit_child_scope_header(node)
+
+    def visit_AsyncFunctionDef(self, node):
+        self._visit_child_scope_header(node)
+
+    def visit_ClassDef(self, node):
+        for expression in (*node.decorator_list, *node.bases):
+            self.visit(expression)
+        for keyword in node.keywords:
+            self.visit(keyword.value)
+        for type_param in getattr(node, "type_params", ()):
+            self.visit(type_param)
+
+    def visit_Lambda(self, node):
+        for default in (*node.args.defaults, *node.args.kw_defaults):
+            if default is not None:
+                self.visit(default)
+
+    def visit_Assign(self, node):
+        self.assignments.append((node.value, node.targets))
+        self.visit(node.value)
+
+    def visit_AnnAssign(self, node):
+        if node.value is not None:
+            self.assignments.append((node.value, [node.target]))
+            self.visit(node.value)
+        self.visit(node.annotation)
+
+    def visit_NamedExpr(self, node):
+        self.assignments.append((node.value, [node.target]))
+        self.visit(node.value)
+
+    def visit_ImportFrom(self, node):
+        for imported in node.names:
+            if imported.name == "*":
+                continue
+            bound_name = imported.asname or imported.name
+            if node.module == "os.path" and imported.name == "join":
+                self.imported_joins.add(bound_name)
+            if node.module == "pathlib" and imported.name == "Path":
+                self.imported_paths.add(bound_name)
+
+
 class _DirectEnergyPathVisitor(ast.NodeVisitor):
     """Find direct UPLOAD_FOLDER/energy construction outside the resolver."""
+
+    ROOT_ALIAS = "upload-root"
+    PATH_ALIAS = "path-constructor"
+    JOIN_ALIAS = "join-function"
 
     def __init__(self):
         self._violations_by_line = {}
         self._upload_root_aliases = set()
+        self._path_aliases = {"Path"}
         self._join_aliases = set()
+        self._possible_upload_root_aliases = set()
+        self._possible_path_aliases = {"Path"}
+        self._possible_join_aliases = set()
 
     @property
     def violations(self):
         return [self._violations_by_line[line] for line in sorted(self._violations_by_line)]
+
+    def visit_Module(self, node):
+        (
+            self._possible_upload_root_aliases,
+            self._possible_path_aliases,
+            self._possible_join_aliases,
+        ) = self._collect_possible_aliases(
+            node.body,
+            self._upload_root_aliases,
+            self._path_aliases,
+            self._join_aliases,
+        )
+        for statement in node.body:
+            self.visit(statement)
 
     def visit_Call(self, node):
         self._inspect(node)
@@ -343,6 +432,10 @@ class _DirectEnergyPathVisitor(ast.NodeVisitor):
             for imported in node.names:
                 if imported.name == "join":
                     self._join_aliases.add(imported.asname or imported.name)
+        if node.module == "pathlib":
+            for imported in node.names:
+                if imported.name == "Path":
+                    self._path_aliases.add(imported.asname or imported.name)
 
     def visit_Import(self, node):
         self._forget_aliases(
@@ -359,59 +452,278 @@ class _DirectEnergyPathVisitor(ast.NodeVisitor):
         for expression in _function_outer_expressions(node):
             self.visit(expression)
 
-        saved_roots, saved_joins = self._upload_root_aliases, self._join_aliases
+        saved_aliases = (
+            self._upload_root_aliases,
+            self._path_aliases,
+            self._join_aliases,
+        )
+        saved_possible_aliases = (
+            self._possible_upload_root_aliases,
+            self._possible_path_aliases,
+            self._possible_join_aliases,
+        )
         local_names = _FunctionLocalBindingCollector(node).local_names
-        self._upload_root_aliases = set(saved_roots) - local_names - {node.name}
-        self._join_aliases = set(saved_joins) - local_names - {node.name}
+        inherited_roots = saved_aliases[0] | saved_possible_aliases[0]
+        inherited_paths = saved_aliases[1] | saved_possible_aliases[1]
+        inherited_joins = saved_aliases[2] | saved_possible_aliases[2]
+        self._upload_root_aliases = inherited_roots - local_names - {node.name}
+        self._path_aliases = inherited_paths - local_names - {node.name}
+        self._join_aliases = inherited_joins - local_names - {node.name}
+        (
+            self._possible_upload_root_aliases,
+            self._possible_path_aliases,
+            self._possible_join_aliases,
+        ) = self._collect_possible_aliases(
+            node.body,
+            self._upload_root_aliases,
+            self._path_aliases,
+            self._join_aliases,
+        )
         for statement in node.body:
             self.visit(statement)
-        self._upload_root_aliases, self._join_aliases = saved_roots, saved_joins
+        (
+            self._upload_root_aliases,
+            self._path_aliases,
+            self._join_aliases,
+        ) = saved_aliases
+        (
+            self._possible_upload_root_aliases,
+            self._possible_path_aliases,
+            self._possible_join_aliases,
+        ) = saved_possible_aliases
         self._forget_aliases({node.name})
 
     def visit_Assign(self, node):
-        self._remember_assignment_aliases(node.value, node.targets)
-        self.generic_visit(node)
+        self.visit(node.value)
+        self._apply_alias_updates(self._assignment_updates(node.value, node.targets))
 
     def visit_AnnAssign(self, node):
+        self.visit(node.annotation)
         if node.value is not None:
-            self._remember_assignment_aliases(node.value, [node.target])
-        self.generic_visit(node)
+            self.visit(node.value)
+            self._apply_alias_updates(self._assignment_updates(node.value, [node.target]))
 
-    def _remember_assignment_aliases(self, value, targets):
-        bound_names = {name for target in targets for name in _target_names(target)}
-        names = [target.id for target in targets if isinstance(target, ast.Name)]
-        is_path_upload_root = (
-            isinstance(value, ast.Call)
-            and ((isinstance(value.func, ast.Name) and value.func.id == "Path") or (isinstance(value.func, ast.Attribute) and value.func.attr == "Path"))
-            and value.args
-            and _is_upload_folder_config(value.args[0])
+    def visit_NamedExpr(self, node):
+        self.visit(node.value)
+        self._apply_alias_updates(self._assignment_updates(node.value, [node.target]))
+
+    def visit_AugAssign(self, node):
+        prior_kinds = self._value_alias_kinds(node.target)
+        self.visit(node.value)
+        retained_kinds = (
+            {self.ROOT_ALIAS}
+            if self.ROOT_ALIAS in prior_kinds and isinstance(node.op, (ast.Add, ast.Div))
+            else set()
         )
-        is_upload_root = _is_upload_folder_config(value) or is_path_upload_root or (
-            isinstance(value, ast.Name) and value.id in self._upload_root_aliases
+        self._apply_alias_updates(
+            [(name, retained_kinds) for name in _target_names(node.target)]
         )
-        is_join = (
-            isinstance(value, ast.Name) and value.id in self._join_aliases
-        ) or (isinstance(value, ast.Attribute) and value.attr == "join")
+
+    def visit_For(self, node):
+        self._visit_for(node)
+
+    def visit_AsyncFor(self, node):
+        self._visit_for(node)
+
+    def _visit_for(self, node):
+        self.visit(node.iter)
+        updates = []
+        if isinstance(node.iter, (ast.List, ast.Tuple, ast.Set)):
+            possible_by_name = {}
+            for value in node.iter.elts:
+                if isinstance(value, ast.Starred):
+                    continue
+                for name, kinds in self._target_updates(node.target, value):
+                    possible_by_name.setdefault(name, set()).update(kinds)
+            updates = list(possible_by_name.items())
+        if not updates:
+            updates = [(name, set()) for name in _target_names(node.target)]
+        self._apply_alias_updates(updates)
+        for statement in (*node.body, *node.orelse):
+            self.visit(statement)
+
+    def visit_With(self, node):
+        for item in node.items:
+            self.visit(item.context_expr)
+            if item.optional_vars is not None:
+                self._forget_aliases(_target_names(item.optional_vars))
+        for statement in node.body:
+            self.visit(statement)
+
+    def visit_AsyncWith(self, node):
+        self.visit_With(node)
+
+    def visit_ExceptHandler(self, node):
+        if node.type is not None:
+            self.visit(node.type)
+        bound_names = {node.name} if isinstance(node.name, str) else _target_names(node.name)
         self._forget_aliases(bound_names)
-        if is_upload_root:
-            self._upload_root_aliases.update(names)
-        if is_join:
-            self._join_aliases.update(names)
+        for statement in node.body:
+            self.visit(statement)
+        self._forget_aliases(bound_names)
+
+    def visit_Delete(self, node):
+        for target in node.targets:
+            self._forget_aliases(_target_names(target))
+
+    def _value_alias_kinds(self, node, aliases=None):
+        roots, paths, joins = aliases or (
+            self._upload_root_aliases,
+            self._path_aliases,
+            self._join_aliases,
+        )
+        kinds = set()
+        if _is_upload_folder_config(node):
+            kinds.add(self.ROOT_ALIAS)
+        if isinstance(node, ast.Name):
+            if node.id in roots:
+                kinds.add(self.ROOT_ALIAS)
+            if node.id in paths:
+                kinds.add(self.PATH_ALIAS)
+            if node.id in joins:
+                kinds.add(self.JOIN_ALIAS)
+        if isinstance(node, ast.Attribute):
+            if node.attr == "Path":
+                kinds.add(self.PATH_ALIAS)
+            if node.attr == "join":
+                kinds.add(self.JOIN_ALIAS)
+        if (
+            isinstance(node, ast.Call)
+            and node.args
+            and (
+                (isinstance(node.func, ast.Name) and node.func.id in paths)
+                or (isinstance(node.func, ast.Attribute) and node.func.attr == "Path")
+            )
+            and self.ROOT_ALIAS in self._value_alias_kinds(node.args[0], aliases)
+        ):
+            kinds.add(self.ROOT_ALIAS)
+        return kinds
+
+    def _contained_alias_kinds(self, node, aliases=None):
+        if isinstance(node, ast.Starred):
+            return self._contained_alias_kinds(node.value, aliases)
+        if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+            kinds = set()
+            for item in node.elts:
+                kinds.update(self._contained_alias_kinds(item, aliases))
+            return kinds
+        return self._value_alias_kinds(node, aliases)
+
+    def _target_updates(self, target, value, aliases=None):
+        if isinstance(target, ast.Name):
+            return [(target.id, self._value_alias_kinds(value, aliases))]
+        if isinstance(target, ast.Starred):
+            return [(name, set()) for name in _target_names(target)]
+        if not isinstance(target, (ast.List, ast.Tuple)):
+            return []
+        if not isinstance(value, (ast.List, ast.Tuple)):
+            return [(name, set()) for name in _target_names(target)]
+
+        target_stars = [
+            index for index, item in enumerate(target.elts) if isinstance(item, ast.Starred)
+        ]
+        value_has_star = any(isinstance(item, ast.Starred) for item in value.elts)
+        pairs = None
+        if not value_has_star and not target_stars and len(target.elts) == len(value.elts):
+            pairs = list(zip(target.elts, value.elts))
+        elif not value_has_star and len(target_stars) == 1:
+            star_index = target_stars[0]
+            trailing_count = len(target.elts) - star_index - 1
+            if len(value.elts) >= len(target.elts) - 1:
+                pairs = list(zip(target.elts[:star_index], value.elts[:star_index]))
+                pairs.append((target.elts[star_index], None))
+                if trailing_count:
+                    pairs.extend(
+                        zip(target.elts[-trailing_count:], value.elts[-trailing_count:])
+                    )
+
+        if pairs is not None:
+            updates = []
+            for item_target, item_value in pairs:
+                if item_value is None:
+                    updates.extend(
+                        (name, set()) for name in _target_names(item_target)
+                    )
+                else:
+                    updates.extend(self._target_updates(item_target, item_value, aliases))
+            return updates
+
+        possible_kinds = self._contained_alias_kinds(value, aliases)
+        return self._conservative_target_updates(target, possible_kinds)
+
+    def _conservative_target_updates(self, target, possible_kinds):
+        if isinstance(target, ast.Name):
+            return [(target.id, set(possible_kinds))]
+        if isinstance(target, ast.Starred):
+            return [(name, set()) for name in _target_names(target)]
+        if isinstance(target, (ast.List, ast.Tuple)):
+            return [
+                update
+                for item in target.elts
+                for update in self._conservative_target_updates(item, possible_kinds)
+            ]
+        return []
+
+    def _assignment_updates(self, value, targets, aliases=None):
+        return [
+            update
+            for target in targets
+            for update in self._target_updates(target, value, aliases)
+        ]
+
+    def _apply_alias_updates(self, updates):
+        for name, kinds in updates:
+            self._forget_aliases({name})
+            if self.ROOT_ALIAS in kinds:
+                self._upload_root_aliases.add(name)
+            if self.PATH_ALIAS in kinds:
+                self._path_aliases.add(name)
+            if self.JOIN_ALIAS in kinds:
+                self._join_aliases.add(name)
+
+    def _collect_possible_aliases(self, statements, roots, paths, joins):
+        collector = _ScopeAliasDefinitionCollector(statements)
+        possible_roots = set(roots)
+        possible_paths = set(paths) | collector.imported_paths
+        possible_joins = set(joins) | collector.imported_joins
+        aliases = (possible_roots, possible_paths, possible_joins)
+        changed = True
+        while changed:
+            changed = False
+            for value, targets in collector.assignments:
+                final_updates = {}
+                for name, kinds in self._assignment_updates(value, targets, aliases):
+                    final_updates[name] = kinds
+                for name, kinds in final_updates.items():
+                    for kind, names in (
+                        (self.ROOT_ALIAS, possible_roots),
+                        (self.PATH_ALIAS, possible_paths),
+                        (self.JOIN_ALIAS, possible_joins),
+                    ):
+                        if kind in kinds and name not in names:
+                            names.add(name)
+                            changed = True
+        return aliases
 
     def _forget_aliases(self, names):
         self._upload_root_aliases.difference_update(names)
+        self._path_aliases.difference_update(names)
         self._join_aliases.difference_update(names)
 
     def _inspect(self, node):
         is_join_alias = isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and (
             node.func.id in self._join_aliases
         )
-        if not _is_path_constructor(node) and not is_join_alias:
+        if not _is_path_constructor(node, self._path_aliases) and not is_join_alias:
             return
         parts = (
-            [part for arg in node.args for part in _path_parts(arg)]
+            [
+                part
+                for arg in node.args
+                for part in _path_parts(arg, self._path_aliases)
+            ]
             if is_join_alias
-            else _path_parts(node)
+            else _path_parts(node, self._path_aliases)
         )
         has_upload_root = any(
             _is_upload_folder_config(part)
@@ -604,6 +916,116 @@ async def local_route():
                 (4, "os.path.join(module_root, 'energy', report_number)"),
                 (8, "os.path.join(enclosing_root, 'energy', report_number)"),
                 (11, "os.path.join(local_root, 'energy', report_number)"),
+            ],
+            visitor.violations,
+        )
+
+    def test_loop_context_and_exception_targets_clear_existing_root_aliases(self):
+        tree = ast.parse("""
+def route():
+    root = app.config["UPLOAD_FOLDER"]
+    for root in unrelated_values:
+        pass
+    loop_path = os.path.join(root, "energy", report_number)
+
+    root = app.config["UPLOAD_FOLDER"]
+    with unrelated_context() as root:
+        context_path = os.path.join(root, "energy", report_number)
+    after_context_path = os.path.join(root, "energy", report_number)
+
+    root = app.config["UPLOAD_FOLDER"]
+    try:
+        unrelated_operation()
+    except Exception as root:
+        exception_path = os.path.join(root, "energy", report_number)
+    after_exception_path = os.path.join(root, "energy", report_number)
+""")
+        visitor = _DirectEnergyPathVisitor()
+        visitor.visit(tree)
+        self.assertEqual([], visitor.violations)
+
+    def test_later_enclosing_root_bindings_are_visible_to_sync_and_async_closures(self):
+        tree = ast.parse("""
+def sync_outer():
+    def sync_inner():
+        return os.path.join(root, "energy", report_number)
+    root = app.config["UPLOAD_FOLDER"]
+    return sync_inner()
+
+async def async_outer():
+    async def async_inner():
+        return os.path.join(async_root, "energy", report_number)
+    async_root = app.config["UPLOAD_FOLDER"]
+    return await async_inner()
+""")
+        visitor = _DirectEnergyPathVisitor()
+        visitor.visit(tree)
+        self.assertEqual(
+            [
+                (4, "os.path.join(root, 'energy', report_number)"),
+                (10, "os.path.join(async_root, 'energy', report_number)"),
+            ],
+            visitor.violations,
+        )
+
+    def test_destructuring_preserves_moves_and_clears_aliases_positionally(self):
+        tree = ast.parse("""
+root = app.config["UPLOAD_FOLDER"]
+path_constructor = pathlib.Path
+joiner = os.path.join
+root, path_constructor, joiner = root, path_constructor, joiner
+legacy_preserved_root = os.path.join(root, "energy", report_number)
+legacy_preserved_path = path_constructor(root) / "energy" / report_number
+legacy_preserved_join = joiner(root, "energy", report_number)
+
+[moved_root, root] = [root, "unrelated"]
+[moved_path_constructor, path_constructor] = [path_constructor, unrelated_factory]
+[moved_joiner, joiner] = [joiner, unrelated_factory]
+legacy_moved_root = os.path.join(moved_root, "energy", report_number)
+legacy_moved_path = moved_path_constructor(moved_root) / "energy" / report_number
+legacy_moved_join = moved_joiner(moved_root, "energy", report_number)
+safe_cleared_root = os.path.join(root, "energy", report_number)
+safe_cleared_path = path_constructor(app.config["UPLOAD_FOLDER"]) / "energy" / report_number
+safe_cleared_join = joiner(app.config["UPLOAD_FOLDER"], "energy", report_number)
+""")
+        visitor = _DirectEnergyPathVisitor()
+        visitor.visit(tree)
+        self.assertEqual(
+            [
+                (6, "os.path.join(root, 'energy', report_number)"),
+                (7, "path_constructor(root) / 'energy' / report_number"),
+                (8, "joiner(root, 'energy', report_number)"),
+                (13, "os.path.join(moved_root, 'energy', report_number)"),
+                (14, "moved_path_constructor(moved_root) / 'energy' / report_number"),
+                (15, "moved_joiner(moved_root, 'energy', report_number)"),
+            ],
+            visitor.violations,
+        )
+
+    def test_starred_and_unresolvable_destructuring_fails_conservatively(self):
+        tree = ast.parse("""
+root = app.config["UPLOAD_FOLDER"]
+path_constructor = pathlib.Path
+joiner = os.path.join
+first, *middle, last = [root, path_constructor, unrelated, joiner]
+legacy_first = os.path.join(first, "energy", report_number)
+legacy_last = last(app.config["UPLOAD_FOLDER"], "energy", report_number)
+safe_starred_list = os.path.join(middle, "energy", report_number)
+
+possible_root, possible_path, possible_join = [root, *dynamic_values, path_constructor, joiner]
+legacy_possible_root = os.path.join(possible_root, "energy", report_number)
+legacy_possible_path = possible_path(app.config["UPLOAD_FOLDER"]) / "energy" / report_number
+legacy_possible_join = possible_join(app.config["UPLOAD_FOLDER"], "energy", report_number)
+""")
+        visitor = _DirectEnergyPathVisitor()
+        visitor.visit(tree)
+        self.assertEqual(
+            [
+                (6, "os.path.join(first, 'energy', report_number)"),
+                (7, "last(app.config['UPLOAD_FOLDER'], 'energy', report_number)"),
+                (11, "os.path.join(possible_root, 'energy', report_number)"),
+                (12, "possible_path(app.config['UPLOAD_FOLDER']) / 'energy' / report_number"),
+                (13, "possible_join(app.config['UPLOAD_FOLDER'], 'energy', report_number)"),
             ],
             visitor.violations,
         )

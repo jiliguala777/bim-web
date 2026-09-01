@@ -22,6 +22,13 @@ class UserStorageKeyTests(unittest.TestCase):
             with self.subTest(value=value), self.assertRaises(InvalidReportPath):
                 validate_report_number(value)
 
+    def test_rejects_report_numbers_too_long_for_a_portable_path_component(self):
+        from energy_report_storage import InvalidReportPath, validate_report_number
+
+        for value in ("R" * 256, "报告" * 43):
+            with self.subTest(value=value), self.assertRaises(InvalidReportPath):
+                validate_report_number(value)
+
 
 class EnergyReportStorageResolutionTests(unittest.TestCase):
     def _symlink_or_skip(self, link: Path, target: Path):

@@ -401,6 +401,21 @@ class PdfOwnerBindingTests(unittest.TestCase):
 
         self.assertIn(response.status_code, {400, 403})
 
+    def test_pdf_prepare_records_the_uploaded_report_for_its_owner(self):
+        self.login_as("alice")
+
+        response = self.client.post(
+            "/energy/pdf_prepare",
+            data=self.pdf_form("BIM-PDF-STATUS"),
+            content_type="multipart/form-data",
+        )
+
+        self.assertEqual(response.status_code, 200, response.get_json())
+        alice_report = self.server._report_row("alice", "BIM-PDF-STATUS")
+        self.assertIsNotNone(alice_report)
+        self.assertEqual(alice_report["status"], "uploaded")
+        self.assertIsNone(self.server._report_row("bob", "BIM-PDF-STATUS"))
+
     def test_report_child_file_validator_rejects_a_regular_file_outside_the_report(self):
         report_dir = self.upload_root / "energy" / user_storage_key("alice") / "BIM-CHILD"
         report_dir.mkdir(parents=True)
@@ -679,6 +694,23 @@ class PdfOwnerBindingTests(unittest.TestCase):
             self.server._report_row("bob", "BIM-FAIL-STATUS")["status"],
             "created",
         )
+
+    def test_ai_recognition_records_a_new_owner_report_before_processing(self):
+        self.login_as("alice")
+
+        response = self.client.post(
+            "/energy/ai_recognize",
+            data={
+                "report_number": "BIM-NEW-RECOGNITION",
+                "model_backend": "unsupported",
+            },
+        )
+
+        self.assertEqual(response.status_code, 400, response.get_json())
+        alice_report = self.server._report_row("alice", "BIM-NEW-RECOGNITION")
+        self.assertIsNotNone(alice_report)
+        self.assertEqual(alice_report["status"], "failed")
+        self.assertIsNone(self.server._report_row("bob", "BIM-NEW-RECOGNITION"))
 
 
 class ReportOperationAuthorizationTests(unittest.TestCase):
@@ -1244,7 +1276,14 @@ class ReportUploadIsolationTests(unittest.TestCase):
                 job_id = f"job-sensitive-error-{worker_name}"
                 self.server.simulation_jobs.set(
                     job_id,
-                    {"status": "processing", "progress": 0, "result": None, "error": None},
+                    {
+                        "owner_username": "alice",
+                        "report_number": "BIM-JOB",
+                        "status": "processing",
+                        "progress": 0,
+                        "result": None,
+                        "error": None,
+                    },
                 )
                 getattr(self.server, worker_name)(
                     job_id,
@@ -1257,6 +1296,36 @@ class ReportUploadIsolationTests(unittest.TestCase):
             self.assertEqual(response.get_json()["error"], "Simulation failed")
             self.assertNotIn(secret_path, response.get_data(as_text=True))
         self.assertIn(secret_path, "\n".join(captured_logs.output))
+
+    def test_job_status_is_owner_scoped_and_requires_explicit_admin_targeting(self):
+        jobs_directory = Path(self.temporary_directory.name) / "owner-jobs"
+        jobs_directory.mkdir()
+        job_id = "alice-private-job"
+        job = {
+            "owner_username": "alice",
+            "report_number": "BIM-JOB",
+            "status": "completed",
+            "progress": 100,
+            "result": {"private": "alice-only"},
+            "error": None,
+        }
+
+        with patch.object(self.server, "JOBS_DIR", str(jobs_directory)):
+            self.server.simulation_jobs.set(job_id, job)
+            self.login_as("alice")
+            own_response = self.client.get(f"/energy/status/{job_id}")
+            self.login_as("bob")
+            cross_owner_response = self.client.get(f"/energy/status/{job_id}")
+            self.login_as("admin", is_admin=True)
+            implicit_admin_response = self.client.get(f"/energy/status/{job_id}")
+            explicit_admin_response = self.client.get(
+                f"/energy/status/{job_id}?owner_username=alice"
+            )
+
+        self.assertEqual(own_response.status_code, 200, own_response.get_json())
+        self.assertEqual(cross_owner_response.status_code, 403, cross_owner_response.get_json())
+        self.assertEqual(implicit_admin_response.status_code, 403, implicit_admin_response.get_json())
+        self.assertEqual(explicit_admin_response.status_code, 200, explicit_admin_response.get_json())
 
     def test_parser_file_error_is_not_misclassified_or_exposed(self):
         self.login_as("alice")

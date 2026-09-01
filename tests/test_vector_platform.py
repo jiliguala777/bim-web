@@ -10,6 +10,7 @@ from unittest import mock
 import cv2
 import numpy as np
 
+from energy_report_storage import user_storage_key
 from vector_platform import VECTOR_BACKEND, VectorPlatformAdapter, VectorPlatformConfig, adapt_vector_prediction
 
 
@@ -87,9 +88,17 @@ class VectorPlatformRouteTests(unittest.TestCase):
         cls.server.app.config.update(TESTING=True, SECRET_KEY="vector-platform-test")
 
     def setUp(self):
+        self.database_directory = tempfile.TemporaryDirectory()
+        self.previous_database_path = self.server.DB_PATH
+        self.server.DB_PATH = str(Path(self.database_directory.name) / "users.db")
+        self.server.init_db()
         self.client = self.server.app.test_client()
         with self.client.session_transaction() as session:
-            session["logged_in"] = True
+            session.update(logged_in=True, username="test-user", is_admin=False)
+
+    def tearDown(self):
+        self.server.DB_PATH = self.previous_database_path
+        self.database_directory.cleanup()
 
     def test_vector_backend_persists_a_recognition_payload_consumable_by_energy_route(self):
         source = np.zeros((10, 20, 3), dtype=np.uint8)
@@ -128,11 +137,12 @@ class VectorPlatformRouteTests(unittest.TestCase):
             payload = response.get_json()
             self.assertEqual(payload["model_info"]["backend"], VECTOR_BACKEND)
             self.assertTrue(payload["room_topology"]["load_geometry_ready"])
+            report_dir = Path(temporary) / "energy" / user_storage_key("test-user") / "VECTOR-1"
             recognition = json.loads(
-                (Path(temporary) / "energy" / "VECTOR-1" / "recognition.json").read_text(encoding="utf-8")
+                (report_dir / "recognition.json").read_text(encoding="utf-8")
             )
             self.assertEqual(recognition["model"]["backend"], VECTOR_BACKEND)
-            self.assertIsNotNone(self.server._load_recognition_payload(Path(temporary) / "energy" / "VECTOR-1"))
+            self.assertIsNotNone(self.server._load_recognition_payload(report_dir))
 
     def test_vector_backend_crops_a_raster_upload_before_prediction(self):
         image = np.zeros((400, 400, 3), dtype=np.uint8)

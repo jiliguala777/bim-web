@@ -27,6 +27,7 @@ class ReportAccessDenied(PermissionError):
 
 
 _READABLE_DISALLOWED = re.compile(r"[^\w.-]+", re.UNICODE)
+_MAX_REPORT_NUMBER_UTF8_BYTES = 255
 
 
 def user_storage_key(username: str) -> str:
@@ -56,6 +57,8 @@ def validate_report_number(report_number: str) -> str:
         raise InvalidReportPath("report number contains a control character")
     if any(char in normalized for char in '<>:"|?*'):
         raise InvalidReportPath("report number contains an invalid filename character")
+    if len(normalized.encode("utf-8")) > _MAX_REPORT_NUMBER_UTF8_BYTES:
+        raise InvalidReportPath("report number is too long")
     return normalized
 
 

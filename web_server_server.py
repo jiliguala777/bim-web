@@ -1106,6 +1106,8 @@ def energy_calculate():
     
     # 初始化状态
     simulation_jobs.set(job_id, {
+        'owner_username': context.owner_username,
+        'report_number': context.report_number,
         'status': 'processing',
         'progress': 0,
         'result': None,
@@ -1279,6 +1281,19 @@ def energy_status(job_id):
     job = simulation_jobs.get(job_id)
     if not job:
         return jsonify({'error': 'Job not found'}), 404
+    job_owner = job.get('owner_username')
+    job_report_number = job.get('report_number')
+    if not isinstance(job_owner, str) or not isinstance(job_report_number, str):
+        return jsonify({'error': 'Job not found'}), 404
+    try:
+        context = _resolved_energy_report_context(
+            job_report_number,
+            _requested_owner_username(),
+        )
+        if context.owner_username != job_owner:
+            raise ReportAccessDenied('job belongs to another report owner')
+    except _REPORT_STORAGE_EXCEPTIONS as exc:
+        return _report_storage_error_response(exc)
     return jsonify(job)
 
 def background_simulation_task(job_id, data):
@@ -2950,6 +2965,7 @@ def prepare_energy_pdf():
         )
     except _REPORT_STORAGE_EXCEPTIONS as exc:
         return _report_storage_error_response(exc)
+    _upsert_report_status(context.owner_username, context.report_number, 'created')
     uploaded = request.files.get('raster_file')
     if not uploaded or not uploaded.filename:
         return jsonify({'error': 'No PDF file provided'}), 400
@@ -2976,6 +2992,8 @@ def prepare_energy_pdf():
             os.remove(stored_path)
         logger.warning('Cannot read prepared PDF: %s', exc)
         return jsonify({'error': 'Cannot read PDF'}), 400
+
+    _upsert_report_status(context.owner_username, context.report_number, 'uploaded')
 
     return jsonify({
         'success': True,
@@ -3475,7 +3493,7 @@ def ai_recognize():
     except _REPORT_STORAGE_EXCEPTIONS as exc:
         return _report_storage_error_response(exc)
 
-    _update_report_status_if_exists(
+    _upsert_report_status(
         context.owner_username, context.report_number, 'recognizing',
     )
 

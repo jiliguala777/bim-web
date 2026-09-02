@@ -44,6 +44,11 @@ id_rsa*
 .superpowers/
 .worktrees/
 
+# 内部交接、设计过程与实施计划仅保留在本地，不随公开仓库发布
+docs/handoff/
+docs/superpowers/plans/
+docs/superpowers/specs/
+
 # 临时输出与验证产物
 tmp/
 artifacts/

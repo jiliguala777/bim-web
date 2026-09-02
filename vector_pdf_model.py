@@ -62,7 +62,7 @@ class VectorModelConfig:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "training_root", Path(self.training_root).resolve())
-        object.__setattr__(self, "python_executable", Path(self.python_executable).resolve())
+        object.__setattr__(self, "python_executable", Path(self.python_executable).absolute())
         object.__setattr__(self, "checkpoint_path", Path(self.checkpoint_path).resolve())
         if self.device not in {"cpu", "cuda"}:
             raise ValueError("vector model device must be cpu or cuda")

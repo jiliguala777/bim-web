@@ -109,6 +109,36 @@ class VectorProbabilityRunnerTests(unittest.TestCase):
         self.assertEqual(config.device, "cpu")
         self.assertEqual(config.timeout_seconds, 42.5)
 
+    def test_preserves_symlinked_virtualenv_python_executable(self):
+        from vector_pdf_model import VectorModelConfig
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            training_root = root / "training-root"
+            training_root.mkdir()
+            system_python = root / "system-python"
+            system_python.write_bytes(b"")
+            virtualenv_python = root / "venv" / "bin" / "python"
+            virtualenv_python.parent.mkdir(parents=True)
+            checkpoint = root / "best.pt"
+            checkpoint.write_bytes(b"weights")
+
+            original_resolve = Path.resolve
+
+            def resolve_virtualenv_symlink(path, *args, **kwargs):
+                if path == virtualenv_python:
+                    return system_python
+                return original_resolve(path, *args, **kwargs)
+
+            with mock.patch.object(Path, "resolve", resolve_virtualenv_symlink):
+                config = VectorModelConfig(
+                    training_root=training_root,
+                    python_executable=virtualenv_python,
+                    checkpoint_path=checkpoint,
+                )
+
+        self.assertEqual(config.python_executable, virtualenv_python.absolute())
+
     def test_runs_external_predictor_with_array_arguments_and_cpu_timeout(self):
         from vector_pdf_model import (
             CHANNEL_NAMES,

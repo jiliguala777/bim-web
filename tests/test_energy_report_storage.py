@@ -37,6 +37,25 @@ class UserStorageKeyTests(unittest.TestCase):
                 self.assertEqual(len(value.encode("utf-8")), 255)
                 self.assertEqual(validate_report_number(value), value)
 
+    def test_rejects_windows_device_names_and_trailing_dots_or_spaces(self):
+        from energy_report_storage import InvalidReportPath, validate_report_number
+
+        for value in (
+            "CON",
+            "con.txt",
+            "PRN.json",
+            "AUX",
+            "NUL",
+            "COM1",
+            "com9.anything",
+            "LPT1",
+            "lpt9.txt",
+            "report.",
+            "report ",
+        ):
+            with self.subTest(value=value), self.assertRaises(InvalidReportPath):
+                validate_report_number(value)
+
 
 class EnergyReportStorageResolutionTests(unittest.TestCase):
     def _symlink_or_skip(self, link: Path, target: Path):

@@ -23,11 +23,19 @@ import subprocess
 from contextlib import contextmanager
 
 from energy_report_storage import (
+    colliding_user_storage_keys,
+    ensure_unique_user_storage_keys,
     EnergyReportContext,
     InvalidReportPath,
     ReportAccessDenied,
+    resolve_report_child_destination,
+    resolve_report_child_file,
+    resolve_report_subdirectory,
     resolve_energy_report_context,
     resolve_report_owner,
+    StorageIdentityCollision,
+    user_storage_key,
+    validate_canonical_username,
 )
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -541,6 +549,44 @@ def _user_exists(username):
         conn.close()
 
 
+def _configured_admin_username():
+    """Return the enabled environment administrator identity, if configured."""
+
+    if not os.environ.get('ADMIN_PASSWORD'):
+        return None
+    return os.environ.get('ADMIN_USER', 'admin')
+
+
+def _database_usernames(conn=None):
+    """Load every database authentication principal."""
+
+    owns_connection = conn is None
+    if owns_connection:
+        conn = get_db_connection()
+    try:
+        return [row[0] for row in conn.execute("SELECT username FROM users")]
+    finally:
+        if owns_connection:
+            conn.close()
+
+
+def _authentication_principals(conn=None):
+    principals = _database_usernames(conn)
+    admin_username = _configured_admin_username()
+    if admin_username is not None:
+        principals.append(admin_username)
+    return principals
+
+
+def _require_unambiguous_report_owner(owner_username):
+    """Fail closed when the selected owner key belongs to multiple principals."""
+
+    if user_storage_key(owner_username) in colliding_user_storage_keys(
+        _authentication_principals()
+    ):
+        raise StorageIdentityCollision("report owner is ambiguous")
+
+
 def _requested_owner_username(payload=None):
     """Return an explicitly requested report owner from the current request."""
     if payload is not None and hasattr(payload, 'get') and 'owner_username' in payload:
@@ -562,6 +608,7 @@ def _effective_report_owner(requested_owner=None):
     session_username = session.get('username')
     is_admin = session.get('is_admin') is True
     owner_username = resolve_report_owner(session_username, is_admin, requested_owner)
+    _require_unambiguous_report_owner(owner_username)
     explicit_target = isinstance(requested_owner, str) and bool(requested_owner.strip())
     if is_admin and explicit_target and owner_username != session_username and not _user_exists(owner_username):
         raise ReportOwnerNotFound("the requested report owner does not exist")
@@ -687,19 +734,35 @@ def register():
         
         if not username or not password:
             return jsonify({'status': 'fail', 'message': '请填写完整信息'}), 400
-            
+        try:
+            validate_canonical_username(username)
+        except ValueError:
+            return jsonify({'status': 'fail', 'message': '用户名格式无效'}), 400
+
         hashed_pw = generate_password_hash(password)
-        
+        conn = None
         try:
             conn = get_db_connection()
+            conn.execute('BEGIN IMMEDIATE')
+            ensure_unique_user_storage_keys([
+                *_authentication_principals(conn),
+                username,
+            ])
             conn.execute('INSERT INTO users (username, password_hash) VALUES (?, ?)', (username, hashed_pw))
             conn.commit()
-            conn.close()
             return jsonify({'status': 'success'})
-        except sqlite3.IntegrityError:
+        except (sqlite3.IntegrityError, StorageIdentityCollision):
+            if conn is not None:
+                conn.rollback()
             return jsonify({'status': 'fail', 'message': '该用户名已被占用'}), 400
-        except Exception as e:
-            return jsonify({'status': 'fail', 'message': str(e)}), 500
+        except Exception:
+            if conn is not None:
+                conn.rollback()
+            logger.exception("Registration failed")
+            return jsonify({'status': 'fail', 'message': '注册失败'}), 500
+        finally:
+            if conn is not None:
+                conn.close()
             
     return render_template('register.html')
 
@@ -745,7 +808,9 @@ def get_simulation_data(report_number):
     """
     try:
         context = _energy_report_context(report_number)
-        dxf_path = context.report_dir / 'building_plan.dxf'
+        dxf_path = resolve_report_child_file(
+            context.report_dir, 'building_plan.dxf', required=False,
+        )
 
         # In a real scenario, we'd store the last simulation results in a DB or JSON file
         # For now, we'll re-extract or return defaults
@@ -822,18 +887,18 @@ def energy_upload():
     try:
         report_number = request.form.get('report_number', 'default')
         context = _energy_report_context(report_number, create=True)
-        target_dir = os.fspath(context.report_dir)
+        target_dir = context.report_dir
         _upsert_report_status(context.owner_username, context.report_number, 'created')
         
         result = {'status': 'success', 'files': {}}
         files_uploaded = False
         dxf_uploaded = False
-        dxf_path = os.path.join(target_dir, 'building_plan.dxf') # Define dxf_path early
+        dxf_path = resolve_report_child_destination(target_dir, 'building_plan.dxf')
         
         if 'dxf_file' in request.files:
             f = request.files['dxf_file']
             if f and allowed_file(f.filename, ALLOWED_DXF):
-                f.save(dxf_path)
+                _atomic_save_upload(f, dxf_path)
                 result['files']['dxf'] = 'building_plan.dxf'
                 dxf_uploaded = True
                 files_uploaded = True
@@ -844,8 +909,13 @@ def energy_upload():
             f = request.files['raster_file']
             if f and allowed_file(f.filename, ALLOWED_RASTER):
                 ext = f.filename.rsplit('.', 1)[1].lower()
-                raster_path = os.path.join(target_dir, f'building_plan.{ext}')
-                f.save(raster_path)
+                raster_path = resolve_report_child_destination(
+                    target_dir, f'building_plan.{ext}',
+                )
+                _atomic_save_upload(f, raster_path)
+                raster_path = resolve_report_child_file(
+                    target_dir, f'building_plan.{ext}',
+                )
                 result['files']['raster'] = f'building_plan.{ext}'
                 raster_uploaded = True
                 files_uploaded = True
@@ -859,13 +929,17 @@ def energy_upload():
                             poppler_path=_resolve_poppler_path(),
                         )
                         if images:
-                            images[0].save(os.path.join(target_dir, 'building_plan.png'), 'PNG')
+                            converted_path = resolve_report_child_destination(
+                                target_dir, 'building_plan.png',
+                            )
+                            _atomic_save_image(images[0], converted_path, 'PNG')
                             result['files']['raster_converted'] = 'building_plan.png'
                     except Exception as e:
                         logger.warning(f"PDF to Image conversion failed: {e}")
         
         # 仅在本次请求确实上传了新文件时才解析层级信息
-        if dxf_uploaded and os.path.exists(dxf_path):
+        if dxf_uploaded and dxf_path.is_file():
+            dxf_path = resolve_report_child_file(target_dir, 'building_plan.dxf')
             doc = ezdxf.readfile(dxf_path)
             msp = doc.modelspace()
             layers = {}
@@ -897,8 +971,8 @@ def energy_upload():
         if 'epw_file' in request.files:
             f = request.files['epw_file']
             if f and allowed_file(f.filename, ALLOWED_EPW):
-                p = os.path.join(target_dir, 'weather_data.epw')
-                f.save(p)
+                p = resolve_report_child_destination(target_dir, 'weather_data.epw')
+                _atomic_save_upload(f, p)
                 result['files']['epw'] = 'weather_data.epw'
                 files_uploaded = True
         elif request.form.get('city_id'):
@@ -906,7 +980,10 @@ def energy_upload():
             src = os.path.join(WEATHER_DATA_DIR, f'{city_id}.epw')
             if os.path.exists(src):
                 import shutil
-                shutil.copy(src, os.path.join(target_dir, 'weather_data.epw'))
+                destination = resolve_report_child_destination(
+                    target_dir, 'weather_data.epw',
+                )
+                _atomic_copy_file(src, destination)
                 result['files']['epw'] = 'weather_data.epw'
                 files_uploaded = True
 
@@ -931,7 +1008,9 @@ def get_all_layers_geometry():
     try:
         report_number = request.args.get('project', 'default')
         context = _energy_report_context(report_number)
-        dxf_path = context.report_dir / 'building_plan.dxf'
+        dxf_path = resolve_report_child_file(
+            context.report_dir, 'building_plan.dxf', required=False,
+        )
         
         if not os.path.exists(dxf_path):
             return jsonify({'error': 'DXF file not found'}), 404
@@ -981,7 +1060,9 @@ def energy_geometry():
         scale = float(data.get('scale', 1.0))
 
         context = _energy_report_context(report_number, requested_owner=_requested_owner_username(data))
-        dxf_path = context.report_dir / 'building_plan.dxf'
+        dxf_path = resolve_report_child_file(
+            context.report_dir, 'building_plan.dxf', required=False,
+        )
         
         if not os.path.exists(dxf_path):
             return jsonify({'error': 'DXF file not found'}), 404
@@ -1022,7 +1103,9 @@ def energy_geometry_advanced():
 
         context = _energy_report_context(report_number, requested_owner=_requested_owner_username(data))
         target_dir = context.report_dir
-        dxf_path = target_dir / 'building_plan.dxf'
+        dxf_path = resolve_report_child_file(
+            target_dir, 'building_plan.dxf', required=False,
+        )
         
         if not os.path.exists(dxf_path):
             return jsonify({'error': 'DXF file not found'}), 404
@@ -1034,8 +1117,12 @@ def energy_geometry_advanced():
         engine = AdvancedCADRecognition(dxf_path)
         
         # 如果有位图则使用位图路由，否则使用矢量启发式路由 (混合模式)
-        png_path = target_dir / 'building_plan.png'
-        jpg_path = target_dir / 'building_plan.jpg'
+        png_path = resolve_report_child_file(
+            target_dir, 'building_plan.png', required=False,
+        )
+        jpg_path = resolve_report_child_file(
+            target_dir, 'building_plan.jpg', required=False,
+        )
         
         raster_path = png_path if os.path.exists(png_path) else (jpg_path if os.path.exists(jpg_path) else None)
         
@@ -1113,15 +1200,24 @@ def energy_calculate():
         'result': None,
         'error': None
     })
+    _upsert_report_status(
+        context.owner_username, context.report_number, 'calculating',
+    )
 
-    
-    if mode == 'simple':
-        # 简单模式直接在主线程或轻量级线程处理计算 (此处为了统一逻辑仍用线程)
-        thread = threading.Thread(target=simple_simulation_task, args=(job_id, data))
-    else:
-        thread = threading.Thread(target=background_simulation_task, args=(job_id, data))
-        
-    thread.start()
+    try:
+        if mode == 'simple':
+            # 简单模式直接在主线程或轻量级线程处理计算 (此处为了统一逻辑仍用线程)
+            thread = threading.Thread(target=simple_simulation_task, args=(job_id, data))
+        else:
+            thread = threading.Thread(target=background_simulation_task, args=(job_id, data))
+
+        thread.start()
+    except Exception as exc:
+        _update_report_status_if_exists(
+            context.owner_username, context.report_number, 'failed',
+        )
+        simulation_jobs.update(job_id, status='failed', error='Simulation failed')
+        return _internal_report_error_response('Cannot start simulation task', exc)
     return jsonify({'job_id': job_id})
 
 def get_dxf_metrics(dxf_path, wall_layers, window_layers, scale=1.0):
@@ -1176,6 +1272,7 @@ def get_dxf_metrics(dxf_path, wall_layers, window_layers, scale=1.0):
 def _background_energy_report_context(data) -> EnergyReportContext:
     """Resolve a report from identity copied into a background-job payload."""
     owner_username = data.get('owner_username')
+    _require_unambiguous_report_owner(owner_username)
     context = resolve_energy_report_context(
         app.config['UPLOAD_FOLDER'],
         owner_username,
@@ -1206,7 +1303,9 @@ def simple_simulation_task(job_id, data):
         win_layers = data.get('window_layers', [])
         
         context = _background_energy_report_context(data)
-        dxf_path = context.report_dir / 'building_plan.dxf'
+        dxf_path = resolve_report_child_file(
+            context.report_dir, 'building_plan.dxf', required=False,
+        )
         
         # 实时从 DXF 提取几何数据
         if os.path.exists(dxf_path) and (wall_layers or win_layers):
@@ -1270,9 +1369,15 @@ def simple_simulation_task(job_id, data):
                 'perimeter': round(wall_len + win_len, 2)
             }
         })
+        _update_report_status_if_exists(
+            data.get('owner_username'), data.get('report_number'), 'calculated',
+        )
     except Exception as e:
         logger.error("Simple simulation task error: %s", e, exc_info=True)
         simulation_jobs.update(job_id, status='failed', error='Simulation failed')
+        _update_report_status_if_exists(
+            data.get('owner_username'), data.get('report_number'), 'failed',
+        )
 
 
 @app.route('/energy/status/<job_id>')
@@ -1301,8 +1406,12 @@ def background_simulation_task(job_id, data):
     try:
         context = _background_energy_report_context(data)
         target_dir = context.report_dir
-        dxf_path = target_dir / 'building_plan.dxf'
-        epw_path = target_dir / 'weather_data.epw'
+        dxf_path = resolve_report_child_file(
+            target_dir, 'building_plan.dxf', required=False,
+        )
+        epw_path = resolve_report_child_file(
+            target_dir, 'weather_data.epw', required=False,
+        )
         
         params = {
             'scale': float(data.get('scale', 1.0)),
@@ -1324,10 +1433,11 @@ def background_simulation_task(job_id, data):
         
         # 2. 执行 EnergyPlus 模拟 (深度算法)
         simulation_jobs.update(job_id, progress=50)
-        output_dir = target_dir / 'energyplus_runs' / job_id
+        output_dir = resolve_report_subdirectory(
+            target_dir, 'energyplus_runs', job_id, create=True,
+        )
 
         idf_path = output_dir / 'run.idf'
-        os.makedirs(output_dir, exist_ok=True)
         
         energyplus_engine.generate_idf(idf_path, geom_result, params)
         csv_path = energyplus_engine.run_eplus(idf_path, epw_path, output_dir)
@@ -1351,10 +1461,16 @@ def background_simulation_task(job_id, data):
                 'cooling_dd': 1200
             }
         })
+        _update_report_status_if_exists(
+            data.get('owner_username'), data.get('report_number'), 'calculated',
+        )
 
     except Exception as e:
         logger.error("Simulation task error: %s", e, exc_info=True)
         simulation_jobs.update(job_id, status='failed', error='Simulation failed')
+        _update_report_status_if_exists(
+            data.get('owner_username'), data.get('report_number'), 'failed',
+        )
 
 def extract_geometry(dxf_path, params):
     """通用的 CAD 几何提取模块"""
@@ -1414,8 +1530,9 @@ def upload_ifc():
         if not f or not allowed_file(f.filename, ALLOWED_IFC):
             return jsonify({'error': 'Invalid file type. Only .ifc files accepted'}), 400
         
-        ifc_path = target_dir / 'building_model.ifc'
-        f.save(ifc_path)
+        ifc_path = resolve_report_child_destination(target_dir, 'building_model.ifc')
+        _atomic_save_upload(f, ifc_path)
+        ifc_path = resolve_report_child_file(target_dir, 'building_model.ifc')
         _upsert_report_status(context.owner_username, context.report_number, 'uploaded')
         
         # 解析 IFC
@@ -1457,7 +1574,9 @@ def ifc_properties():
     
     try:
         context = _energy_report_context(report_number, requested_owner=requested_owner)
-        ifc_path = context.report_dir / 'building_model.ifc'
+        ifc_path = resolve_report_child_file(
+            context.report_dir, 'building_model.ifc', required=False,
+        )
         
         if not os.path.exists(ifc_path):
             return jsonify({'error': 'IFC file not found. Upload one first.'}), 404
@@ -1487,7 +1606,9 @@ def ifc_walls():
     
     try:
         context = _energy_report_context(report_number, requested_owner=requested_owner)
-        ifc_path = context.report_dir / 'building_model.ifc'
+        ifc_path = resolve_report_child_file(
+            context.report_dir, 'building_model.ifc', required=False,
+        )
         
         if not os.path.exists(ifc_path):
             return jsonify({'error': 'IFC file not found'}), 404
@@ -1524,7 +1645,9 @@ def ifc_simulate():
     
     try:
         context = _energy_report_context(report_number, requested_owner=requested_owner)
-        ifc_path = context.report_dir / 'building_model.ifc'
+        ifc_path = resolve_report_child_file(
+            context.report_dir, 'building_model.ifc', required=False,
+        )
         
         if not os.path.exists(ifc_path):
             return jsonify({'error': 'IFC file not found'}), 404
@@ -1762,71 +1885,61 @@ def _recognition_json_path(target_dir):
 
 
 def _canonical_report_directory(report_dir):
-    report_path = Path(report_dir)
-    if report_path.is_symlink() or not report_path.is_dir():
-        raise InvalidReportPath('report directory is invalid')
-    try:
-        return report_path.resolve(strict=True)
-    except OSError as exc:
-        raise InvalidReportPath('report directory is invalid') from exc
+    return resolve_report_subdirectory(report_dir)
 
 
 def _validated_report_child_file(report_dir, child_path, *, required=True):
     """Return one regular, non-aliased file directly below *report_dir*."""
-    canonical_report = _canonical_report_directory(report_dir)
     candidate = Path(child_path)
-    if candidate.is_symlink():
+    canonical_report = _canonical_report_directory(report_dir)
+    if candidate.parent.absolute() != Path(report_dir).absolute():
         raise InvalidReportPath('report child file is invalid')
-    try:
-        resolved = candidate.resolve(strict=True)
-    except FileNotFoundError:
-        if required:
-            raise
-        try:
-            parent = candidate.parent.resolve(strict=True)
-        except OSError as exc:
-            raise InvalidReportPath('report child file is invalid') from exc
-        if parent != canonical_report:
-            raise InvalidReportPath('report child file is invalid')
-        return canonical_report / candidate.name
-    except OSError as exc:
-        raise InvalidReportPath('report child file is invalid') from exc
-    if resolved.parent != canonical_report or not resolved.is_file():
-        raise InvalidReportPath('report child file is invalid')
-    return resolved
+    return resolve_report_child_file(canonical_report, candidate.name, required=required)
 
 
 def _validated_report_child_directory(report_dir, child_path, *, create=False):
     """Return one non-aliased directory directly below *report_dir*."""
-    canonical_report = _canonical_report_directory(report_dir)
     candidate = Path(child_path)
-    if candidate.is_symlink():
+    canonical_report = _canonical_report_directory(report_dir)
+    if candidate.parent.absolute() != Path(report_dir).absolute():
         raise InvalidReportPath('report child directory is invalid')
+    return resolve_report_subdirectory(canonical_report, candidate.name, create=create)
+
+
+def _atomic_file_operation(destination, operation):
+    """Publish a fixed report child without opening the destination alias."""
+
+    destination = Path(destination)
+    temporary = None
     try:
-        resolved = candidate.resolve(strict=True)
-    except FileNotFoundError:
-        if not create:
-            raise
-        try:
-            parent = candidate.parent.resolve(strict=True)
-        except OSError as exc:
-            raise InvalidReportPath('report child directory is invalid') from exc
-        if parent != canonical_report:
-            raise InvalidReportPath('report child directory is invalid')
-        try:
-            candidate.mkdir()
-        except FileExistsError:
-            pass
-        return _validated_report_child_directory(
-            canonical_report,
-            candidate,
-            create=False,
-        )
-    except OSError as exc:
-        raise InvalidReportPath('report child directory is invalid') from exc
-    if resolved.parent != canonical_report or not resolved.is_dir():
-        raise InvalidReportPath('report child directory is invalid')
-    return resolved
+        with tempfile.NamedTemporaryFile(
+            mode='wb', dir=destination.parent,
+            prefix=f'.{destination.name}.', suffix='.tmp', delete=False,
+        ) as handle:
+            temporary = Path(handle.name)
+        operation(temporary)
+        with temporary.open('r+b') as handle:
+            os.fsync(handle.fileno())
+        os.replace(temporary, destination)
+    except BaseException:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+        raise
+
+
+def _atomic_save_upload(uploaded, destination):
+    _atomic_file_operation(destination, lambda temporary: uploaded.save(temporary))
+
+
+def _atomic_copy_file(source, destination):
+    _atomic_file_operation(destination, lambda temporary: shutil.copyfile(source, temporary))
+
+
+def _atomic_save_image(image, destination, image_format):
+    _atomic_file_operation(
+        destination,
+        lambda temporary: image.save(temporary, image_format),
+    )
 
 
 def _geometry_summary(geometry):
@@ -2025,8 +2138,8 @@ def _persist_vector_recognition(
     overlay = result['overlay']
     mask = result['mask']
     h, w = mask.shape
-    overlay_path = os.path.join(target_dir, 'ai_overlay.jpg')
-    mask_path = os.path.join(target_dir, 'ai_mask.png')
+    overlay_path = resolve_report_child_destination(target_dir, 'ai_overlay.jpg')
+    mask_path = resolve_report_child_destination(target_dir, 'ai_mask.png')
     _write_image(Path(overlay_path), overlay, [cv2.IMWRITE_JPEG_QUALITY, 90])
     mask_color = np.zeros((h, w, 3), dtype=np.uint8)
     mask_color[mask == 1] = (60, 76, 231)
@@ -2170,13 +2283,11 @@ def _require_exterior_report_dir(context):
 
 
 def _read_exterior_artifact(artifact_dir, filename):
-    path = artifact_dir / filename
-    if not path.is_file() or path.is_symlink():
+    try:
+        path = resolve_report_child_file(artifact_dir, filename)
+    except FileNotFoundError:
         raise FileNotFoundError(f'{filename} does not exist')
-    resolved = path.resolve(strict=True)
-    if resolved.parent != artifact_dir:
-        raise ValueError(f'{filename} path is invalid')
-    raw = resolved.read_bytes()
+    raw = path.read_bytes()
     try:
         payload = json.loads(raw.decode('utf-8'))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -2814,15 +2925,25 @@ _exterior_thread_locks = {}
 @contextmanager
 def _exterior_report_lock(report_dir):
     """Serialize exterior fusion/confirmation/use for one report across workers."""
-    report_dir = Path(report_dir).resolve()
-    report_dir.mkdir(parents=True, exist_ok=True)
+    report_dir = _canonical_report_directory(report_dir)
     lock_key = os.fspath(report_dir)
     with _exterior_thread_locks_guard:
         thread_lock = _exterior_thread_locks.setdefault(lock_key, threading.RLock())
 
     with thread_lock:
-        lock_path = report_dir / '.exterior_generation.lock'
-        with open(lock_path, 'a+b') as lock_file:
+        lock_path = resolve_report_child_file(
+            report_dir, '.exterior_generation.lock', required=False,
+        )
+        flags = os.O_RDWR | os.O_CREAT
+        if hasattr(os, 'O_BINARY'):
+            flags |= os.O_BINARY
+        if hasattr(os, 'O_NOFOLLOW'):
+            flags |= os.O_NOFOLLOW
+        try:
+            lock_fd = os.open(lock_path, flags, 0o600)
+        except OSError as exc:
+            raise InvalidReportPath('exterior lock file is invalid') from exc
+        with os.fdopen(lock_fd, 'r+b') as lock_file:
             lock_file.seek(0, os.SEEK_END)
             if lock_file.tell() == 0:
                 lock_file.write(b'0')
@@ -2851,12 +2972,13 @@ def _exterior_report_lock(report_dir):
 
 
 def _exterior_generation_path(report_dir):
-    return Path(report_dir) / 'exterior_generation.json'
+    return resolve_report_child_destination(report_dir, 'exterior_generation.json')
 
 
 def _read_exterior_generation(report_dir):
-    path = _exterior_generation_path(report_dir)
-    if not path.is_file() or path.is_symlink():
+    try:
+        path = resolve_report_child_file(report_dir, 'exterior_generation.json')
+    except FileNotFoundError:
         return None
     try:
         marker = json.loads(path.read_text(encoding='utf-8'))
@@ -2977,7 +3099,7 @@ def prepare_energy_pdf():
 
     target_dir = context.report_dir
     stored_filename = f'building_plan_prepared_{uuid.uuid4().hex}.pdf'
-    stored_path = target_dir / stored_filename
+    stored_path = resolve_report_child_destination(target_dir, stored_filename)
 
     def discard_partial_upload():
         try:
@@ -2986,7 +3108,7 @@ def prepare_energy_pdf():
             logger.error('Cannot remove partial prepared PDF', exc_info=True)
 
     try:
-        uploaded.save(stored_path)
+        _atomic_save_upload(uploaded, stored_path)
     except Exception as exc:
         discard_partial_upload()
         _update_report_status_if_exists(
@@ -3105,6 +3227,18 @@ def vector_pdf_fusion():
         )
     except _REPORT_STORAGE_EXCEPTIONS as exc:
         return _report_storage_error_response(exc)
+    _upsert_report_status(
+        context.owner_username, context.report_number, 'recognizing',
+    )
+
+    @after_this_request
+    def update_vector_pdf_fusion_status(response):
+        status = 'recognized' if 200 <= response.status_code < 300 else 'failed'
+        _update_report_status_if_exists(
+            context.owner_username, context.report_number, status,
+        )
+        return response
+
     if not HAS_VECTOR_PDF_FUSION or _vector_pdf_fusion_config is None:
         return jsonify({'error': 'Vector PDF fusion module is not configured'}), 501
     report_number = context.report_number
@@ -3159,10 +3293,22 @@ def vector_pdf_fusion():
             _vector_pdf_fusion_config,
             crop_bbox_page_px=crop_bbox_page_px,
         )
-        original = cv2.imread(str(target_dir / 'pdf_vector_model_input.png'), cv2.IMREAD_COLOR)
-        overlay = cv2.imread(str(target_dir / 'pdf_vector_fusion_overlay.png'), cv2.IMREAD_COLOR)
-        exterior_overlay = cv2.imread(str(target_dir / 'pdf_exterior_overlay.png'), cv2.IMREAD_COLOR)
-        component_overlay = cv2.imread(str(target_dir / 'pdf_component_overlay.png'), cv2.IMREAD_COLOR)
+        original_path = resolve_report_child_file(
+            target_dir, 'pdf_vector_model_input.png', required=False,
+        )
+        overlay_path = resolve_report_child_file(
+            target_dir, 'pdf_vector_fusion_overlay.png', required=False,
+        )
+        exterior_overlay_path = resolve_report_child_file(
+            target_dir, 'pdf_exterior_overlay.png', required=False,
+        )
+        component_overlay_path = resolve_report_child_file(
+            target_dir, 'pdf_component_overlay.png', required=False,
+        )
+        original = cv2.imread(str(original_path), cv2.IMREAD_COLOR)
+        overlay = cv2.imread(str(overlay_path), cv2.IMREAD_COLOR)
+        exterior_overlay = cv2.imread(str(exterior_overlay_path), cv2.IMREAD_COLOR)
+        component_overlay = cv2.imread(str(component_overlay_path), cv2.IMREAD_COLOR)
         images = {}
         if original is not None:
             encoded, buffer = cv2.imencode('.png', original)
@@ -3180,7 +3326,10 @@ def vector_pdf_fusion():
             encoded, buffer = cv2.imencode('.png', component_overlay)
             if encoded:
                 images['component_overlay'] = base64.b64encode(buffer).decode('utf-8')
-        topology_sha256 = _sha256_file(target_dir / 'pdf_exterior_topology.json')
+        topology_path = resolve_report_child_file(
+            target_dir, 'pdf_exterior_topology.json', required=False,
+        )
+        topology_sha256 = _sha256_file(topology_path)
     except ValueError as exc:
         _update_exterior_generation_if_current(
             report_dir, generation_marker['generation'], status='failed',
@@ -3332,6 +3481,8 @@ def vector_pdf_exterior_confirm():
         generation_marker = _require_current_exterior_generation(
             report_dir, report_number, topology_sha256=current_hash,
         )
+    except _REPORT_STORAGE_EXCEPTIONS as exc:
+        return _report_storage_error_response(exc)
     except ExteriorGenerationConflict as exc:
         return jsonify({'error': str(exc)}), 409
 
@@ -3471,6 +3622,11 @@ def vector_pdf_exterior_confirm():
             topology_sha256=current_hash,
             expected_generation=generation_marker['generation'],
         )
+        _upsert_report_status(
+            context.owner_username, report_number, 'recognized',
+        )
+    except _REPORT_STORAGE_EXCEPTIONS as exc:
+        return _report_storage_error_response(exc)
     except ExteriorGenerationConflict as exc:
         return jsonify({'error': str(exc)}), 409
     except (RuntimeError, ValueError) as exc:
@@ -3580,8 +3736,13 @@ def ai_recognize():
                 return jsonify({'error': 'Empty file'}), 400
 
             ext = f.filename.rsplit('.', 1)[1].lower() if '.' in f.filename else 'png'
-            raster_path = os.path.join(target_dir, f'building_plan_ai.{ext}')
-            f.save(raster_path)
+            raster_path = resolve_report_child_destination(
+                target_dir, f'building_plan_ai.{ext}',
+            )
+            _atomic_save_upload(f, raster_path)
+            raster_path = resolve_report_child_file(
+                target_dir, f'building_plan_ai.{ext}',
+            )
             if ext == 'pdf':
                 pdf_page_number = 1
 
@@ -3590,7 +3751,7 @@ def ai_recognize():
                 return jsonify({'error': 'Vector recognition currently accepts PNG or JPG; render the target PDF page first.'}), 400
             crop_bbox_image_px = None
             if region_request['mode'] == 'crop_region':
-                source_bgr = cv2.imread(raster_path)
+                source_bgr = cv2.imread(str(raster_path))
                 if source_bgr is None:
                     return jsonify({'error': 'Cannot decode image'}), 400
                 image_height, image_width = source_bgr.shape[:2]
@@ -3600,7 +3761,9 @@ def ai_recognize():
                     [image_width, image_height],
                 )
                 left, top, right, bottom = crop_bbox_image_px
-                raster_path = os.path.join(target_dir, 'building_plan_ai_crop.png')
+                raster_path = resolve_report_child_destination(
+                    target_dir, 'building_plan_ai_crop.png',
+                )
                 _write_image(Path(raster_path), source_bgr[top:bottom, left:right].copy())
             result = _vector_platform_adapter.predict(Path(raster_path), Path(target_dir))
             result.update({
@@ -3641,6 +3804,16 @@ def ai_recognize():
         prepared_page = None
         if ext == 'pdf':
             try:
+                for artifact_name in (
+                    'page_render.png',
+                    'cleaned_page.png',
+                    'model_view.png',
+                    'model_input_512.png',
+                    'preprocessing.json',
+                ):
+                    resolve_report_child_file(
+                        target_dir, artifact_name, required=False,
+                    )
                 prepared_page = prepare_pdf_page(
                     raster_path,
                     page_number=pdf_page_number,
@@ -3651,8 +3824,12 @@ def ai_recognize():
                 pdf_page_count = prepared_page.page_count
                 scale_calibration = prepared_page.scale_calibration
                 vector_cleanup = dict(prepared_page.vector_cleanup)
-                png_path = os.path.join(target_dir, 'building_plan_ai.png')
+                png_path = resolve_report_child_destination(
+                    target_dir, 'building_plan_ai.png',
+                )
                 raster_path = png_path
+            except _REPORT_STORAGE_EXCEPTIONS as exc:
+                return _report_storage_error_response(exc)
             except Exception as exc:
                 return _internal_report_error_response('PDF conversion failed', exc)
 
@@ -3660,7 +3837,7 @@ def ai_recognize():
         img_bgr = (
             prepared_page.cleaned_bgr.copy()
             if prepared_page is not None
-            else cv2.imread(raster_path)
+                else cv2.imread(str(raster_path))
         )
         if img_bgr is None:
             return jsonify({'error': 'Cannot decode image'}), 400
@@ -3729,7 +3906,7 @@ def ai_recognize():
             )
         ):
             _write_image(
-                Path(target_dir) / 'pdf_nonstructural_mask.png',
+                resolve_report_child_destination(target_dir, 'pdf_nonstructural_mask.png'),
                 combined_cleanup_mask,
             )
 
@@ -3739,19 +3916,23 @@ def ai_recognize():
                 and vector_cleanup.get('structural_mask', {}).get('enabled')
             ):
                 _write_image(
-                    Path(target_dir) / 'pdf_structural_mask.png',
+                    resolve_report_child_destination(target_dir, 'pdf_structural_mask.png'),
                     structural_support_mask,
                 )
             building_roi = vector_cleanup.get('building_roi') or {
                 'enabled': False,
                 'bbox_px': None,
             }
-            roi_path = os.path.join(target_dir, 'pdf_building_roi.json')
-            with open(roi_path, 'w', encoding='utf-8') as roi_file:
-                json.dump(building_roi, roi_file, ensure_ascii=False, indent=2)
+            roi_path = resolve_report_child_destination(
+                target_dir, 'pdf_building_roi.json',
+            )
+            _atomic_write_json(roi_path, building_roi)
 
         if prepared_page is not None and has_vector_geometry:
-            _write_image(Path(target_dir) / 'pdf_model_input.png', img_bgr)
+            _write_image(
+                resolve_report_child_destination(target_dir, 'pdf_model_input.png'),
+                img_bgr,
+            )
 
         predict_kwargs = {}
         if has_vector_geometry:
@@ -3823,8 +4004,8 @@ def ai_recognize():
         h, w = mask.shape
 
         # 保存结果
-        overlay_path = os.path.join(target_dir, 'ai_overlay.jpg')
-        mask_path = os.path.join(target_dir, 'ai_mask.png')
+        overlay_path = resolve_report_child_destination(target_dir, 'ai_overlay.jpg')
+        mask_path = resolve_report_child_destination(target_dir, 'ai_mask.png')
         _write_image(
             Path(overlay_path),
             overlay,
@@ -3837,7 +4018,10 @@ def ai_recognize():
             raw_mask_color[raw_model_mask == 1] = (60, 76, 231)
             raw_mask_color[raw_model_mask == 2] = (219, 152, 52)
             raw_mask_color[raw_model_mask == 3] = (113, 204, 46)
-            _write_image(Path(target_dir) / 'ai_raw_model_mask.png', raw_mask_color)
+            _write_image(
+                resolve_report_child_destination(target_dir, 'ai_raw_model_mask.png'),
+                raw_mask_color,
+            )
 
         # mask 转彩色保存
         mask_color = np.zeros((h, w, 3), dtype=np.uint8)

@@ -20,11 +20,26 @@ class VectorPdfFusionRouteTests(unittest.TestCase):
         cls.server.app.config.update(TESTING=True, SECRET_KEY="vector-pdf-fusion-test")
 
     def setUp(self):
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.original_database_path = self.server.DB_PATH
+        self.server.DB_PATH = str(Path(self.temporary_directory.name) / "users.db")
+        self.server.init_db()
+        connection = self.server.get_db_connection()
+        connection.executemany(
+            "INSERT INTO users (username, password_hash) VALUES (?, ?)",
+            [("test-user", "hash"), ("bob", "hash")],
+        )
+        connection.commit()
+        connection.close()
         self.client = self.server.app.test_client()
         with self.client.session_transaction() as session:
             session["logged_in"] = True
             session["username"] = "test-user"
             session["is_admin"] = False
+
+    def tearDown(self):
+        self.server.DB_PATH = self.original_database_path
+        self.temporary_directory.cleanup()
 
     def symlink_or_skip(self, link, target, *, target_is_directory=False):
         try:
@@ -99,8 +114,18 @@ class VectorPdfFusionRouteTests(unittest.TestCase):
             token = self.server._make_pdf_upload_token(
                 "test-user", "FUSION-1", "prepared.pdf", 1,
             )
+            self.server._upsert_report_status("test-user", "FUSION-1", "uploaded")
+            self.server._upsert_report_status("bob", "FUSION-1", "uploaded")
 
             def fake_analysis(pdf_path, page_number, output_dir, model_config, crop_bbox_page_px=None):
+                self.assertEqual(
+                    self.server._report_row("test-user", "FUSION-1")["status"],
+                    "recognizing",
+                )
+                self.assertEqual(
+                    self.server._report_row("bob", "FUSION-1")["status"],
+                    "uploaded",
+                )
                 output = Path(output_dir)
                 output.mkdir(parents=True, exist_ok=True)
                 image = np.full((20, 30, 3), 255, dtype=np.uint8)
@@ -234,6 +259,14 @@ class VectorPdfFusionRouteTests(unittest.TestCase):
             self.assertNotIn("generation", payload)
             analyze.assert_called_once()
             segmenter.predict.assert_not_called()
+            self.assertEqual(
+                self.server._report_row("test-user", "FUSION-1")["status"],
+                "recognized",
+            )
+            self.assertEqual(
+                self.server._report_row("bob", "FUSION-1")["status"],
+                "uploaded",
+            )
 
     def test_failed_new_fusion_generation_invalidates_old_confirmed_exterior(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -278,8 +311,14 @@ class VectorPdfFusionRouteTests(unittest.TestCase):
             token = self.server._make_pdf_upload_token(
                 "test-user", "FUSION-RACE", "prepared.pdf", 1,
             )
+            self.server._upsert_report_status("test-user", "FUSION-RACE", "uploaded")
+            self.server._upsert_report_status("bob", "FUSION-RACE", "uploaded")
 
             def fail_after_running_marker(*args, **kwargs):
+                self.assertEqual(
+                    self.server._report_row("test-user", "FUSION-RACE")["status"],
+                    "recognizing",
+                )
                 marker = json.loads(marker_path.read_text("utf-8"))
                 self.assertEqual(marker["status"], "running")
                 self.assertNotEqual(marker["generation"], "generation-a")
@@ -311,6 +350,14 @@ class VectorPdfFusionRouteTests(unittest.TestCase):
                 self.server.app.config["UPLOAD_FOLDER"] = previous_upload
 
             self.assertEqual(fusion_response.status_code, 500, fusion_response.get_json())
+            self.assertEqual(
+                self.server._report_row("test-user", "FUSION-RACE")["status"],
+                "failed",
+            )
+            self.assertEqual(
+                self.server._report_row("bob", "FUSION-RACE")["status"],
+                "uploaded",
+            )
             failed_marker = json.loads(marker_path.read_text("utf-8"))
             self.assertEqual(failed_marker["status"], "failed")
             self.assertNotEqual(failed_marker["generation"], "generation-a")

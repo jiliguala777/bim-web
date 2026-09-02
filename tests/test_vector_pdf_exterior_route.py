@@ -18,11 +18,26 @@ class VectorPdfExteriorConfirmRouteTests(unittest.TestCase):
         cls.server.app.config.update(TESTING=True, SECRET_KEY="vector-pdf-exterior-test")
 
     def setUp(self):
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.original_database_path = self.server.DB_PATH
+        self.server.DB_PATH = str(Path(self.temporary_directory.name) / "users.db")
+        self.server.init_db()
+        connection = self.server.get_db_connection()
+        connection.executemany(
+            "INSERT INTO users (username, password_hash) VALUES (?, ?)",
+            [("test-user", "hash"), ("bob", "hash")],
+        )
+        connection.commit()
+        connection.close()
         self.client = self.server.app.test_client()
         with self.client.session_transaction() as session:
             session["logged_in"] = True
             session["username"] = "test-user"
             session["is_admin"] = False
+
+    def tearDown(self):
+        self.server.DB_PATH = self.original_database_path
+        self.temporary_directory.cleanup()
 
     @staticmethod
     def _artifacts(report_dir):
@@ -206,6 +221,8 @@ class VectorPdfExteriorConfirmRouteTests(unittest.TestCase):
             upload_root = Path(directory)
             report_dir = upload_root / "energy" / user_storage_key("test-user") / "EXT-1"
             _, _, topology_path = self._artifacts(report_dir)
+            self.server._upsert_report_status("test-user", "EXT-1", "uploaded")
+            self.server._upsert_report_status("bob", "EXT-1", "uploaded")
             previous = self.server.app.config["UPLOAD_FOLDER"]
             self.server.app.config["UPLOAD_FOLDER"] = str(upload_root)
             segmenter = mock.Mock()
@@ -228,6 +245,14 @@ class VectorPdfExteriorConfirmRouteTests(unittest.TestCase):
             self.assertEqual(saved["opening_widths"]["door_total_width_m"], 0.6)
             self.assertEqual(saved["image_size"], [100, 50])
             self.assertEqual(saved["pdf_page_number"], 2)
+            self.assertEqual(
+                self.server._report_row("test-user", "EXT-1")["status"],
+                "recognized",
+            )
+            self.assertEqual(
+                self.server._report_row("bob", "EXT-1")["status"],
+                "uploaded",
+            )
             self.assertEqual(saved["crop_bbox_page_px"], [10, 20, 110, 70])
             self.assertFalse(saved["room_topology"]["load_geometry_ready"])
             self.assertEqual(saved["scale_calibration"]["method"], "manual_two_point")
@@ -271,6 +296,26 @@ class VectorPdfExteriorConfirmRouteTests(unittest.TestCase):
                         )
             self.assertNotEqual(saved["exterior_topology"]["polygon_px"], [[999, 999], [1000, 999], [1000, 1000]])
             segmenter.predict.assert_not_called()
+
+    def test_late_invalid_report_path_is_sanitized_as_bad_request(self):
+        with tempfile.TemporaryDirectory() as directory:
+            upload_root = Path(directory)
+            report_dir = upload_root / "energy" / user_storage_key("test-user") / "EXT-1"
+            topology, openings, topology_path = self._artifacts(report_dir)
+            secret = str(upload_root / "outside-recognition.json")
+
+            with mock.patch.object(
+                self.server,
+                "_save_recognition_payload",
+                side_effect=self.server.InvalidReportPath(secret),
+            ):
+                response = self._post_artifacts(
+                    upload_root, topology, openings, topology_path,
+                )
+
+            self.assertEqual(response.status_code, 400, response.get_json())
+            self.assertEqual(response.get_json(), {"error": "Invalid report path"})
+            self.assertNotIn(secret, response.get_data(as_text=True))
 
     def test_confirm_rejects_marker_hash_mismatch_without_overwriting_recognition(self):
         with tempfile.TemporaryDirectory() as directory:

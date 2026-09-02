@@ -59,6 +59,61 @@ class AuthSessionTests(unittest.TestCase):
             self.assertNotIn("username", state)
             self.assertNotIn("is_admin", state)
 
+    def test_registration_rejects_noncanonical_usernames(self):
+        for username in (" alice", "alice ", "ａｌｉｃｅ"):
+            with self.subTest(username=username):
+                response = self.client.post(
+                    "/register",
+                    json={"username": username, "password": "pw"},
+                )
+                self.assertEqual(response.status_code, 400, response.get_json())
+
+        connection = self.server.get_db_connection()
+        try:
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM users").fetchone()[0], 0)
+        finally:
+            connection.close()
+
+    def test_registration_rejects_a_storage_key_collision_with_a_legacy_user(self):
+        connection = self.server.get_db_connection()
+        connection.execute(
+            "INSERT INTO users (username, password_hash) VALUES (?, ?)",
+            (" alice ", self.server.generate_password_hash("legacy-pw")),
+        )
+        connection.commit()
+        connection.close()
+
+        response = self.client.post(
+            "/register",
+            json={"username": "alice", "password": "pw"},
+        )
+
+        self.assertEqual(response.status_code, 400, response.get_json())
+        connection = self.server.get_db_connection()
+        try:
+            usernames = [row[0] for row in connection.execute("SELECT username FROM users")]
+        finally:
+            connection.close()
+        self.assertEqual(usernames, [" alice "])
+
+    def test_registration_rejects_a_storage_key_collision_with_environment_admin(self):
+        with patch.dict(
+            os.environ,
+            {"ADMIN_USER": " alice ", "ADMIN_PASSWORD": "secret"},
+            clear=False,
+        ):
+            response = self.client.post(
+                "/register",
+                json={"username": "alice", "password": "pw"},
+            )
+
+        self.assertEqual(response.status_code, 400, response.get_json())
+        connection = self.server.get_db_connection()
+        try:
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM users").fetchone()[0], 0)
+        finally:
+            connection.close()
+
 
 class ReportSchemaMigrationTests(unittest.TestCase):
     @classmethod
@@ -1179,6 +1234,14 @@ class ReportUploadIsolationTests(unittest.TestCase):
     def image_file():
         return io.BytesIO(b"test image"), "plan.png"
 
+    def symlink_or_skip(self, link, target, *, target_is_directory=False):
+        try:
+            link.symlink_to(target, target_is_directory=target_is_directory)
+        except OSError as error:
+            if getattr(error, "winerror", None) == 1314:
+                self.skipTest("creating symlinks requires Windows developer mode or privilege")
+            raise
+
     def test_same_report_number_isolated_by_authenticated_user(self):
         self.login_as("alice")
         alice_response = self.client.post(
@@ -1198,6 +1261,375 @@ class ReportUploadIsolationTests(unittest.TestCase):
         self.assertFalse((self.upload_root / "energy" / "BIM-1").exists())
         self.assertEqual(self.server._report_row("alice", "BIM-1")["status"], "uploaded")
         self.assertEqual(self.server._report_row("bob", "BIM-1")["status"], "uploaded")
+
+    def test_legacy_equivalent_login_identities_fail_closed_for_the_same_report(self):
+        password_rows = [
+            ("alice", self.server.generate_password_hash("alice-pw")),
+            (" alice ", self.server.generate_password_hash("space-pw")),
+            ("ａｌｉｃｅ", self.server.generate_password_hash("nfkc-pw")),
+        ]
+        connection = self.server.get_db_connection()
+        connection.execute("DELETE FROM users")
+        connection.executemany(
+            "INSERT INTO users (username, password_hash) VALUES (?, ?)",
+            password_rows,
+        )
+        connection.commit()
+        connection.close()
+
+        for username, password in (
+            ("alice", "alice-pw"),
+            (" alice ", "space-pw"),
+            ("ａｌｉｃｅ", "nfkc-pw"),
+        ):
+            with self.subTest(username=username):
+                login = self.client.post(
+                    "/login",
+                    json={"username": username, "password": password},
+                )
+                self.assertEqual(login.status_code, 200, login.get_json())
+                response = self.client.post(
+                    "/energy/upload",
+                    data={
+                        "report_number": "BIM-COLLISION",
+                        "raster_file": self.image_file(),
+                    },
+                )
+                self.assertEqual(response.status_code, 403, response.get_json())
+
+        self.assertFalse((self.upload_root / "energy").exists())
+
+    def test_environment_admin_collision_fails_closed_at_runtime(self):
+        connection = self.server.get_db_connection()
+        connection.execute(
+            "UPDATE users SET password_hash = ? WHERE username = ?",
+            (self.server.generate_password_hash("alice-pw"), "alice"),
+        )
+        connection.commit()
+        connection.close()
+
+        with patch.dict(
+            os.environ,
+            {"ADMIN_USER": " alice ", "ADMIN_PASSWORD": "admin-pw"},
+            clear=False,
+        ):
+            login = self.client.post(
+                "/login",
+                json={"username": " alice ", "password": "admin-pw"},
+            )
+            self.assertEqual(login.status_code, 200, login.get_json())
+            response = self.client.post(
+                "/energy/upload",
+                data={
+                    "report_number": "BIM-ADMIN-COLLISION",
+                    "raster_file": self.image_file(),
+                },
+            )
+
+        self.assertEqual(response.status_code, 403, response.get_json())
+        self.assertFalse((self.upload_root / "energy").exists())
+
+    def test_dxf_raster_and_weather_uploads_replace_fixed_file_symlinks(self):
+        self.login_as("alice")
+        report_number = "BIM-FIXED-UPLOADS"
+        report_dir = self.upload_root / "energy" / user_storage_key("alice") / report_number
+        report_dir.mkdir(parents=True)
+        outside_files = {}
+        for child_name in ("building_plan.dxf", "building_plan.png", "weather_data.epw"):
+            outside = self.upload_root / f"outside-{child_name}"
+            outside.write_bytes(b"outside")
+            self.symlink_or_skip(report_dir / child_name, outside)
+            outside_files[child_name] = outside
+
+        fake_document = MagicMock()
+        fake_document.modelspace.return_value = []
+        with patch.object(self.server, "ezdxf", create=True) as ezdxf:
+            ezdxf.readfile.return_value = fake_document
+            response = self.client.post(
+                "/energy/upload",
+                data={
+                    "report_number": report_number,
+                    "dxf_file": (io.BytesIO(b"new dxf"), "plan.dxf"),
+                    "raster_file": (io.BytesIO(b"new raster"), "plan.png"),
+                    "epw_file": (io.BytesIO(b"new weather"), "weather.epw"),
+                },
+            )
+
+        self.assertEqual(response.status_code, 200, response.get_json())
+        expected = {
+            "building_plan.dxf": b"new dxf",
+            "building_plan.png": b"new raster",
+            "weather_data.epw": b"new weather",
+        }
+        for child_name, contents in expected.items():
+            with self.subTest(child_name=child_name):
+                child = report_dir / child_name
+                self.assertFalse(child.is_symlink())
+                self.assertEqual(child.read_bytes(), contents)
+                self.assertEqual(outside_files[child_name].read_bytes(), b"outside")
+
+    def test_fixed_uploads_are_staged_before_replacing_existing_file_aliases(self):
+        self.login_as("alice")
+        report_number = "BIM-ATOMIC-UPLOADS"
+        report_dir = self.upload_root / "energy" / user_storage_key("alice") / report_number
+        report_dir.mkdir(parents=True)
+        outside_files = {}
+        for child_name in ("building_plan.dxf", "building_plan.png", "weather_data.epw"):
+            outside = self.upload_root / f"hardlink-{child_name}"
+            outside.write_bytes(b"outside")
+            os.link(outside, report_dir / child_name)
+            outside_files[child_name] = outside
+
+        fake_document = MagicMock()
+        fake_document.modelspace.return_value = []
+        with patch.object(self.server, "ezdxf", create=True) as ezdxf:
+            ezdxf.readfile.return_value = fake_document
+            response = self.client.post(
+                "/energy/upload",
+                data={
+                    "report_number": report_number,
+                    "dxf_file": (io.BytesIO(b"new dxf"), "plan.dxf"),
+                    "raster_file": (io.BytesIO(b"new raster"), "plan.png"),
+                    "epw_file": (io.BytesIO(b"new weather"), "weather.epw"),
+                },
+            )
+
+        self.assertEqual(response.status_code, 200, response.get_json())
+        expected = {
+            "building_plan.dxf": b"new dxf",
+            "building_plan.png": b"new raster",
+            "weather_data.epw": b"new weather",
+        }
+        for child_name, contents in expected.items():
+            with self.subTest(child_name=child_name):
+                self.assertEqual((report_dir / child_name).read_bytes(), contents)
+                self.assertEqual(outside_files[child_name].read_bytes(), b"outside")
+
+    def test_city_weather_copy_replaces_a_fixed_file_symlink(self):
+        self.login_as("alice")
+        report_number = "BIM-CITY-WEATHER"
+        report_dir = self.upload_root / "energy" / user_storage_key("alice") / report_number
+        report_dir.mkdir(parents=True)
+        outside = self.upload_root / "outside-city-weather.epw"
+        outside.write_bytes(b"outside")
+        self.symlink_or_skip(report_dir / "weather_data.epw", outside)
+        weather_root = Path(self.temporary_directory.name) / "weather"
+        weather_root.mkdir()
+        (weather_root / "test-city.epw").write_bytes(b"city weather")
+
+        with patch.object(self.server, "WEATHER_DATA_DIR", str(weather_root)):
+            response = self.client.post(
+                "/energy/upload",
+                data={"report_number": report_number, "city_id": "test-city"},
+            )
+
+        self.assertEqual(response.status_code, 200, response.get_json())
+        weather_path = report_dir / "weather_data.epw"
+        self.assertFalse(weather_path.is_symlink())
+        self.assertEqual(weather_path.read_bytes(), b"city weather")
+        self.assertEqual(outside.read_bytes(), b"outside")
+
+    def test_city_weather_copy_is_staged_before_replacing_an_existing_alias(self):
+        self.login_as("alice")
+        report_number = "BIM-ATOMIC-CITY-WEATHER"
+        report_dir = self.upload_root / "energy" / user_storage_key("alice") / report_number
+        report_dir.mkdir(parents=True)
+        outside = self.upload_root / "hardlink-city-weather.epw"
+        outside.write_bytes(b"outside")
+        os.link(outside, report_dir / "weather_data.epw")
+        weather_root = Path(self.temporary_directory.name) / "atomic-weather"
+        weather_root.mkdir()
+        (weather_root / "test-city.epw").write_bytes(b"city weather")
+
+        with patch.object(self.server, "WEATHER_DATA_DIR", str(weather_root)):
+            response = self.client.post(
+                "/energy/upload",
+                data={"report_number": report_number, "city_id": "test-city"},
+            )
+
+        self.assertEqual(response.status_code, 200, response.get_json())
+        self.assertEqual((report_dir / "weather_data.epw").read_bytes(), b"city weather")
+        self.assertEqual(outside.read_bytes(), b"outside")
+
+    def test_ifc_upload_replaces_a_fixed_file_symlink(self):
+        self.login_as("alice")
+        report_number = "BIM-IFC-SYMLINK"
+        report_dir = self.upload_root / "energy" / user_storage_key("alice") / report_number
+        report_dir.mkdir(parents=True)
+        outside = self.upload_root / "outside.ifc"
+        outside.write_bytes(b"outside")
+        self.symlink_or_skip(report_dir / "building_model.ifc", outside)
+        parser = MagicMock()
+        parser.get_project_info.return_value = {}
+        parser.get_element_summary.return_value = {}
+        parser.get_storeys.return_value = []
+        parser.extract_for_simulation.return_value = {}
+
+        with (
+            patch.object(self.server, "HAS_IFC", True),
+            patch.object(self.server, "IFCParser", return_value=parser, create=True),
+        ):
+            response = self.client.post(
+                "/energy/upload_ifc",
+                data={
+                    "report_number": report_number,
+                    "ifc_file": (io.BytesIO(b"new ifc"), "model.ifc"),
+                },
+            )
+
+        self.assertEqual(response.status_code, 200, response.get_json())
+        ifc_path = report_dir / "building_model.ifc"
+        self.assertFalse(ifc_path.is_symlink())
+        self.assertEqual(ifc_path.read_bytes(), b"new ifc")
+        self.assertEqual(outside.read_bytes(), b"outside")
+
+    def test_ifc_upload_is_staged_before_replacing_an_existing_alias(self):
+        self.login_as("alice")
+        report_number = "BIM-ATOMIC-IFC"
+        report_dir = self.upload_root / "energy" / user_storage_key("alice") / report_number
+        report_dir.mkdir(parents=True)
+        outside = self.upload_root / "hardlink-building-model.ifc"
+        outside.write_bytes(b"outside")
+        os.link(outside, report_dir / "building_model.ifc")
+        parser = MagicMock()
+        parser.get_project_info.return_value = {}
+        parser.get_element_summary.return_value = {}
+        parser.get_storeys.return_value = []
+        parser.extract_for_simulation.return_value = {}
+
+        with (
+            patch.object(self.server, "HAS_IFC", True),
+            patch.object(self.server, "IFCParser", return_value=parser, create=True),
+        ):
+            response = self.client.post(
+                "/energy/upload_ifc",
+                data={
+                    "report_number": report_number,
+                    "ifc_file": (io.BytesIO(b"new ifc"), "model.ifc"),
+                },
+            )
+
+        self.assertEqual(response.status_code, 200, response.get_json())
+        self.assertEqual((report_dir / "building_model.ifc").read_bytes(), b"new ifc")
+        self.assertEqual(outside.read_bytes(), b"outside")
+
+    def test_dxf_and_ifc_read_routes_reject_fixed_file_symlinks(self):
+        self.login_as("alice")
+        dxf_report = self.upload_root / "energy" / user_storage_key("alice") / "BIM-DXF-READ-LINK"
+        ifc_report = self.upload_root / "energy" / user_storage_key("alice") / "BIM-IFC-READ-LINK"
+        dxf_report.mkdir(parents=True)
+        ifc_report.mkdir(parents=True)
+        outside_dxf = self.upload_root / "outside-read.dxf"
+        outside_ifc = self.upload_root / "outside-read.ifc"
+        outside_dxf.write_bytes(b"outside dxf")
+        outside_ifc.write_bytes(b"outside ifc")
+        self.symlink_or_skip(dxf_report / "building_plan.dxf", outside_dxf)
+        self.symlink_or_skip(ifc_report / "building_model.ifc", outside_ifc)
+
+        with patch.object(self.server, "ezdxf", create=True) as ezdxf:
+            dxf_response = self.client.post(
+                "/energy/geometry",
+                json={"report_number": "BIM-DXF-READ-LINK", "layers": []},
+            )
+        with (
+            patch.object(self.server, "HAS_IFC", True),
+            patch.object(self.server, "IFCParser", create=True) as parser,
+        ):
+            ifc_response = self.client.get(
+                "/energy/ifc_properties?project=BIM-IFC-READ-LINK"
+            )
+
+        for response in (dxf_response, ifc_response):
+            with self.subTest(response=response):
+                self.assertEqual(response.status_code, 400, response.get_json())
+                self.assertEqual(response.get_json(), {"error": "Invalid report path"})
+        ezdxf.readfile.assert_not_called()
+        parser.assert_not_called()
+
+    def test_energyplus_worker_rejects_symlinked_nested_output_directories(self):
+        self.login_as("alice")
+        for location in ("runs-root", "job-directory"):
+            with self.subTest(location=location):
+                report_number = f"BIM-EPLUS-{location}"
+                job_id = f"job-{location}"
+                report_dir = self.upload_root / "energy" / user_storage_key("alice") / report_number
+                report_dir.mkdir(parents=True)
+                (report_dir / "building_plan.dxf").write_bytes(b"dxf")
+                (report_dir / "weather_data.epw").write_bytes(b"weather")
+                outside = self.upload_root / f"outside-{location}"
+                outside.mkdir()
+                if location == "runs-root":
+                    self.symlink_or_skip(
+                        report_dir / "energyplus_runs", outside, target_is_directory=True,
+                    )
+                else:
+                    runs_root = report_dir / "energyplus_runs"
+                    runs_root.mkdir()
+                    self.symlink_or_skip(
+                        runs_root / job_id, outside, target_is_directory=True,
+                    )
+                self.server._upsert_report_status("alice", report_number, "calculating")
+                jobs = MagicMock()
+                with (
+                    patch.object(self.server, "simulation_jobs", jobs),
+                    patch.object(
+                        self.server,
+                        "extract_geometry",
+                        return_value={"floor_area": 100.0, "perimeter": 40.0},
+                    ),
+                    patch.object(self.server, "energyplus_engine", create=True) as engine,
+                ):
+                    self.server.background_simulation_task(
+                        job_id,
+                        {"owner_username": "alice", "report_number": report_number},
+                    )
+
+                engine.generate_idf.assert_not_called()
+                jobs.update.assert_called_with(
+                    job_id, status="failed", error="Simulation failed",
+                )
+
+    def test_energyplus_worker_rejects_a_symlinked_weather_input(self):
+        report_number = "BIM-EPLUS-WEATHER-LINK"
+        job_id = "job-weather-link"
+        report_dir = self.upload_root / "energy" / user_storage_key("alice") / report_number
+        report_dir.mkdir(parents=True)
+        (report_dir / "building_plan.dxf").write_bytes(b"dxf")
+        outside = self.upload_root / "outside-worker-weather.epw"
+        outside.write_bytes(b"outside weather")
+        self.symlink_or_skip(report_dir / "weather_data.epw", outside)
+        self.server._upsert_report_status("alice", report_number, "calculating")
+        jobs = MagicMock()
+
+        with (
+            patch.object(self.server, "simulation_jobs", jobs),
+            patch.object(
+                self.server,
+                "extract_geometry",
+                return_value={"floor_area": 100.0, "perimeter": 40.0},
+            ),
+            patch.object(self.server, "energyplus_engine", create=True) as engine,
+        ):
+            self.server.background_simulation_task(
+                job_id,
+                {"owner_username": "alice", "report_number": report_number},
+            )
+
+        engine.run_eplus.assert_not_called()
+        jobs.update.assert_called_with(job_id, status="failed", error="Simulation failed")
+
+    def test_exterior_lock_rejects_a_fixed_file_symlink(self):
+        report_dir = self.upload_root / "energy" / user_storage_key("alice") / "BIM-LOCK-LINK"
+        report_dir.mkdir(parents=True)
+        outside = self.upload_root / "outside-lock"
+        outside.write_bytes(b"outside")
+        self.symlink_or_skip(report_dir / ".exterior_generation.lock", outside)
+
+        with self.assertRaises(self.server.InvalidReportPath):
+            with self.server._exterior_report_lock(report_dir):
+                self.fail("symlinked lock must not be acquired")
+
+        self.assertEqual(outside.read_bytes(), b"outside")
 
     def test_ordinary_user_cannot_upload_for_another_owner(self):
         self.login_as("alice")
@@ -1456,6 +1888,110 @@ class ReportUploadIsolationTests(unittest.TestCase):
         self.assertEqual(worker_payload["report_number"], "BIM-CALC")
         jobs.set.assert_called_once()
         fake_thread.start.assert_called_once_with()
+
+    def test_calculation_start_marks_only_the_selected_composite_report(self):
+        self.login_as("alice")
+        for mode in ("simple", "energyplus"):
+            with self.subTest(mode=mode):
+                report_number = f"BIM-CALC-START-{mode}"
+                report_dir = (
+                    self.upload_root / "energy" / user_storage_key("alice") / report_number
+                )
+                report_dir.mkdir(parents=True)
+                self.server._upsert_report_status("alice", report_number, "uploaded")
+                self.server._upsert_report_status("bob", report_number, "uploaded")
+                fake_thread = MagicMock()
+                with (
+                    patch.object(self.server.threading, "Thread", return_value=fake_thread),
+                    patch.object(self.server, "simulation_jobs"),
+                ):
+                    response = self.client.post(
+                        "/energy/calculate",
+                        json={"report_number": report_number, "mode": mode},
+                    )
+
+                self.assertEqual(response.status_code, 200, response.get_json())
+                self.assertEqual(
+                    self.server._report_row("alice", report_number)["status"],
+                    "calculating",
+                )
+                self.assertEqual(
+                    self.server._report_row("bob", report_number)["status"],
+                    "uploaded",
+                )
+
+    def test_simple_worker_records_calculated_and_failed_terminal_states(self):
+        for outcome in ("success", "failure"):
+            with self.subTest(outcome=outcome):
+                report_number = f"BIM-SIMPLE-{outcome}"
+                report_dir = (
+                    self.upload_root / "energy" / user_storage_key("alice") / report_number
+                )
+                report_dir.mkdir(parents=True)
+                self.server._upsert_report_status("alice", report_number, "calculating")
+                self.server._upsert_report_status("bob", report_number, "uploaded")
+                jobs = MagicMock()
+                data = {"owner_username": "alice", "report_number": report_number}
+                if outcome == "failure":
+                    data["u_wall"] = "not-a-number"
+                with patch.object(self.server, "simulation_jobs", jobs):
+                    self.server.simple_simulation_task(f"job-{outcome}", data)
+
+                expected = "calculated" if outcome == "success" else "failed"
+                self.assertEqual(
+                    self.server._report_row("alice", report_number)["status"],
+                    expected,
+                )
+                self.assertEqual(
+                    self.server._report_row("bob", report_number)["status"],
+                    "uploaded",
+                )
+
+    def test_energyplus_worker_records_calculated_and_failed_terminal_states(self):
+        for outcome in ("success", "failure"):
+            with self.subTest(outcome=outcome):
+                report_number = f"BIM-EPLUS-{outcome}"
+                report_dir = (
+                    self.upload_root / "energy" / user_storage_key("alice") / report_number
+                )
+                report_dir.mkdir(parents=True)
+                (report_dir / "building_plan.dxf").write_bytes(b"dxf")
+                (report_dir / "weather_data.epw").write_bytes(b"weather")
+                self.server._upsert_report_status("alice", report_number, "calculating")
+                self.server._upsert_report_status("bob", report_number, "uploaded")
+                jobs = MagicMock()
+                with (
+                    patch.object(self.server, "simulation_jobs", jobs),
+                    patch.object(
+                        self.server,
+                        "extract_geometry",
+                        return_value={"floor_area": 100.0, "perimeter": 40.0},
+                    ),
+                    patch.object(self.server, "energyplus_engine", create=True) as engine,
+                ):
+                    if outcome == "failure":
+                        engine.run_eplus.side_effect = RuntimeError("simulation failure")
+                    else:
+                        engine.run_eplus.return_value = report_dir / "results.csv"
+                        engine.parse_results.return_value = {
+                            "heating_kwh": 10.0,
+                            "cooling_kwh": 20.0,
+                            "total_kwh": 30.0,
+                        }
+                    self.server.background_simulation_task(
+                        f"job-{outcome}",
+                        {"owner_username": "alice", "report_number": report_number},
+                    )
+
+                expected = "calculated" if outcome == "success" else "failed"
+                self.assertEqual(
+                    self.server._report_row("alice", report_number)["status"],
+                    expected,
+                )
+                self.assertEqual(
+                    self.server._report_row("bob", report_number)["status"],
+                    "uploaded",
+                )
 
     def test_general_dxf_geometry_reads_the_authenticated_users_report(self):
         self.login_as("alice")

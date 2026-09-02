@@ -26,21 +26,68 @@ class ReportAccessDenied(PermissionError):
     """Raised when a non-admin requests another user's report."""
 
 
+class StorageIdentityCollision(ReportAccessDenied):
+    """Raised when distinct authentication principals share one storage key."""
+
+
 _READABLE_DISALLOWED = re.compile(r"[^\w.-]+", re.UNICODE)
 _MAX_REPORT_NUMBER_UTF8_BYTES = 255
+_WINDOWS_RESERVED_BASENAMES = {
+    "CON",
+    "PRN",
+    "AUX",
+    "NUL",
+    *(f"COM{number}" for number in range(1, 10)),
+    *(f"LPT{number}" for number in range(1, 10)),
+}
+
+
+def normalized_username(username: str) -> str:
+    """Return the exact normalization used by the report storage layout."""
+
+    if not isinstance(username, str):
+        raise ValueError("username must be a string")
+    return unicodedata.normalize("NFKC", username).strip()
+
+
+def validate_canonical_username(username: str) -> str:
+    """Require a non-empty registration identity already in canonical form."""
+
+    normalized = normalized_username(username)
+    if not normalized or normalized != username:
+        raise ValueError("username must already be normalized and trimmed")
+    return username
 
 
 def user_storage_key(username: str) -> str:
     """Return a readable, stable, filesystem-safe key for *username*."""
 
-    if not isinstance(username, str):
-        raise ValueError("username must be a string")
-    normalized = unicodedata.normalize("NFKC", username).strip()
+    normalized = normalized_username(username)
     readable = _READABLE_DISALLOWED.sub("-", normalized).strip(".-")[:48].strip(".-")
     if not readable:
         readable = "user"
     digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:8]
     return f"{readable}-{digest}"
+
+
+def colliding_user_storage_keys(usernames) -> set[str]:
+    """Return keys assigned to more than one supplied authentication principal."""
+
+    seen: set[str] = set()
+    collisions: set[str] = set()
+    for username in usernames:
+        key = user_storage_key(username)
+        if key in seen:
+            collisions.add(key)
+        seen.add(key)
+    return collisions
+
+
+def ensure_unique_user_storage_keys(usernames) -> None:
+    """Enforce the one-storage-key-per-authentication-principal invariant."""
+
+    if colliding_user_storage_keys(usernames):
+        raise StorageIdentityCollision("distinct principals share a report storage key")
 
 
 def validate_report_number(report_number: str) -> str:
@@ -57,6 +104,11 @@ def validate_report_number(report_number: str) -> str:
         raise InvalidReportPath("report number contains a control character")
     if any(char in normalized for char in '<>:"|?*'):
         raise InvalidReportPath("report number contains an invalid filename character")
+    if normalized.endswith((".", " ")):
+        raise InvalidReportPath("report number has a non-portable trailing character")
+    basename = normalized.split(".", 1)[0].upper()
+    if basename in _WINDOWS_RESERVED_BASENAMES:
+        raise InvalidReportPath("report number uses a reserved device name")
     if len(normalized.encode("utf-8")) > _MAX_REPORT_NUMBER_UTF8_BYTES:
         raise InvalidReportPath("report number is too long")
     return normalized
@@ -103,6 +155,96 @@ def _existing_symlink_components(path: Path) -> list[Path]:
 def _reject_symlinks(path: Path) -> None:
     if _existing_symlink_components(path):
         raise InvalidReportPath("report path cannot contain symlinks")
+
+
+def _canonical_directory(path: str | os.PathLike[str], label: str) -> Path:
+    directory = Path(path)
+    if directory.is_symlink() or not directory.is_dir():
+        raise InvalidReportPath(f"{label} is invalid")
+    try:
+        return directory.resolve(strict=True)
+    except OSError as exc:
+        raise InvalidReportPath(f"{label} is invalid") from exc
+
+
+def _fixed_child_component(component: str) -> str:
+    if (
+        not isinstance(component, str)
+        or not component
+        or component in {".", ".."}
+        or "/" in component
+        or "\\" in component
+        or Path(component).is_absolute()
+    ):
+        raise InvalidReportPath("report child component is invalid")
+    return component
+
+
+def resolve_report_child_destination(
+    report_dir: str | os.PathLike[str],
+    filename: str,
+) -> Path:
+    """Return a fixed direct-child destination suitable for atomic replacement."""
+
+    canonical_report = _canonical_directory(report_dir, "report directory")
+    return canonical_report / _fixed_child_component(filename)
+
+
+def resolve_report_child_file(
+    report_dir: str | os.PathLike[str],
+    filename: str,
+    *,
+    required: bool = True,
+) -> Path:
+    """Return a regular, non-symlink fixed file directly below a report."""
+
+    candidate = resolve_report_child_destination(report_dir, filename)
+    if candidate.is_symlink():
+        raise InvalidReportPath("report child file is invalid")
+    try:
+        resolved = candidate.resolve(strict=True)
+    except FileNotFoundError:
+        if required:
+            raise
+        return candidate
+    except OSError as exc:
+        raise InvalidReportPath("report child file is invalid") from exc
+    if resolved.parent != candidate.parent or not resolved.is_file():
+        raise InvalidReportPath("report child file is invalid")
+    return resolved
+
+
+def resolve_report_subdirectory(
+    report_dir: str | os.PathLike[str],
+    *components: str,
+    create: bool = False,
+) -> Path:
+    """Resolve fixed nested directories without following an existing alias."""
+
+    current = _canonical_directory(report_dir, "report directory")
+    if not components:
+        return current
+    for component in components:
+        candidate = current / _fixed_child_component(component)
+        if candidate.is_symlink():
+            raise InvalidReportPath("report child directory is invalid")
+        if not candidate.exists():
+            if not create:
+                raise FileNotFoundError(candidate.name)
+            try:
+                candidate.mkdir()
+            except FileExistsError:
+                pass
+        if candidate.is_symlink() or not candidate.is_dir():
+            raise InvalidReportPath("report child directory is invalid")
+        try:
+            resolved = candidate.resolve(strict=True)
+        except OSError as exc:
+            raise InvalidReportPath("report child directory is invalid") from exc
+        if resolved.parent != current:
+            raise InvalidReportPath("report child directory is invalid")
+        current = resolved
+    return current
 
 
 def resolve_energy_report_context(

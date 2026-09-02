@@ -1,6 +1,7 @@
 """Read-only deployment preflight for user-scoped energy report storage."""
 
 import argparse
+import os
 from pathlib import Path
 import sqlite3
 import sys
@@ -9,32 +10,68 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from energy_report_storage import user_storage_key
+from energy_report_storage import (
+    ensure_unique_user_storage_keys,
+    InvalidReportPath,
+    StorageIdentityCollision,
+    user_storage_key,
+    validate_report_number,
+)
 
 
 class StorageLayoutError(RuntimeError):
     """Raised when persisted report ownership and the storage tree disagree."""
 
 
-def _persisted_owner_keys(db_path: Path) -> set[str]:
+def _persisted_layout(db_path: Path) -> tuple[dict[str, set[str]], set[tuple[str, str]]]:
     if not db_path.is_file():
         raise StorageLayoutError(f"report database is missing: {db_path}")
 
     try:
         connection = sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=ro", uri=True)
         try:
-            rows = connection.execute("SELECT DISTINCT username FROM reports").fetchall()
+            users = connection.execute("SELECT username FROM users").fetchall()
+            reports = connection.execute(
+                "SELECT username, report_number FROM reports"
+            ).fetchall()
         finally:
             connection.close()
     except sqlite3.Error as exc:
         raise StorageLayoutError(f"cannot read persisted report owners: {exc}") from exc
 
-    keys = set()
-    for (username,) in rows:
+    principals = []
+    for (username,) in users:
+        if not isinstance(username, str) or not username.strip():
+            raise StorageLayoutError("users contains an empty username")
+        principals.append(username)
+
+    if os.environ.get("ADMIN_PASSWORD"):
+        admin_username = os.environ.get("ADMIN_USER", "admin")
+        if not isinstance(admin_username, str) or not admin_username.strip():
+            raise StorageLayoutError("environment administrator identity is invalid")
+        principals.append(admin_username)
+
+    try:
+        ensure_unique_user_storage_keys(principals)
+    except (StorageIdentityCollision, ValueError) as exc:
+        raise StorageLayoutError("identity storage-key collision detected") from exc
+
+    principal_by_name = {username: user_storage_key(username) for username in principals}
+    expected_by_owner: dict[str, set[str]] = {}
+    expected_pairs: set[tuple[str, str]] = set()
+    for username, report_number in reports:
         if not isinstance(username, str) or not username.strip():
             raise StorageLayoutError("reports contains an empty username")
-        keys.add(user_storage_key(username))
-    return keys
+        owner_key = principal_by_name.get(username)
+        if owner_key is None:
+            raise StorageLayoutError("report owner is not an authentication principal")
+        try:
+            safe_report_number = validate_report_number(report_number)
+        except InvalidReportPath as exc:
+            raise StorageLayoutError("reports contains an invalid report number") from exc
+        expected_by_owner.setdefault(owner_key, set()).add(safe_report_number)
+        expected_pairs.add((owner_key, safe_report_number))
+    return expected_by_owner, expected_pairs
 
 
 def validate_layout(db_path: str | Path, uploads_root: str | Path, *, runtime_root: str | Path) -> None:
@@ -56,26 +93,33 @@ def validate_layout(db_path: str | Path, uploads_root: str | Path, *, runtime_ro
         raise StorageLayoutError("database and uploads root must be direct runtime-root children")
     if db_path.name != "users.db" or uploads_root.name != "uploads" or not uploads_root.is_dir():
         raise StorageLayoutError("expected direct users.db file and uploads directory")
-    owner_keys = _persisted_owner_keys(db_path)
+    expected_by_owner, expected_pairs = _persisted_layout(db_path)
     energy_root = uploads_root / "energy"
     if not energy_root.exists():
-        if owner_keys:
-            raise StorageLayoutError(f"energy directory is missing despite persisted reports: {energy_root}")
+        if expected_pairs:
+            raise StorageLayoutError("energy directory is missing despite persisted reports")
         return
     if not energy_root.is_dir() or energy_root.is_symlink():
         raise StorageLayoutError(f"energy directory is not a real directory: {energy_root}")
 
     problems = []
+    actual_pairs = set()
     for entry in energy_root.iterdir():
         if entry.is_symlink() or not entry.is_dir():
             problems.append(f"invalid energy entry: {entry}")
             continue
-        if entry.name not in owner_keys:
+        if entry.name not in expected_by_owner:
             problems.append(f"legacy or unknown owner directory: {entry}")
             continue
         for report_dir in entry.iterdir():
             if report_dir.is_symlink() or not report_dir.is_dir():
                 problems.append(f"invalid report entry: {report_dir}")
+                continue
+            actual_pairs.add((entry.name, report_dir.name))
+            if report_dir.name not in expected_by_owner[entry.name]:
+                problems.append("storage owner/report mapping does not match persisted identities")
+    if actual_pairs != expected_pairs:
+        problems.append("storage owner/report mapping does not match persisted identities")
     if problems:
         raise StorageLayoutError("\n".join(problems))
 

@@ -1,4 +1,5 @@
 import ast
+import os
 import pathlib
 import re
 import sqlite3
@@ -6,6 +7,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -1038,7 +1040,9 @@ legacy_possible_join = possible_join(app.config["UPLOAD_FOLDER"], "energy", repo
             db_path = root / "users.db"
             uploads = root / "uploads"
             conn = sqlite3.connect(db_path)
+            conn.execute("CREATE TABLE users (username TEXT)")
             conn.execute("CREATE TABLE reports (username TEXT, report_number TEXT)")
+            conn.execute("INSERT INTO users VALUES (?)", ("alice",))
             conn.execute("INSERT INTO reports VALUES (?, ?)", ("alice", "BIM-1"))
             conn.commit()
             conn.close()
@@ -1060,7 +1064,9 @@ legacy_possible_join = possible_join(app.config["UPLOAD_FOLDER"], "energy", repo
             db_path = root / "users.db"
             uploads = root / "uploads"
             conn = sqlite3.connect(db_path)
+            conn.execute("CREATE TABLE users (username TEXT)")
             conn.execute("CREATE TABLE reports (username TEXT, report_number TEXT)")
+            conn.execute("INSERT INTO users VALUES (?)", ("alice",))
             conn.execute("INSERT INTO reports VALUES (?, ?)", ("alice", "BIM-1"))
             conn.commit()
             conn.close()
@@ -1084,7 +1090,9 @@ legacy_possible_join = possible_join(app.config["UPLOAD_FOLDER"], "energy", repo
             db_path = root / "users.db"
             uploads = root / "uploads"
             conn = sqlite3.connect(db_path)
+            conn.execute("CREATE TABLE users (username TEXT)")
             conn.execute("CREATE TABLE reports (username TEXT, report_number TEXT)")
+            conn.execute("INSERT INTO users VALUES (?)", ("alice",))
             conn.execute("INSERT INTO reports VALUES (?, ?)", ("alice", "BIM-1"))
             conn.commit()
             conn.close()
@@ -1102,7 +1110,9 @@ legacy_possible_join = possible_join(app.config["UPLOAD_FOLDER"], "energy", repo
             db_path = root / "users.db"
             uploads = root / "uploads"
             conn = sqlite3.connect(db_path)
+            conn.execute("CREATE TABLE users (username TEXT)")
             conn.execute("CREATE TABLE reports (username TEXT, report_number TEXT)")
+            conn.execute("INSERT INTO users VALUES (?)", ("alice",))
             conn.execute("INSERT INTO reports VALUES (?, ?)", ("alice", "BIM-1"))
             conn.commit()
             conn.close()
@@ -1125,6 +1135,93 @@ legacy_possible_join = possible_join(app.config["UPLOAD_FOLDER"], "energy", repo
                 check=False,
             )
             self.assertEqual(0, result.returncode, result.stderr)
+
+    def test_preflight_rejects_equivalent_principals_without_disclosing_names_or_paths(self):
+        from tools.user_report_storage_preflight import StorageLayoutError, validate_layout
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            db_path = root / "users.db"
+            uploads = root / "uploads"
+            uploads.mkdir()
+            conn = sqlite3.connect(db_path)
+            conn.execute("CREATE TABLE users (username TEXT)")
+            conn.execute("CREATE TABLE reports (username TEXT, report_number TEXT)")
+            conn.executemany("INSERT INTO users VALUES (?)", [("alice",), (" alice ",)])
+            conn.commit()
+            conn.close()
+
+            with self.assertRaises(StorageLayoutError) as raised:
+                validate_layout(db_path, uploads, runtime_root=root)
+
+            message = str(raised.exception)
+            self.assertIn("identity storage-key collision", message)
+            self.assertNotIn("alice", message)
+            self.assertNotIn(str(root), message)
+
+    def test_preflight_rejects_environment_admin_storage_key_collision(self):
+        from tools.user_report_storage_preflight import StorageLayoutError, validate_layout
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            db_path = root / "users.db"
+            uploads = root / "uploads"
+            uploads.mkdir()
+            conn = sqlite3.connect(db_path)
+            conn.execute("CREATE TABLE users (username TEXT)")
+            conn.execute("CREATE TABLE reports (username TEXT, report_number TEXT)")
+            conn.execute("INSERT INTO users VALUES (?)", ("alice",))
+            conn.commit()
+            conn.close()
+
+            with mock.patch.dict(
+                os.environ,
+                {"ADMIN_USER": " alice ", "ADMIN_PASSWORD": "secret"},
+                clear=False,
+            ), self.assertRaisesRegex(StorageLayoutError, "identity storage-key collision"):
+                validate_layout(db_path, uploads, runtime_root=root)
+
+    def test_preflight_requires_exact_persisted_owner_report_directories(self):
+        from tools.user_report_storage_preflight import StorageLayoutError, validate_layout
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            db_path = root / "users.db"
+            uploads = root / "uploads"
+            conn = sqlite3.connect(db_path)
+            conn.execute("CREATE TABLE users (username TEXT)")
+            conn.execute("CREATE TABLE reports (username TEXT, report_number TEXT)")
+            conn.execute("INSERT INTO users VALUES (?)", ("alice",))
+            conn.execute("INSERT INTO reports VALUES (?, ?)", ("alice", "BIM-1"))
+            conn.commit()
+            conn.close()
+            owner_root = uploads / "energy" / "alice-2bd806c9"
+            (owner_root / "BIM-OTHER").mkdir(parents=True)
+
+            with self.assertRaisesRegex(StorageLayoutError, "owner/report mapping"):
+                validate_layout(db_path, uploads, runtime_root=root)
+
+    def test_preflight_rejects_flat_legacy_report_named_like_an_owner_key(self):
+        from tools.user_report_storage_preflight import StorageLayoutError, validate_layout
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            db_path = root / "users.db"
+            uploads = root / "uploads"
+            conn = sqlite3.connect(db_path)
+            conn.execute("CREATE TABLE users (username TEXT)")
+            conn.execute("CREATE TABLE reports (username TEXT, report_number TEXT)")
+            conn.execute("INSERT INTO users VALUES (?)", ("alice",))
+            conn.execute(
+                "INSERT INTO reports VALUES (?, ?)",
+                ("alice", "alice-2bd806c9"),
+            )
+            conn.commit()
+            conn.close()
+            (uploads / "energy" / "alice-2bd806c9").mkdir(parents=True)
+
+            with self.assertRaisesRegex(StorageLayoutError, "owner/report mapping"):
+                validate_layout(db_path, uploads, runtime_root=root)
 
     def test_server_report_number_predicates_always_scope_by_username(self):
         unsafe_queries = _unsafe_report_sql_literals(self.source_tree())

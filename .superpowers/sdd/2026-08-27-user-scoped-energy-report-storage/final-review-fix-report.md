@@ -168,3 +168,50 @@ exit 1 was expected).  The worktree `users.db` SHA-256 remained
 Concern: the Windows host cannot create symlinks without privilege, so the
 existing real-symlink cases remain skipped; hardlink coverage is non-skipped
 and was exercised in this repair cycle.
+
+## Targeted repair cycle: confirmation callback ordering
+
+Date: 2026-09-02 (Asia/Shanghai)
+
+### RED/GREEN
+
+A behavior-level two-client ordering test was added before the production
+change.  It delays only the older failed confirmation's registered Flask
+callback, submits a newer successful confirmation for the same report, then
+releases the older callback:
+
+```powershell
+python -m unittest tests.test_vector_pdf_exterior_route.VectorPdfExteriorConfirmRouteTests.test_older_confirmation_callback_cannot_overwrite_a_newer_terminal_status -v
+```
+
+At `83fcda77ef` the test failed, exit 1: the final composite status was
+`failed`, because the old callback ran after the decorator had released the
+report lock and overwrote the new successful confirmation's `recognized`
+state.  After the fix the same test passed, **1 test, OK**, exit 0.
+
+`vector_pdf_exterior_confirm` now finalizes every response after report-context
+resolution through `_finalize_exterior_confirmation_response`.  It converts
+the response and updates the same `(owner_username, report_number)` status
+while still executing inside `_serialized_exterior_report`'s lock: 2xx maps to
+`recognized`, every terminal non-2xx response maps to `failed`.  The prior
+`after_this_request` callback for confirmation was removed, so it cannot write
+a stale status after a newer serialized operation.
+
+### Regression evidence
+
+```powershell
+python -m unittest tests.test_vector_pdf_exterior_route -v
+python -m unittest tests.test_energy_report_ownership -v
+python -m unittest discover -s tests
+node tests/test_energy_pdf_preview_state.js
+```
+
+Results: exterior route **25 tests** passed; ownership/lifecycle **64 tests**
+passed with **10 capability skips**; full discovery **519 tests** passed with
+**13 skips**; Node state test passed.  Diff check, Python compilation, AST
+parse, both Node syntax checks, and static legacy path/SQL search passed (the
+search returned no matches, exit 1 expected).  `users.db` stayed at
+`F0FB63F246F389B1DD6A495D6B4F3A2CA8601D97589A89C177CCD5B65EA0C2A9`.
+
+Concern: real symlink cases remain Windows capability-skipped; run them on a
+privileged Linux CI/deployment host.

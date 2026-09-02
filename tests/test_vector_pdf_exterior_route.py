@@ -2,6 +2,7 @@ import hashlib
 import json
 import math
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -363,6 +364,71 @@ class VectorPdfExteriorConfirmRouteTests(unittest.TestCase):
                 self.assertEqual(
                     self.server._report_row("bob", "EXT-1")["status"], "recognized",
                 )
+
+    def test_older_confirmation_callback_cannot_overwrite_a_newer_terminal_status(self):
+        with tempfile.TemporaryDirectory() as directory:
+            upload_root = Path(directory)
+            report_dir = upload_root / "energy" / user_storage_key("test-user") / "EXT-1"
+            _, _, topology_path = self._artifacts(report_dir)
+            self.server._upsert_report_status("test-user", "EXT-1", "recognized")
+            previous = self.server.app.config["UPLOAD_FOLDER"]
+            self.server.app.config["UPLOAD_FOLDER"] = str(upload_root)
+            old_callback_started = threading.Event()
+            allow_old_callback = threading.Event()
+            registrations = 0
+            original_after_this_request = self.server.after_this_request
+
+            def delay_only_the_first_callback(callback):
+                nonlocal registrations
+                registrations += 1
+                if registrations != 1:
+                    return original_after_this_request(callback)
+
+                def delayed(response):
+                    old_callback_started.set()
+                    self.assertTrue(allow_old_callback.wait(timeout=5))
+                    return callback(response)
+
+                return original_after_this_request(delayed)
+
+            def post_old_failure():
+                client = self.server.app.test_client()
+                with client.session_transaction() as session:
+                    session.update(logged_in=True, username="test-user", is_admin=False)
+                response = client.post(
+                    "/energy/vector_pdf_exterior_confirm",
+                    json=self._payload(topology_path, topology_sha256="0" * 64),
+                )
+                self.assertEqual(response.status_code, 409, response.get_json())
+
+            old_thread = threading.Thread(target=post_old_failure)
+            try:
+                with mock.patch.object(
+                    self.server,
+                    "after_this_request",
+                    side_effect=delay_only_the_first_callback,
+                ):
+                    old_thread.start()
+                    old_callback_started.wait(timeout=2)
+                    newer_client = self.server.app.test_client()
+                    with newer_client.session_transaction() as session:
+                        session.update(logged_in=True, username="test-user", is_admin=False)
+                    newer_response = newer_client.post(
+                        "/energy/vector_pdf_exterior_confirm",
+                        json=self._payload(topology_path),
+                    )
+                    self.assertEqual(newer_response.status_code, 200, newer_response.get_json())
+                    allow_old_callback.set()
+                    old_thread.join(timeout=5)
+            finally:
+                allow_old_callback.set()
+                old_thread.join(timeout=5)
+                self.server.app.config["UPLOAD_FOLDER"] = previous
+
+            self.assertFalse(old_thread.is_alive())
+            self.assertEqual(
+                self.server._report_row("test-user", "EXT-1")["status"], "recognized",
+            )
 
     def test_confirm_rejects_marker_hash_mismatch_without_overwriting_recognition(self):
         with tempfile.TemporaryDirectory() as directory:

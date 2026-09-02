@@ -3072,6 +3072,18 @@ def _serialized_exterior_report(route):
     return wrapped
 
 
+def _finalize_exterior_confirmation_response(context, response):
+    """Persist a confirmation terminal state before its report lock releases."""
+
+    response = app.make_response(response)
+    if context is not None:
+        status = 'recognized' if 200 <= response.status_code < 300 else 'failed'
+        _update_report_status_if_exists(
+            context.owner_username, context.report_number, status,
+        )
+    return response
+
+
 @app.route('/energy/pdf_prepare', methods=['POST'])
 @login_required
 def prepare_energy_pdf():
@@ -3430,6 +3442,7 @@ def vector_pdf_exterior_confirm():
         return jsonify({'error': 'JSON request body is required'}), 400
     if payload.get('confirmed') is not True:
         return jsonify({'error': 'confirmed must be boolean true'}), 400
+    context = None
     try:
         calibration_method = payload.get(
             'calibration_method', 'manual_exterior_confirmation',
@@ -3457,15 +3470,6 @@ def vector_pdf_exterior_confirm():
             _requested_owner_username(payload),
         )
         report_number = context.report_number
-
-        @after_this_request
-        def update_exterior_confirmation_status(response):
-            status = 'recognized' if 200 <= response.status_code < 300 else 'failed'
-            _update_report_status_if_exists(
-                context.owner_username, context.report_number, status,
-            )
-            return response
-
         report_dir, artifact_dir = _require_exterior_report_dir(context)
         topology_raw, topology = _read_exterior_artifact(
             artifact_dir, 'pdf_exterior_topology.json',
@@ -3474,24 +3478,37 @@ def vector_pdf_exterior_confirm():
             artifact_dir, 'pdf_opening_candidates.json',
         )
     except _REPORT_STORAGE_EXCEPTIONS as exc:
-        return _report_storage_error_response(exc)
+        return _finalize_exterior_confirmation_response(
+            context, _report_storage_error_response(exc),
+        )
     except FileNotFoundError as exc:
-        return jsonify({'error': str(exc)}), 404
+        return _finalize_exterior_confirmation_response(
+            context, (jsonify({'error': str(exc)}), 404),
+        )
     except ValueError as exc:
-        return jsonify({'error': str(exc)}), 400
+        return _finalize_exterior_confirmation_response(
+            context, (jsonify({'error': str(exc)}), 400),
+        )
 
     current_hash = hashlib.sha256(topology_raw).hexdigest()
     if not hmac.compare_digest(current_hash, supplied_hash.lower()):
-        return jsonify({'error': 'Exterior topology has changed; review it again'}), 409
+        return _finalize_exterior_confirmation_response(
+            context,
+            (jsonify({'error': 'Exterior topology has changed; review it again'}), 409),
+        )
 
     try:
         generation_marker = _require_current_exterior_generation(
             report_dir, report_number, topology_sha256=current_hash,
         )
     except _REPORT_STORAGE_EXCEPTIONS as exc:
-        return _report_storage_error_response(exc)
+        return _finalize_exterior_confirmation_response(
+            context, _report_storage_error_response(exc),
+        )
     except ExteriorGenerationConflict as exc:
-        return jsonify({'error': str(exc)}), 409
+        return _finalize_exterior_confirmation_response(
+            context, (jsonify({'error': str(exc)}), 409),
+        )
 
     opening_hash = topology.get('opening_artifact_sha256')
     if (
@@ -3500,7 +3517,10 @@ def vector_pdf_exterior_confirm():
         or any(character not in '0123456789abcdef' for character in opening_hash)
         or not hmac.compare_digest(hashlib.sha256(opening_raw).hexdigest(), opening_hash)
     ):
-        return jsonify({'error': 'Opening artifact has changed; review it again'}), 409
+        return _finalize_exterior_confirmation_response(
+            context,
+            (jsonify({'error': 'Opening artifact has changed; review it again'}), 409),
+        )
 
     try:
         provenance, artifact_page, artifact_crop, image_size = _artifact_provenance(
@@ -3630,15 +3650,23 @@ def vector_pdf_exterior_confirm():
             expected_generation=generation_marker['generation'],
         )
     except _REPORT_STORAGE_EXCEPTIONS as exc:
-        return _report_storage_error_response(exc)
+        return _finalize_exterior_confirmation_response(
+            context, _report_storage_error_response(exc),
+        )
     except ExteriorGenerationConflict as exc:
-        return jsonify({'error': str(exc)}), 409
+        return _finalize_exterior_confirmation_response(
+            context, (jsonify({'error': str(exc)}), 409),
+        )
     except (RuntimeError, ValueError) as exc:
-        return jsonify({'error': str(exc)}), 409
+        return _finalize_exterior_confirmation_response(
+            context, (jsonify({'error': str(exc)}), 409),
+        )
     except Exception as exc:
-        return _internal_report_error_response('Cannot persist exterior recognition', exc)
+        return _finalize_exterior_confirmation_response(
+            context, _internal_report_error_response('Cannot persist exterior recognition', exc),
+        )
 
-    return jsonify({
+    return _finalize_exterior_confirmation_response(context, jsonify({
         'success': True,
         'report_number': report_number,
         'status': 'confirmed',
@@ -3649,7 +3677,7 @@ def vector_pdf_exterior_confirm():
         'opening_widths': recognition['opening_widths'],
         'geometry_summary': recognition['geometry_summary'],
         'recognition': recognition,
-    })
+    }))
 
 
 @app.route('/energy/ai_recognize', methods=['POST'])

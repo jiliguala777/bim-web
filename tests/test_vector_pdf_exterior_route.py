@@ -317,6 +317,53 @@ class VectorPdfExteriorConfirmRouteTests(unittest.TestCase):
             self.assertEqual(response.get_json(), {"error": "Invalid report path"})
             self.assertNotIn(secret, response.get_data(as_text=True))
 
+    def test_terminal_confirmation_failures_mark_only_the_active_owner_failed(self):
+        cases = ("hash_mismatch", "generation_conflict", "validation_failure", "storage_failure")
+        for case in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+                upload_root = Path(directory)
+                report_dir = upload_root / "energy" / user_storage_key("test-user") / "EXT-1"
+                topology, openings, topology_path = self._artifacts(report_dir)
+                self.server._upsert_report_status("test-user", "EXT-1", "recognized")
+                self.server._upsert_report_status("bob", "EXT-1", "recognized")
+                payload = self._payload(topology_path)
+                if case == "hash_mismatch":
+                    payload["topology_sha256"] = "0" * 64
+                elif case == "generation_conflict":
+                    marker_path = report_dir / "exterior_generation.json"
+                    marker = json.loads(marker_path.read_text(encoding="utf-8"))
+                    marker["status"] = "running"
+                    marker_path.write_text(json.dumps(marker), encoding="utf-8")
+                elif case == "validation_failure":
+                    payload["page_number"] = 99
+
+                previous = self.server.app.config["UPLOAD_FOLDER"]
+                self.server.app.config["UPLOAD_FOLDER"] = str(upload_root)
+                try:
+                    if case == "storage_failure":
+                        with mock.patch.object(
+                            self.server,
+                            "_save_recognition_payload",
+                            side_effect=self.server.InvalidReportPath("outside"),
+                        ):
+                            response = self.client.post(
+                                "/energy/vector_pdf_exterior_confirm", json=payload,
+                            )
+                    else:
+                        response = self.client.post(
+                            "/energy/vector_pdf_exterior_confirm", json=payload,
+                        )
+                finally:
+                    self.server.app.config["UPLOAD_FOLDER"] = previous
+
+                self.assertIn(response.status_code, {400, 409}, response.get_json())
+                self.assertEqual(
+                    self.server._report_row("test-user", "EXT-1")["status"], "failed",
+                )
+                self.assertEqual(
+                    self.server._report_row("bob", "EXT-1")["status"], "recognized",
+                )
+
     def test_confirm_rejects_marker_hash_mismatch_without_overwriting_recognition(self):
         with tempfile.TemporaryDirectory() as directory:
             upload_root = Path(directory)

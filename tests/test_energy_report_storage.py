@@ -1,3 +1,4 @@
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -108,6 +109,21 @@ class EnergyReportStorageResolutionTests(unittest.TestCase):
             self._symlink_or_skip(owner_root / "BIM-1", outside)
             with self.assertRaises(InvalidReportPath):
                 resolve_energy_report_context(root, "alice", False, "BIM-1")
+
+    def test_rejects_a_hardlinked_fixed_child_file_for_reads(self):
+        from energy_report_storage import InvalidReportPath, resolve_report_child_file
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            report_dir = root / "report"
+            report_dir.mkdir()
+            outside = root / "outside.dxf"
+            outside.write_bytes(b"outside")
+            os.link(outside, report_dir / "building_plan.dxf")
+
+            with self.assertRaises(InvalidReportPath):
+                resolve_report_child_file(report_dir, "building_plan.dxf")
+            self.assertEqual(outside.read_bytes(), b"outside")
 
     def test_admin_can_resolve_requested_owner(self):
         from energy_report_storage import resolve_energy_report_context

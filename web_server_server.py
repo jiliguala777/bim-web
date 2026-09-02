@@ -31,6 +31,8 @@ from energy_report_storage import (
     resolve_report_child_destination,
     resolve_report_child_file,
     resolve_report_subdirectory,
+    create_private_report_subdirectory,
+    open_private_report_lock_file,
     resolve_energy_report_context,
     resolve_report_owner,
     StorageIdentityCollision,
@@ -1433,11 +1435,11 @@ def background_simulation_task(job_id, data):
         
         # 2. 执行 EnergyPlus 模拟 (深度算法)
         simulation_jobs.update(job_id, progress=50)
-        output_dir = resolve_report_subdirectory(
-            target_dir, 'energyplus_runs', job_id, create=True,
+        runs_root = resolve_report_subdirectory(
+            target_dir, 'energyplus_runs', create=True,
         )
-
-        idf_path = output_dir / 'run.idf'
+        output_dir = create_private_report_subdirectory(runs_root, job_id)
+        idf_path = resolve_report_child_file(output_dir, 'run.idf', required=False)
         
         energyplus_engine.generate_idf(idf_path, geom_result, params)
         csv_path = energyplus_engine.run_eplus(idf_path, epw_path, output_dir)
@@ -2931,16 +2933,12 @@ def _exterior_report_lock(report_dir):
         thread_lock = _exterior_thread_locks.setdefault(lock_key, threading.RLock())
 
     with thread_lock:
-        lock_path = resolve_report_child_file(
-            report_dir, '.exterior_generation.lock', required=False,
-        )
-        flags = os.O_RDWR | os.O_CREAT
-        if hasattr(os, 'O_BINARY'):
-            flags |= os.O_BINARY
-        if hasattr(os, 'O_NOFOLLOW'):
-            flags |= os.O_NOFOLLOW
         try:
-            lock_fd = os.open(lock_path, flags, 0o600)
+            lock_fd = open_private_report_lock_file(
+                report_dir, '.exterior_generation.lock',
+            )
+        except InvalidReportPath:
+            raise
         except OSError as exc:
             raise InvalidReportPath('exterior lock file is invalid') from exc
         with os.fdopen(lock_fd, 'r+b') as lock_file:
@@ -3459,6 +3457,15 @@ def vector_pdf_exterior_confirm():
             _requested_owner_username(payload),
         )
         report_number = context.report_number
+
+        @after_this_request
+        def update_exterior_confirmation_status(response):
+            status = 'recognized' if 200 <= response.status_code < 300 else 'failed'
+            _update_report_status_if_exists(
+                context.owner_username, context.report_number, status,
+            )
+            return response
+
         report_dir, artifact_dir = _require_exterior_report_dir(context)
         topology_raw, topology = _read_exterior_artifact(
             artifact_dir, 'pdf_exterior_topology.json',
@@ -3621,9 +3628,6 @@ def vector_pdf_exterior_confirm():
             recognition=recognition,
             topology_sha256=current_hash,
             expected_generation=generation_marker['generation'],
-        )
-        _upsert_report_status(
-            context.owner_username, report_number, 'recognized',
         )
     except _REPORT_STORAGE_EXCEPTIONS as exc:
         return _report_storage_error_response(exc)

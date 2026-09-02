@@ -106,3 +106,65 @@ and exited 1 as expected.
 
 Pending at report creation; the recovery commit hash is recorded in the
 handoff response after the commit succeeds.
+
+## Targeted repair cycle: hardlink artifacts and exterior terminal lifecycle
+
+Date: 2026-09-02 (Asia/Shanghai)
+
+### RED
+
+The following behavior-first tests were added before production changes and
+run against commit `3c810bea97`:
+
+```powershell
+python -m unittest tests.test_energy_report_storage.EnergyReportStorageResolutionTests.test_rejects_a_hardlinked_fixed_child_file_for_reads tests.test_energy_report_ownership.ReportUploadIsolationTests.test_energyplus_worker_rejects_a_preexisting_hardlinked_idf tests.test_energy_report_ownership.ReportUploadIsolationTests.test_exterior_lock_rejects_a_fixed_file_hardlink tests.test_floorplan_page_pipeline.PdfPagePipelineTests.test_prepare_pdf_page_replaces_hardlinked_preprocessing_metadata tests.test_vector_pdf_exterior_route.VectorPdfExteriorConfirmRouteTests.test_terminal_confirmation_failures_mark_only_the_active_owner_failed -v
+```
+
+Result: exit 1, **5 test methods failed with 8 assertions**.  The storage
+resolver accepted a hardlinked read input; the exterior lock acquired a
+hardlinked lock file; the worker called `generate_idf` for a pre-seeded nested
+job directory; `preprocessing.json` overwrote its hardlink peer; and hash,
+generation, validation, and persistence confirmation failures left the active
+report status as `recognized`.
+
+### Minimal fix
+
+- Read resolution now checks the direct child's `lstat` mode and requires one
+  hard link.  Lock acquisition uses `O_NOFOLLOW` when available and checks
+  `fstat`/`lstat` identity, regular-file mode, and link count after opening.
+- The PDF page pipeline atomically publishes `preprocessing.json` via a
+  temporary file, `fsync`, and `os.replace`.
+- EnergyPlus creates its job directory with exclusive `mkdir` mode `0700` and
+  rejects an existing nested job directory before passing output paths to the
+  engine.  This makes generated `run.idf` and engine output private to the
+  newly-created job invocation.
+- Once exterior confirmation has resolved its report context, an
+  `after_this_request` transition writes `recognized` only for a 2xx result
+  and `failed` for every later terminal error, keyed by that same owner/report
+  composite identity.
+
+### GREEN and regression evidence
+
+The RED command above passed after the minimal fixes: **5 tests, OK**, exit 0.
+
+```powershell
+python -m unittest tests.test_floorplan_page_pipeline -v
+python -m unittest tests.test_energy_report_storage tests.test_energy_report_ownership tests.test_vector_pdf_exterior_route -v
+python -m unittest tests.test_energy_report_storage tests.test_energy_report_ownership tests.test_energy_report_path_audit tests.test_vector_pdf_fusion_route tests.test_vector_pdf_exterior_route tests.test_energy_template -v
+python -m unittest discover -s tests
+node tests/test_energy_pdf_preview_state.js
+```
+
+Results: pipeline **15 tests** passed; adjacent storage/ownership/exterior
+suite **102 tests** passed with **12 capability skips**; the pre-existing
+focused command now contains **214 tests** and passed with **13 skips**; full
+discovery **518 tests** passed with **13 skips**; Node state test passed.
+
+`git diff --check`, `py_compile`, AST parsing, both Node syntax checks, and
+the static old-path/SQL search all passed (the search had zero matches and its
+exit 1 was expected).  The worktree `users.db` SHA-256 remained
+`F0FB63F246F389B1DD6A495D6B4F3A2CA8601D97589A89C177CCD5B65EA0C2A9`.
+
+Concern: the Windows host cannot create symlinks without privilege, so the
+existing real-symlink cases remain skipped; hardlink coverage is non-skipped
+and was exercised in this repair cycle.

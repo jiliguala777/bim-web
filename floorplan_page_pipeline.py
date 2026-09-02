@@ -249,6 +249,31 @@ def _write_image(
     return {"path": path.name, "sha256": _sha256(path)}
 
 
+def _atomic_write_json(path: Path, payload: dict[str, Any]) -> dict[str, str]:
+    """Publish JSON metadata without writing through a pre-existing alias."""
+
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temporary = Path(handle.name)
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    except BaseException:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+        raise
+    return {"path": path.name, "sha256": _sha256(path)}
+
+
 def _letterbox_preview(model_view_rgb: np.ndarray, metadata: dict[str, Any]) -> np.ndarray:
     resized_w, resized_h = metadata["resized_size"]
     top, left, _, _ = metadata["padding"]
@@ -437,24 +462,19 @@ def prepare_pdf_page(
             ),
         )
         metadata_path = destination / "preprocessing.json"
-        metadata_path.write_text(
-            json.dumps(
-                {
-                    "page_number": page_number,
-                    "page_count": page_count,
-                    "render_dpi": render_dpi,
-                    "model_input": model_input_metadata,
-                    "vector_analysis": vector_outcome.evidence,
-                    "scale_calibration": scale_calibration,
-                    "vector_cleanup": vector_cleanup,
-                    "inference_roi": inference_roi,
-                },
-                ensure_ascii=False,
-                indent=2,
-            ),
-            encoding="utf-8",
+        artifacts["metadata"] = _atomic_write_json(
+            metadata_path,
+            {
+                "page_number": page_number,
+                "page_count": page_count,
+                "render_dpi": render_dpi,
+                "model_input": model_input_metadata,
+                "vector_analysis": vector_outcome.evidence,
+                "scale_calibration": scale_calibration,
+                "vector_cleanup": vector_cleanup,
+                "inference_roi": inference_roi,
+            },
         )
-        artifacts["metadata"] = {"path": metadata_path.name, "sha256": _sha256(metadata_path)}
 
     return PreparedFloorplanPage(
         page_number=page_number,

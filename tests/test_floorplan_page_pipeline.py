@@ -318,6 +318,36 @@ class PdfPagePipelineTests(unittest.TestCase):
             self.assertEqual(artifact["sha256"], hashlib.sha256(encoded).hexdigest())
             self.assertFalse(output.with_name(output.name + ".tmp.png").exists())
 
+    @patch("floorplan_page_pipeline._run_vector_analysis")
+    def test_prepare_pdf_page_replaces_hardlinked_preprocessing_metadata(self, run_analysis):
+        run_analysis.return_value = VectorAnalysisOutcome(
+            None,
+            {
+                "status": "timed_out",
+                "mode": "raster_fallback",
+                "timeout_seconds": 15,
+                "reason": "vector extraction exceeded 15 seconds",
+            },
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "artifacts"
+            output.mkdir()
+            outside = Path(directory) / "outside-preprocessing.json"
+            outside.write_bytes(b"outside")
+            metadata_path = output / "preprocessing.json"
+            os.link(outside, metadata_path)
+
+            prepare_pdf_page(
+                self._make_two_page_pdf(directory),
+                1,
+                poppler_path=os.environ.get("POPPLER_PATH"),
+                segmenter=self._segmenter(),
+                output_dir=output,
+            )
+
+            self.assertEqual(outside.read_bytes(), b"outside")
+            self.assertEqual(json.loads(metadata_path.read_text(encoding="utf-8"))["page_number"], 1)
+
     def test_prepare_pdf_page_renders_only_the_requested_one_based_page(self):
         poppler_path = os.environ.get("POPPLER_PATH")
         with tempfile.TemporaryDirectory() as directory:

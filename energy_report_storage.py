@@ -5,6 +5,7 @@ import hashlib
 import os
 from pathlib import Path
 import re
+import stat
 import unicodedata
 
 
@@ -199,19 +200,61 @@ def resolve_report_child_file(
     """Return a regular, non-symlink fixed file directly below a report."""
 
     candidate = resolve_report_child_destination(report_dir, filename)
-    if candidate.is_symlink():
-        raise InvalidReportPath("report child file is invalid")
     try:
-        resolved = candidate.resolve(strict=True)
+        metadata = os.lstat(candidate)
     except FileNotFoundError:
         if required:
             raise
         return candidate
     except OSError as exc:
         raise InvalidReportPath("report child file is invalid") from exc
+    if (
+        stat.S_ISLNK(metadata.st_mode)
+        or not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_nlink != 1
+    ):
+        raise InvalidReportPath("report child file is invalid")
+    try:
+        resolved = candidate.resolve(strict=True)
+    except FileNotFoundError:
+        raise InvalidReportPath("report child file is invalid") from None
+    except OSError as exc:
+        raise InvalidReportPath("report child file is invalid") from exc
     if resolved.parent != candidate.parent or not resolved.is_file():
         raise InvalidReportPath("report child file is invalid")
     return resolved
+
+
+def open_private_report_lock_file(
+    report_dir: str | os.PathLike[str],
+    filename: str,
+) -> int:
+    """Open one lock file without following aliases and verify its inode."""
+
+    candidate = resolve_report_child_destination(report_dir, filename)
+    flags = os.O_RDWR | os.O_CREAT
+    if hasattr(os, "O_BINARY"):
+        flags |= os.O_BINARY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(candidate, flags, 0o600)
+    except OSError as exc:
+        raise InvalidReportPath("report lock file is invalid") from exc
+    try:
+        opened = os.fstat(descriptor)
+        current = os.lstat(candidate)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_nlink != 1
+            or stat.S_ISLNK(current.st_mode)
+            or (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino)
+        ):
+            raise InvalidReportPath("report lock file is invalid")
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return descriptor
 
 
 def resolve_report_subdirectory(
@@ -245,6 +288,37 @@ def resolve_report_subdirectory(
             raise InvalidReportPath("report child directory is invalid")
         current = resolved
     return current
+
+
+def create_private_report_subdirectory(
+    report_dir: str | os.PathLike[str],
+    component: str,
+) -> Path:
+    """Atomically create an empty private direct child directory."""
+
+    parent = _canonical_directory(report_dir, "report directory")
+    candidate = parent / _fixed_child_component(component)
+    try:
+        os.mkdir(candidate, 0o700)
+    except FileExistsError as exc:
+        raise InvalidReportPath("report child directory already exists") from exc
+    except OSError as exc:
+        raise InvalidReportPath("report child directory is invalid") from exc
+    try:
+        resolved = _canonical_directory(candidate, "report child directory")
+    except BaseException:
+        try:
+            candidate.rmdir()
+        except OSError:
+            pass
+        raise
+    if resolved.parent != parent:
+        try:
+            candidate.rmdir()
+        except OSError:
+            pass
+        raise InvalidReportPath("report child directory is invalid")
+    return resolved
 
 
 def resolve_energy_report_context(

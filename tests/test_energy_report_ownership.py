@@ -1618,6 +1618,56 @@ class ReportUploadIsolationTests(unittest.TestCase):
         engine.run_eplus.assert_not_called()
         jobs.update.assert_called_with(job_id, status="failed", error="Simulation failed")
 
+    def test_energyplus_worker_rejects_a_preexisting_hardlinked_idf(self):
+        report_number = "BIM-EPLUS-HARDLINK-IDF"
+        job_id = "job-hardlink-idf"
+        report_dir = self.upload_root / "energy" / user_storage_key("alice") / report_number
+        report_dir.mkdir(parents=True)
+        (report_dir / "building_plan.dxf").write_bytes(b"dxf")
+        (report_dir / "weather_data.epw").write_bytes(b"weather")
+        output_dir = report_dir / "energyplus_runs" / job_id
+        output_dir.mkdir(parents=True)
+        outside = self.upload_root / "outside-run.idf"
+        outside.write_bytes(b"outside")
+        os.link(outside, output_dir / "run.idf")
+        self.server._upsert_report_status("alice", report_number, "calculating")
+        jobs = MagicMock()
+
+        def write_idf(path, *_args):
+            Path(path).write_bytes(b"engine output")
+
+        with (
+            patch.object(self.server, "simulation_jobs", jobs),
+            patch.object(
+                self.server,
+                "extract_geometry",
+                return_value={"floor_area": 100.0, "perimeter": 40.0},
+            ),
+            patch.object(self.server, "energyplus_engine", create=True) as engine,
+        ):
+            engine.generate_idf.side_effect = write_idf
+            self.server.background_simulation_task(
+                job_id,
+                {"owner_username": "alice", "report_number": report_number},
+            )
+
+        engine.generate_idf.assert_not_called()
+        self.assertEqual(outside.read_bytes(), b"outside")
+        jobs.update.assert_called_with(job_id, status="failed", error="Simulation failed")
+
+    def test_exterior_lock_rejects_a_fixed_file_hardlink(self):
+        report_dir = self.upload_root / "energy" / user_storage_key("alice") / "BIM-LOCK-HARDLINK"
+        report_dir.mkdir(parents=True)
+        outside = self.upload_root / "outside-lock-hardlink"
+        outside.write_bytes(b"outside")
+        os.link(outside, report_dir / ".exterior_generation.lock")
+
+        with self.assertRaises(self.server.InvalidReportPath):
+            with self.server._exterior_report_lock(report_dir):
+                self.fail("hardlinked lock must not be acquired")
+
+        self.assertEqual(outside.read_bytes(), b"outside")
+
     def test_exterior_lock_rejects_a_fixed_file_symlink(self):
         report_dir = self.upload_root / "energy" / user_storage_key("alice") / "BIM-LOCK-LINK"
         report_dir.mkdir(parents=True)

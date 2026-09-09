@@ -28,6 +28,8 @@ class EnergyTemplateTests(unittest.TestCase):
         self.assertIn("closure_status", html)
         self.assertIn("accepted_lines_px", html)
         self.assertIn("function imageFootprintAreaM2", html)
+        self.assertIn("function applyImageExteriorAreas", html)
+        self.assertIn("exterior_elements", html)
         self.assertIn("image_onnx", html)
         self.assertIn("自动连接了", html)
         self.assertIn("已闭合房间面积", html)

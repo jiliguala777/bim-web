@@ -2057,6 +2057,7 @@ def _build_recognition_payload(
             'has_vector_text': False,
         },
         'topology_repair': result.get('topology_repair') or {},
+        'exterior_elements': result.get('exterior_elements'),
         'vector_geometry': result.get('vector_geometry'),
         'vector_measurements': result.get('vector_measurements'),
         'vector_inference': result.get('vector_inference'),
@@ -4181,6 +4182,7 @@ def ai_recognize():
             'vector_cleanup': vector_cleanup,
             'topology_repair': result.get('topology_repair') or {},
             'footprint': recognition_payload.get('footprint'),
+            'exterior_elements': recognition_payload.get('exterior_elements'),
             'pixel_lengths': {
                 'wall_px': round(wall_total_length, 1),
                 'window_px': round(win_total_length, 1),

@@ -44,6 +44,33 @@ def footprint_mask_from_logits(logits, output_size):
     return result
 
 
+def exterior_element_lengths(mask, footprint, boundary_band_px=None):
+    """Estimate exterior wall/window lengths on the four page sides in pixels."""
+    footprint = np.asarray(footprint, dtype=np.uint8)
+    height, width = footprint.shape
+    band_px = boundary_band_px or max(6, min(24, round(min(height, width) * 0.015)))
+    edge = cv2.morphologyEx(footprint, cv2.MORPH_GRADIENT, np.ones((3, 3), dtype=np.uint8))
+    edge = cv2.dilate(edge, np.ones((band_px * 2 + 1, band_px * 2 + 1), dtype=np.uint8))
+    moments = cv2.moments(footprint)
+    center_x = moments["m10"] / moments["m00"] if moments["m00"] else width / 2
+    center_y = moments["m01"] / moments["m00"] if moments["m00"] else height / 2
+    output = {side: {"wall_px": 0.0, "window_px": 0.0} for side in ("top", "right", "bottom", "left")}
+    y_grid, x_grid = np.indices(footprint.shape)
+    dx, dy = x_grid - center_x, y_grid - center_y
+    side_masks = {
+        "top": (dy < 0) & (np.abs(dy) >= np.abs(dx)),
+        "right": (dx >= 0) & (np.abs(dx) > np.abs(dy)),
+        "bottom": (dy >= 0) & (np.abs(dy) >= np.abs(dx)),
+        "left": (dx < 0) & (np.abs(dx) > np.abs(dy)),
+    }
+    for class_id, name in ((1, "wall_px"), (2, "window_px")):
+        exterior = (np.asarray(mask) == class_id) & (edge > 0)
+        for side, side_mask in side_masks.items():
+            coordinates = np.where(exterior & side_mask)
+            output[side][name] = float(len(np.unique(coordinates[1 if side in ("top", "bottom") else 0])))
+    return output
+
+
 class FloorplanImageSegmenterONNX(FloorplanSegmenterONNX):
     """Keep the established geometry and energy contract for the new image model."""
 
@@ -87,6 +114,7 @@ class FloorplanImageSegmenterONNX(FloorplanSegmenterONNX):
     def predict(self, image_input, use_preprocessing=False, **kwargs):
         result = super().predict(image_input, use_preprocessing=False, **kwargs)
         footprint = result["footprint_mask"].astype(bool)
+        result["exterior_elements"] = exterior_element_lengths(result["mask"], result["footprint_mask"])
         purple = np.zeros_like(result["overlay"])
         purple[:] = (180, 80, 180)
         result["overlay"][footprint] = cv2.addWeighted(result["overlay"], 0.55, purple, 0.45, 0)[footprint]

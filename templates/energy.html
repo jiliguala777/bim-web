@@ -1772,6 +1772,9 @@
                 if (event.key === 'Escape') closeRecognitionImageModal();
             });
             setupScaleCalibrationCanvas();
+            ['param-orientation', 'param-height', 'param-window-height'].forEach(id => {
+                document.getElementById(id).addEventListener('change', applyImageExteriorAreas);
+            });
             updateCalculationScopeControls();
             updateAnnualUsePreview();
             updateDesignTemperatureNotice();
@@ -2466,6 +2469,30 @@
                 : null;
         }
 
+        function imageExteriorElements() {
+            const backend = aiResultData?.model_info?.backend || aiResultData?.model?.backend;
+            return backend === 'image_onnx' ? aiResultData?.exterior_elements : null;
+        }
+
+        function applyImageExteriorAreas() {
+            const exterior = imageExteriorElements();
+            const scale = Number(document.getElementById('param-scale').value);
+            const wallHeight = Number(document.getElementById('param-height').value);
+            const windowHeight = Number(document.getElementById('param-window-height').value);
+            if (!exterior || !Number.isFinite(scale) || scale <= 0 || !Number.isFinite(wallHeight) || wallHeight <= 0 || !Number.isFinite(windowHeight) || windowHeight <= 0) return false;
+            const pageSides = ['top', 'right', 'bottom', 'left'];
+            const compass = ['north', 'east', 'south', 'west'];
+            const topIndex = compass.indexOf(document.getElementById('param-orientation').value);
+            pageSides.forEach((side, index) => {
+                const direction = compass[(topIndex + index) % compass.length];
+                const lengths = exterior[side] || {};
+                detailedEnvelope.walls_by_orientation[direction].area_m2 = Number(lengths.wall_px || 0) * scale * wallHeight;
+                detailedEnvelope.windows_by_orientation[direction].area_m2 = Number(lengths.window_px || 0) * scale * windowHeight;
+            });
+            renderDetailedOrientationCards();
+            return true;
+        }
+
         function applyScaleCalibrationResult(calibration, roomTopology) {
             const panel = document.getElementById('scale-calibration-panel');
             const status = document.getElementById('scale-calibration-status');
@@ -2610,8 +2637,14 @@
             const scale = parseFloat(document.getElementById('param-scale').value);
             if (!Number.isFinite(scale) || scale <= 0) return;
             
-            const wall_px = aiResultData.pixel_lengths.wall_px || 0;
-            const win_px = aiResultData.pixel_lengths.window_px || 0;
+            const exterior = imageExteriorElements();
+            const exteriorSides = exterior ? Object.values(exterior) : [];
+            const wall_px = exteriorSides.length
+                ? exteriorSides.reduce((total, side) => total + Number(side.wall_px || 0), 0)
+                : (aiResultData.pixel_lengths.wall_px || 0);
+            const win_px = exteriorSides.length
+                ? exteriorSides.reduce((total, side) => total + Number(side.window_px || 0), 0)
+                : (aiResultData.pixel_lengths.window_px || 0);
             
             document.getElementById('param-wall-length').value = (wall_px * scale).toFixed(1);
             document.getElementById('param-window-length').value = (win_px * scale).toFixed(1);
@@ -2622,6 +2655,7 @@
             } else if (totalAreaPx2 > 0 && aiResultData.room_topology?.load_geometry_ready) {
                 document.getElementById('param-floor-area').value = (totalAreaPx2 * scale * scale).toFixed(1);
             }
+            applyImageExteriorAreas();
             updateAnnualUsePreview();
         }
 

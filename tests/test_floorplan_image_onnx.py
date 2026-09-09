@@ -10,7 +10,7 @@ import cv2
 import numpy as np
 
 from energy_report_storage import user_storage_key
-from floorplan_image_onnx import prepare_image_tensor, remap_element_classes
+from floorplan_image_onnx import prepare_image_tensor, remap_element_classes, footprint_mask_from_logits
 
 
 class FloorplanImageOnnxTests(unittest.TestCase):
@@ -31,6 +31,10 @@ class FloorplanImageOnnxTests(unittest.TestCase):
         platform_mask = remap_element_classes(training_mask)
 
         self.assertEqual(platform_mask.tolist(), [[0, 1, 3, 2]])
+
+    def test_footprint_logits_produce_a_binary_building_mask(self):
+        logits = np.array([[[[-2, 2], [2, -2]]]], dtype=np.float32)
+        self.assertEqual(footprint_mask_from_logits(logits, (2, 2)).tolist(), [[0, 1], [1, 0]])
 
 
 class FloorplanImageOnnxRouteTests(unittest.TestCase):

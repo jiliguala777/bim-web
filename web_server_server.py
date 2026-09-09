@@ -3756,7 +3756,7 @@ def ai_recognize():
         if (
             region_request['mode'] == 'crop_region'
             and not pdf_upload_token
-            and model_backend != VECTOR_PYTORCH_BACKEND
+            and model_backend not in {VECTOR_PYTORCH_BACKEND, IMAGE_ONNX_BACKEND}
         ):
             return jsonify({
                 'error': 'crop_region requires a prepared PDF upload or the vector model',
@@ -4072,6 +4072,7 @@ def ai_recognize():
         # 保存结果
         overlay_path = resolve_report_child_destination(target_dir, 'ai_overlay.jpg')
         mask_path = resolve_report_child_destination(target_dir, 'ai_mask.png')
+        footprint_path = resolve_report_child_destination(target_dir, 'ai_footprint_mask.png')
         _write_image(
             Path(overlay_path),
             overlay,
@@ -4095,6 +4096,8 @@ def ai_recognize():
         mask_color[mask == 2] = (219, 152, 52)   # window - blue
         mask_color[mask == 3] = (113, 204, 46)   # door - green
         _write_image(Path(mask_path), mask_color)
+        if result.get('footprint_mask') is not None:
+            _write_image(Path(footprint_path), result['footprint_mask'] * 255)
 
         # 编码为base64用于前端展示
         _, overlay_buf = cv2.imencode('.jpg', overlay, [cv2.IMWRITE_JPEG_QUALITY, 85])
@@ -4142,6 +4145,12 @@ def ai_recognize():
             elapsed,
             context.owner_username,
         )
+        if result.get('footprint_mask') is not None:
+            recognition_payload['footprint'] = {
+                'path': os.path.basename(footprint_path),
+                'pixels': int(result['footprint_mask'].sum()),
+                'color': '#b450b4',
+            }
         recognition_path = _save_recognition_payload(target_dir, recognition_payload)
 
         return jsonify({

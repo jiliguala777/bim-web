@@ -33,6 +33,12 @@ def remap_element_classes(training_mask):
     return np.array([0, 1, 3, 2], dtype=np.uint8)[np.asarray(training_mask, dtype=np.uint8)]
 
 
+def footprint_mask_from_logits(logits, output_size):
+    """Restore the binary footprint head to source-image coordinates."""
+    probability = 1.0 / (1.0 + np.exp(-np.asarray(logits, dtype=np.float32)[0, 0]))
+    return (cv2.resize(probability, output_size, interpolation=cv2.INTER_LINEAR) >= 0.5).astype(np.uint8)
+
+
 class FloorplanImageSegmenterONNX(FloorplanSegmenterONNX):
     """Keep the established geometry and energy contract for the new image model."""
 
@@ -66,10 +72,22 @@ class FloorplanImageSegmenterONNX(FloorplanSegmenterONNX):
         probabilities = np.exp(probabilities - probabilities.max(axis=0, keepdims=True))
         probabilities /= probabilities.sum(axis=0, keepdims=True)
         probabilities = probabilities[[0, 1, 3, 2]]
-        return probabilities.argmax(axis=0).astype(np.uint8), probabilities
+        footprint_logits = np.asarray(outputs[1], dtype=np.float32)[:, :, top:top + resized_height, left:left + resized_width]
+        footprint = footprint_mask_from_logits(footprint_logits, (width, height))
+        roi = cv2.dilate(footprint, np.ones((9, 9), dtype=np.uint8))
+        prediction = probabilities.argmax(axis=0).astype(np.uint8)
+        prediction[roi == 0] = 0
+        boundary = cv2.morphologyEx(footprint, cv2.MORPH_GRADIENT, np.ones((5, 5), dtype=np.uint8))
+        prediction[(prediction == 0) & (boundary > 0)] = 1
+        return prediction, probabilities, {"footprint_mask": footprint}
 
     def predict(self, image_input, use_preprocessing=False, **kwargs):
-        return super().predict(image_input, use_preprocessing=False, **kwargs)
+        result = super().predict(image_input, use_preprocessing=False, **kwargs)
+        footprint = result["footprint_mask"].astype(bool)
+        purple = np.zeros_like(result["overlay"])
+        purple[:] = (180, 80, 180)
+        result["overlay"][footprint] = cv2.addWeighted(result["overlay"], 0.55, purple, 0.45, 0)[footprint]
+        return result
 
 
 def get_image_segmenter(model_path):

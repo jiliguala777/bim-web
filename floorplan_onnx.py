@@ -245,7 +245,9 @@ class FloorplanSegmenterONNX:
             model_input = cv2.cvtColor(inference_bgr, cv2.COLOR_BGR2RGB)
             annot_mask = None
 
-        pred_raw, probs = self._run_inference(model_input)
+        inference = self._run_inference(model_input)
+        pred_raw, probs = inference[:2]
+        inference_artifacts = inference[2] if len(inference) > 2 else {}
 
         if use_preprocessing:
             pred_roi = self.postprocess_mask(pred_raw, probs, inference_bgr.shape, annot_mask)
@@ -322,6 +324,7 @@ class FloorplanSegmenterONNX:
             "topology_repair": topology_repair,
             "inference_roi": normalized_roi,
             "image_size": [w_orig, h_orig],
+            **inference_artifacts,
         }
 
     # ============ 可视化 ============

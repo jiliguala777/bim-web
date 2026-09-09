@@ -3114,7 +3114,7 @@
             const isPdf = file.type === 'application/pdf' || file.name.toLowerCase().endsWith('.pdf');
             if (isPdf) {
                 await preparePdf(file);
-            } else if (document.getElementById('model-backend').value === 'vector_pytorch') {
+            } else if (['vector_pytorch', 'image_onnx'].includes(document.getElementById('model-backend').value)) {
                 await prepareVectorRasterCrop(file);
             } else {
                 await submitRecognition(file);
@@ -3596,7 +3596,7 @@
             const vectorRasterCrop = Boolean(
                 file
                 && file === vectorRasterFile
-                && document.getElementById('model-backend').value === 'vector_pytorch'
+                && ['vector_pytorch', 'image_onnx'].includes(document.getElementById('model-backend').value)
             );
             const recognitionMode = file
                 ? (vectorRasterCrop ? vectorRasterRecognitionMode : 'full_page')

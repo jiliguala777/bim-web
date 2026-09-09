@@ -59,11 +59,13 @@ class FloorplanImageOnnxTests(unittest.TestCase):
         mask[10:13, 20:80] = 1
         mask[40:43, 25:75] = 1
         mask[30:70, 87:90] = 2
+        mask[87:90, 45:55] = 3
 
         lengths = exterior_element_lengths(mask, footprint, boundary_band_px=5)
 
         self.assertEqual(lengths["top"]["wall_px"], 60.0)
         self.assertEqual(lengths["right"]["window_px"], 40.0)
+        self.assertEqual(lengths["bottom"]["door_px"], 10.0)
         self.assertEqual(lengths["bottom"]["wall_px"], 0.0)
 
 

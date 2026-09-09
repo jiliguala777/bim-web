@@ -45,7 +45,7 @@ def footprint_mask_from_logits(logits, output_size):
 
 
 def exterior_element_lengths(mask, footprint, boundary_band_px=None):
-    """Estimate exterior wall/window lengths on the four page sides in pixels."""
+    """Estimate exterior wall/window/door lengths on the four page sides in pixels."""
     footprint = np.asarray(footprint, dtype=np.uint8)
     height, width = footprint.shape
     band_px = boundary_band_px or max(6, min(24, round(min(height, width) * 0.015)))
@@ -54,7 +54,7 @@ def exterior_element_lengths(mask, footprint, boundary_band_px=None):
     moments = cv2.moments(footprint)
     center_x = moments["m10"] / moments["m00"] if moments["m00"] else width / 2
     center_y = moments["m01"] / moments["m00"] if moments["m00"] else height / 2
-    output = {side: {"wall_px": 0.0, "window_px": 0.0} for side in ("top", "right", "bottom", "left")}
+    output = {side: {"wall_px": 0.0, "window_px": 0.0, "door_px": 0.0} for side in ("top", "right", "bottom", "left")}
     y_grid, x_grid = np.indices(footprint.shape)
     dx, dy = x_grid - center_x, y_grid - center_y
     side_masks = {
@@ -63,7 +63,7 @@ def exterior_element_lengths(mask, footprint, boundary_band_px=None):
         "bottom": (dy >= 0) & (np.abs(dy) >= np.abs(dx)),
         "left": (dx < 0) & (np.abs(dx) > np.abs(dy)),
     }
-    for class_id, name in ((1, "wall_px"), (2, "window_px")):
+    for class_id, name in ((1, "wall_px"), (2, "window_px"), (3, "door_px")):
         exterior = (np.asarray(mask) == class_id) & (edge > 0)
         for side, side_mask in side_masks.items():
             coordinates = np.where(exterior & side_mask)

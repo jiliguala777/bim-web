@@ -2456,6 +2456,16 @@
             });
         }
 
+        function imageFootprintAreaM2(scale = Number(aiResultData?.scale_calibration?.scale_m_per_px)) {
+            const backend = aiResultData?.model_info?.backend || aiResultData?.model?.backend;
+            const pixels = backend === 'image_onnx'
+                ? Number(aiResultData?.footprint?.pixels || 0)
+                : 0;
+            return pixels > 0 && Number.isFinite(scale) && scale > 0
+                ? pixels * scale * scale
+                : null;
+        }
+
         function applyScaleCalibrationResult(calibration, roomTopology) {
             const panel = document.getElementById('scale-calibration-panel');
             const status = document.getElementById('scale-calibration-status');
@@ -2474,7 +2484,10 @@
                 status.innerText = '自动比例尺未确认，请点击“手动两点标定”，在原图上选择一段已知长度。';
                 status.style.color = 'var(--warning)';
             }
-            if (roomTopology?.total_area_m2 != null) {
+            const footprintArea = imageFootprintAreaM2(Number(calibration?.scale_m_per_px));
+            if (footprintArea != null) {
+                areaInput.value = footprintArea.toFixed(2);
+            } else if (roomTopology?.total_area_m2 != null) {
                 areaInput.value = Number(roomTopology.total_area_m2).toFixed(2);
             }
             calculateButton.disabled = !hasCurrentConfirmedGeometry();
@@ -2602,8 +2615,11 @@
             
             document.getElementById('param-wall-length').value = (wall_px * scale).toFixed(1);
             document.getElementById('param-window-length').value = (win_px * scale).toFixed(1);
+            const footprintArea = imageFootprintAreaM2(scale);
             const totalAreaPx2 = Number(aiResultData.room_topology?.total_area_px2 || 0);
-            if (totalAreaPx2 > 0 && aiResultData.room_topology?.load_geometry_ready) {
+            if (footprintArea != null) {
+                document.getElementById('param-floor-area').value = footprintArea.toFixed(1);
+            } else if (totalAreaPx2 > 0 && aiResultData.room_topology?.load_geometry_ready) {
                 document.getElementById('param-floor-area').value = (totalAreaPx2 * scale * scale).toFixed(1);
             }
             updateAnnualUsePreview();
@@ -2775,6 +2791,8 @@
         function hasCurrentConfirmedGeometry() {
             if (!hasCurrentAiRecognitionResult()) return false;
             return Boolean(
+                imageFootprintAreaM2() != null
+                ||
                 (
                     aiResultData.exterior_topology?.confirmed === true
                     && aiResultData.exterior_topology?.load_geometry_ready === true
@@ -3728,10 +3746,17 @@
                 document.getElementById('aiRecognitionResults').classList.remove('hidden');
 
                 const roomCount = Number(data.room_topology?.room_count || 0);
+                const backend = data.model_info?.backend || data.model?.backend;
+                const imageFootprintPixels = backend === 'image_onnx'
+                    ? Number(data.footprint?.pixels || 0)
+                    : 0;
                 const closureSummary = document.getElementById('room-closure-summary');
                 const closureStatus = data.topology_repair?.closure_status || 'failed';
                 const repairedLines = data.topology_repair?.exterior_repair?.accepted_lines_px || [];
-                if (closureStatus === 'partial' || data.topology_repair?.manual_exterior_wall_required) {
+                if (imageFootprintPixels > 0) {
+                    closureSummary.innerText = '已提取紫色建筑覆盖面；完成比例尺标定后，单层建筑面积按该覆盖面计算，房间未闭合不会阻止计算。';
+                    closureSummary.style.color = 'var(--success)';
+                } else if (closureStatus === 'partial' || data.topology_repair?.manual_exterior_wall_required) {
                     closureSummary.innerText = roomCount > 0
                         ? `自动连接了 ${repairedLines.length} 条长边；当前仍为部分闭合，${roomCount} 个房间合计仅为已闭合房间面积。`
                         : '当前仍为部分闭合，尚未形成可用房间面积。';

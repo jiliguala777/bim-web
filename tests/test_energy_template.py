@@ -27,6 +27,8 @@ class EnergyTemplateTests(unittest.TestCase):
         self.assertIn("manual_exterior_wall_required", html)
         self.assertIn("closure_status", html)
         self.assertIn("accepted_lines_px", html)
+        self.assertIn("function imageFootprintAreaM2", html)
+        self.assertIn("image_onnx", html)
         self.assertIn("自动连接了", html)
         self.assertIn("已闭合房间面积", html)
         self.assertNotIn("外轮廓无法由唯一一条直线自动闭合", html)
@@ -3067,7 +3069,8 @@ class EnergyRouteClientTests(unittest.TestCase):
         connection = MagicMock()
         connection.execute.return_value.fetchone.return_value = None
         with (
-            patch.object(self.server, "HAS_FLOORPLAN_AI", True),
+            patch.object(self.server, "HAS_FLOORPLAN_AI", False),
+            patch.object(self.server, "HAS_IMAGE_FLOORPLAN_AI", True),
             patch.object(self.server, "HAS_ENERGY_CALC", True),
             patch.object(self.server, "_load_recognition_payload", return_value=recognition),
             patch.object(self.server.energy_calc, "calculate_energy", return_value=calculation) as calculate,

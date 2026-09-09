@@ -82,6 +82,7 @@ class FloorplanImageOnnxRouteTests(unittest.TestCase):
             "geometry": {"walls": [], "windows": [], "doors": []},
             "room_topology": {"status": "no_closed_rooms", "room_count": 0, "rooms": [], "total_area_px2": 0.0, "total_area_m2": None, "load_geometry_ready": False},
             "topology_repair": {},
+            "footprint_mask": np.ones((10, 20), dtype=np.uint8),
         }
         with tempfile.TemporaryDirectory() as upload_directory:
             previous_upload = self.server.app.config["UPLOAD_FOLDER"]
@@ -103,6 +104,7 @@ class FloorplanImageOnnxRouteTests(unittest.TestCase):
 
             self.assertEqual(response.status_code, 200, response.get_json())
             self.assertEqual(response.get_json()["model_info"]["backend"], "image_onnx")
+            self.assertEqual(response.get_json()["footprint"]["pixels"], 200)
             report_dir = Path(upload_directory) / "energy" / user_storage_key("test-user") / "IMAGE-ONNX-1"
             self.assertIsNotNone(self.server._load_recognition_payload(report_dir))
 

@@ -4508,7 +4508,12 @@ def ai_simulate():
             (recognition.get('topology_repair') or {}).get('manual_exterior_wall_required')
         )
         exterior_geometry = None
-        if exterior.get('confirmed') is True and exterior.get('load_geometry_ready') is True:
+        footprint = recognition.get('footprint') or {}
+        footprint_pixels = float(footprint.get('pixels') or 0.0)
+        if footprint_pixels > 0:
+            floor_area_m2 = footprint_pixels * (scale ** 2)
+            floor_area_source = 'image_footprint'
+        elif exterior.get('confirmed') is True and exterior.get('load_geometry_ready') is True:
             try:
                 _require_current_exterior_generation(
                     Path(target_dir), report_number, recognition=recognition,
@@ -4525,7 +4530,9 @@ def ai_simulate():
                 else:
                     raise
 
-        if exterior.get('confirmed') is True and exterior.get('load_geometry_ready') is True:
+        if footprint_pixels > 0:
+            pass
+        elif exterior.get('confirmed') is True and exterior.get('load_geometry_ready') is True:
             from vector_pdf_energy_geometry import build_exterior_energy_geometry
 
             exterior_geometry = build_exterior_energy_geometry(

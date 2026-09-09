@@ -3053,6 +3053,32 @@ class EnergyRouteClientTests(unittest.TestCase):
         self.assertEqual(response.get_json()["floor_area_source"], "manual")
         self.assertEqual(calculate.call_args.args[0]["geometry"]["floor_area_m2"], 100.0)
 
+    def test_ai_simulate_uses_image_footprint_before_unclosed_rooms(self):
+        recognition = {
+            "schema_version": 1,
+            "model": {"version": self.server.FLOORPLAN_MODEL_VERSION},
+            "image_size": [100, 100],
+            "geometry": {"walls": [], "windows": [], "doors": []},
+            "room_topology": {"status": "no_closed_rooms", "room_count": 0, "rooms": [], "total_area_px2": 0.0},
+            "topology_repair": {"manual_exterior_wall_required": True},
+            "footprint": {"pixels": 400.0},
+        }
+        calculation = {"success": True, "summary": {"total_energy_kwh": 0, "eui": 0, "rating": "A", "rating_label": "test"}}
+        connection = MagicMock()
+        connection.execute.return_value.fetchone.return_value = None
+        with (
+            patch.object(self.server, "HAS_FLOORPLAN_AI", True),
+            patch.object(self.server, "HAS_ENERGY_CALC", True),
+            patch.object(self.server, "_load_recognition_payload", return_value=recognition),
+            patch.object(self.server.energy_calc, "calculate_energy", return_value=calculation) as calculate,
+            patch.object(self.server, "get_db_connection", return_value=connection),
+        ):
+            response = self.client.post("/energy/ai_simulate", json={"report_number": "IMAGE-FOOTPRINT", "scale": 0.1})
+
+        self.assertEqual(response.status_code, 200, response.get_json())
+        self.assertEqual(response.get_json()["floor_area_source"], "image_footprint")
+        self.assertAlmostEqual(calculate.call_args.args[0]["geometry"]["floor_area_m2"], 4.0)
+
     def test_ai_simulate_uses_confirmed_persisted_scale_instead_of_frontend_default(self):
         recognition = {
             "schema_version": 1,

@@ -78,6 +78,11 @@ flowchart LR
 记录的 mIoU：0.787
 ```
 
+图片/扫描 PDF 可在页面中选择 `新图片 ONNX 模型`。其文件
+`floorplan_image_dataset_5000.onnx` 独立存放在 `models/`，通过
+`IMAGE_ONNX_MODEL_PATH` 配置；该模型输入为 `[1, 3, 256, 256]`，训练类别
+`background、wall、door、window` 会在服务端转换为平台既有的门窗顺序。
+
 腾讯云部署回归样例为文化宫 PDF 第 13 页：
 
 ```text
@@ -267,6 +272,7 @@ Gunicorn 只监听 `127.0.0.1:8000`，不要在腾讯云防火墙中开放 8000 
 | `ADMIN_USER` | 后备管理员用户名 |
 | `ADMIN_PASSWORD` | 后备管理员密码；未设置时后备管理员登录不启用 |
 | `ONNX_MODEL_PATH` | 当前使用的 ONNX 模型绝对路径 |
+| `IMAGE_ONNX_MODEL_PATH` | 新图片 ONNX 模型绝对路径 |
 | `UPLOAD_FOLDER` | 上传文件和识别结果根目录 |
 | `DB_PATH` | 用户和报告 SQLite 数据库 |
 | `BUILDING_LIBRARY_DB_PATH` | 建筑材料基础库 |

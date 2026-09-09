@@ -193,6 +193,7 @@ ALLOWED_RASTER = {'pdf', 'png', 'jpg', 'jpeg'}
 # --- App Initialization ---
 app = Flask(__name__, template_folder='templates', static_folder=os.path.join(BASE_DIR, 'static'), static_url_path='/static')
 app.config['UPLOAD_FOLDER'] = os.environ.get('UPLOAD_FOLDER', UPLOAD_FOLDER)
+app.config['SESSION_COOKIE_NAME'] = os.environ.get('SESSION_COOKIE_NAME', 'bim_web_session_v2')
 app.secret_key = os.environ.get('SECRET_KEY') or secrets.token_hex(32)
 
 
@@ -281,7 +282,7 @@ _REPORT_STORAGE_EXCEPTIONS = (
 def login_required(f):
     @wraps(f)
     def decorated_function(*args, **kwargs):
-        if 'logged_in' not in session:
+        if session.get('logged_in') is not True or not session.get('username'):
             return redirect(url_for('login'))
         return f(*args, **kwargs)
     return decorated_function
@@ -795,7 +796,10 @@ def logout():
 @app.route('/')
 def landing():
     """ 公开着陆页 - 包含功能介绍与登录 """
-    return render_template('landing.html', logged_in=('logged_in' in session))
+    return render_template(
+        'landing.html',
+        logged_in=session.get('logged_in') is True and bool(session.get('username')),
+    )
 
 @app.route('/energy')
 @login_required

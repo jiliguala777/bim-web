@@ -59,6 +59,19 @@ class AuthSessionTests(unittest.TestCase):
             self.assertNotIn("username", state)
             self.assertNotIn("is_admin", state)
 
+    def test_energy_and_recognition_require_a_complete_authenticated_session(self):
+        for state in ({}, {"logged_in": False, "username": "alice"}, {"logged_in": True}):
+            with self.subTest(state=state):
+                client = self.server.app.test_client()
+                if state:
+                    with client.session_transaction() as session_state:
+                        session_state.update(state)
+                self.assertEqual(client.get("/energy").status_code, 302)
+                self.assertEqual(client.post("/energy/ai_recognize").status_code, 302)
+
+    def test_deployment_uses_versioned_login_cookie(self):
+        self.assertEqual(self.server.app.config["SESSION_COOKIE_NAME"], "bim_web_session_v2")
+
     def test_registration_rejects_noncanonical_usernames(self):
         for username in (" alice", "alice ", "ａｌｉｃｅ"):
             with self.subTest(username=username):

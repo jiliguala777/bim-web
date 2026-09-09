@@ -47,9 +47,15 @@ FLOORPLAN_MODEL_NAME = 'M2_UNet_ResNet34_DA'
 ONNX_MODEL_PATH = os.environ.get('ONNX_MODEL_PATH', os.path.join(MODELS_DIR, 'M2_pub_plus_user.onnx'))
 FLOORPLAN_MODEL_VERSION = os.path.basename(ONNX_MODEL_PATH)
 FLOORPLAN_MODEL_MIOU = 0.787
+FLOORPLAN_IMAGE_MODEL_NAME = 'DualHeadUNet_dataset_5000'
+IMAGE_ONNX_MODEL_PATH = os.environ.get(
+    'IMAGE_ONNX_MODEL_PATH', os.path.join(MODELS_DIR, 'floorplan_image_dataset_5000.onnx'),
+)
+FLOORPLAN_IMAGE_MODEL_VERSION = os.path.basename(IMAGE_ONNX_MODEL_PATH)
 RECOGNITION_SCHEMA_VERSION = 1
 LEGACY_ONNX_BACKEND = 'legacy_onnx'
 VECTOR_PYTORCH_BACKEND = 'vector_pytorch'
+IMAGE_ONNX_BACKEND = 'image_onnx'
 
 # --- IFC / Benchmark 模块 ---
 try:
@@ -74,6 +80,15 @@ try:
 except Exception as e:
     HAS_FLOORPLAN_AI = False
     print(f"FloorPlan AI not available: {e}")
+
+try:
+    from floorplan_image_onnx import get_image_segmenter
+    _floorplan_image_segmenter = get_image_segmenter(IMAGE_ONNX_MODEL_PATH)
+    HAS_IMAGE_FLOORPLAN_AI = True
+except Exception as e:
+    _floorplan_image_segmenter = None
+    HAS_IMAGE_FLOORPLAN_AI = False
+    print(f"Image FloorPlan AI not available: {e}")
 
 try:
     from vector_platform import VECTOR_BACKEND, VectorPlatformAdapter, VectorPlatformConfig
@@ -2111,7 +2126,9 @@ def _load_recognition_payload(target_dir):
     if payload.get('schema_version') != RECOGNITION_SCHEMA_VERSION:
         return None
     model = payload.get('model') or {}
-    if model.get('backend', LEGACY_ONNX_BACKEND) not in {LEGACY_ONNX_BACKEND, VECTOR_PYTORCH_BACKEND}:
+    if model.get('backend', LEGACY_ONNX_BACKEND) not in {
+        LEGACY_ONNX_BACKEND, VECTOR_PYTORCH_BACKEND, IMAGE_ONNX_BACKEND,
+    }:
         return None
     if not isinstance(model.get('version'), str) or not model.get('version'):
         return None
@@ -3712,12 +3729,14 @@ def ai_recognize():
     try:
         t0 = _time.time()
         model_backend = request.form.get('model_backend', LEGACY_ONNX_BACKEND)
-        if model_backend not in {LEGACY_ONNX_BACKEND, VECTOR_PYTORCH_BACKEND}:
+        if model_backend not in {LEGACY_ONNX_BACKEND, VECTOR_PYTORCH_BACKEND, IMAGE_ONNX_BACKEND}:
             return jsonify({'error': 'Unsupported model backend'}), 400
         if model_backend == LEGACY_ONNX_BACKEND and not HAS_FLOORPLAN_AI:
             return jsonify({'error': 'Legacy ONNX recognition module is not available'}), 501
         if model_backend == VECTOR_PYTORCH_BACKEND and not HAS_VECTOR_FLOORPLAN_AI:
             return jsonify({'error': 'Vector recognition module is not configured'}), 501
+        if model_backend == IMAGE_ONNX_BACKEND and not HAS_IMAGE_FLOORPLAN_AI:
+            return jsonify({'error': 'Image ONNX recognition module is not available'}), 501
         report_number = context.report_number
         target_dir = context.report_dir
 
@@ -3850,7 +3869,10 @@ def ai_recognize():
                     raster_path,
                     page_number=pdf_page_number,
                     poppler_path=_resolve_poppler_path(),
-                    segmenter=_floorplan_segmenter,
+                    segmenter=(
+                        _floorplan_image_segmenter
+                        if model_backend == IMAGE_ONNX_BACKEND else _floorplan_segmenter
+                    ),
                     output_dir=target_dir,
                 )
                 pdf_page_count = prepared_page.page_count
@@ -3997,7 +4019,11 @@ def ai_recognize():
                 'topology_max_gap_px': 12,
                 'topology_min_room_area_px': topology_min_room_area_px,
             }
-        result = _floorplan_segmenter.predict(
+        segmenter = (
+            _floorplan_image_segmenter
+            if model_backend == IMAGE_ONNX_BACKEND else _floorplan_segmenter
+        )
+        result = segmenter.predict(
             img_bgr,
             use_preprocessing=use_preprocessing,
             **predict_kwargs,
@@ -4010,6 +4036,14 @@ def ai_recognize():
         result['crop_bbox_preview_px'] = region_request['crop_bbox_px']
         result['crop_preview_size'] = region_request['preview_size']
         result['vector_cleanup'] = vector_cleanup
+        if model_backend == IMAGE_ONNX_BACKEND:
+            result['model'] = {
+                'backend': IMAGE_ONNX_BACKEND,
+                'name': FLOORPLAN_IMAGE_MODEL_NAME,
+                'version': FLOORPLAN_IMAGE_MODEL_VERSION,
+                'path': IMAGE_ONNX_MODEL_PATH,
+                'classes': ['background', 'wall', 'window', 'door'],
+            }
 
         mask = result['mask']
         overlay = result['overlay']
@@ -4114,13 +4148,14 @@ def ai_recognize():
             'success': True,
             'status': 'success',
             'source': 'AI',
-            'model': FLOORPLAN_MODEL_NAME,
+            'model': result.get('model', {}).get('name', FLOORPLAN_MODEL_NAME),
             'model_info': {
-                'name': FLOORPLAN_MODEL_NAME,
-                'version': FLOORPLAN_MODEL_VERSION,
-                'mIoU': FLOORPLAN_MODEL_MIOU,
+                'backend': result.get('model', {}).get('backend', LEGACY_ONNX_BACKEND),
+                'name': result.get('model', {}).get('name', FLOORPLAN_MODEL_NAME),
+                'version': result.get('model', {}).get('version', FLOORPLAN_MODEL_VERSION),
+                'mIoU': result.get('model', {}).get('mIoU'),
             },
-            'mIoU': FLOORPLAN_MODEL_MIOU,
+            'mIoU': result.get('model', {}).get('mIoU'),
             'elapsed_sec': elapsed,
             'image_size': [w, h],
             'stats': stats,
@@ -4177,6 +4212,12 @@ def ai_status():
             if HAS_VECTOR_FLOORPLAN_AI else None
         ),
     })
+    image_model = _public_ai_model_info({
+        'backend': IMAGE_ONNX_BACKEND,
+        'name': FLOORPLAN_IMAGE_MODEL_NAME,
+        'version': FLOORPLAN_IMAGE_MODEL_VERSION if HAS_IMAGE_FLOORPLAN_AI else None,
+        'classes': ['background', 'wall', 'window', 'door'],
+    })
     backends = {
         LEGACY_ONNX_BACKEND: {
             'available': HAS_FLOORPLAN_AI,
@@ -4188,13 +4229,18 @@ def ai_status():
             'model': vector_model.get('name') if HAS_VECTOR_FLOORPLAN_AI else None,
             'model_version': vector_model.get('version') if HAS_VECTOR_FLOORPLAN_AI else None,
         },
+        IMAGE_ONNX_BACKEND: {
+            'available': HAS_IMAGE_FLOORPLAN_AI,
+            'model': image_model.get('name') if HAS_IMAGE_FLOORPLAN_AI else None,
+            'model_version': image_model.get('version') if HAS_IMAGE_FLOORPLAN_AI else None,
+        },
     }
     active_model = (
         legacy_model if HAS_FLOORPLAN_AI
-        else (vector_model if HAS_VECTOR_FLOORPLAN_AI else {})
+        else (vector_model if HAS_VECTOR_FLOORPLAN_AI else (image_model if HAS_IMAGE_FLOORPLAN_AI else {}))
     )
     return jsonify({
-        'available': HAS_FLOORPLAN_AI or HAS_VECTOR_FLOORPLAN_AI,
+        'available': HAS_FLOORPLAN_AI or HAS_IMAGE_FLOORPLAN_AI or HAS_VECTOR_FLOORPLAN_AI,
         'model': active_model.get('name') if active_model else None,
         'model_version': active_model.get('version') if active_model else None,
         'mIoU': FLOORPLAN_MODEL_MIOU if HAS_FLOORPLAN_AI else None,

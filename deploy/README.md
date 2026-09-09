@@ -5,10 +5,12 @@
 和 Poppler 24.02。第一阶段通过公网 IP 的 HTTP 端口访问；域名和 HTTPS
 需要后续单独配置。
 
-模型不进入 GitHub。`M2_pub_plus_user.onnx` 必须单独上传并存放在：
+模型不进入 GitHub。旧模型 `M2_pub_plus_user.onnx` 与图片模型
+`floorplan_image_dataset_5000.onnx` 必须单独上传并存放在：
 
 ```text
 /opt/bim-web/models/M2_pub_plus_user.onnx
+/opt/bim-web/models/floorplan_image_dataset_5000.onnx
 ```
 
 服务器目录：
@@ -226,6 +228,7 @@ python3 -c "import secrets; print(secrets.token_hex(32))"
 
 ```dotenv
 ONNX_MODEL_PATH=/opt/bim-web/models/M2_pub_plus_user.onnx
+IMAGE_ONNX_MODEL_PATH=/opt/bim-web/models/floorplan_image_dataset_5000.onnx
 UPLOAD_FOLDER=/var/lib/bim-web/uploads
 DB_PATH=/var/lib/bim-web/users.db
 BUILDING_LIBRARY_DB_PATH=/opt/bim-web/app/data/building_library.db

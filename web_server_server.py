@@ -4180,6 +4180,7 @@ def ai_recognize():
             'crop_preview_size': result['crop_preview_size'],
             'vector_cleanup': vector_cleanup,
             'topology_repair': result.get('topology_repair') or {},
+            'footprint': recognition_payload.get('footprint'),
             'pixel_lengths': {
                 'wall_px': round(wall_total_length, 1),
                 'window_px': round(win_total_length, 1),
@@ -4358,7 +4359,7 @@ def ai_simulate():
         )
         report_number = context.report_number
         target_dir = context.report_dir
-        if not (HAS_FLOORPLAN_AI or HAS_VECTOR_FLOORPLAN_AI):
+        if not (HAS_FLOORPLAN_AI or HAS_IMAGE_FLOORPLAN_AI or HAS_VECTOR_FLOORPLAN_AI):
             return jsonify({'error': 'AI module not available'}), 501
         scale = float(data.get('scale', 0.01))  # 默认 1px = 1cm
         height = float(data.get('height', 3.0))

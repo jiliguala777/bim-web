@@ -36,7 +36,12 @@ def remap_element_classes(training_mask):
 def footprint_mask_from_logits(logits, output_size):
     """Restore the binary footprint head to source-image coordinates."""
     probability = 1.0 / (1.0 + np.exp(-np.asarray(logits, dtype=np.float32)[0, 0]))
-    return (cv2.resize(probability, output_size, interpolation=cv2.INTER_LINEAR) >= 0.5).astype(np.uint8)
+    mask = (cv2.resize(probability, output_size, interpolation=cv2.INTER_LINEAR) >= 0.5).astype(np.uint8)
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    result = np.zeros_like(mask)
+    if contours:
+        cv2.drawContours(result, [max(contours, key=cv2.contourArea)], -1, 1, thickness=cv2.FILLED)
+    return result
 
 
 class FloorplanImageSegmenterONNX(FloorplanSegmenterONNX):

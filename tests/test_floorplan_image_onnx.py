@@ -32,9 +32,20 @@ class FloorplanImageOnnxTests(unittest.TestCase):
 
         self.assertEqual(platform_mask.tolist(), [[0, 1, 3, 2]])
 
-    def test_footprint_logits_produce_a_binary_building_mask(self):
-        logits = np.array([[[[-2, 2], [2, -2]]]], dtype=np.float32)
-        self.assertEqual(footprint_mask_from_logits(logits, (2, 2)).tolist(), [[0, 1], [1, 0]])
+    def test_footprint_logits_keep_the_largest_outer_footprint_and_fill_its_holes(self):
+        logits = np.full((1, 1, 5, 5), -2, dtype=np.float32)
+        logits[0, 0, 1:4, 1] = 2
+        logits[0, 0, 1:4, 3] = 2
+        logits[0, 0, 1, 1:4] = 2
+        logits[0, 0, 3, 1:4] = 2
+
+        self.assertEqual(footprint_mask_from_logits(logits, (5, 5)).tolist(), [
+            [0, 0, 0, 0, 0],
+            [0, 1, 1, 1, 0],
+            [0, 1, 1, 1, 0],
+            [0, 1, 1, 1, 0],
+            [0, 0, 0, 0, 0],
+        ])
 
 
 class FloorplanImageOnnxRouteTests(unittest.TestCase):

@@ -18,6 +18,13 @@ from energy_report_storage import user_storage_key
 
 
 class EnergyTemplateTests(unittest.TestCase):
+    def test_all_dropdown_options_use_dark_background(self):
+        html = Path("templates/energy.html").read_text(encoding="utf-8")
+
+        self.assertIn("select.form-control option", html)
+        self.assertIn("background: #111;", html)
+        self.assertNotIn("#library-exterior-wall option", html)
+
     def test_recognition_ui_uses_closed_room_area_instead_of_image_rectangle_guess(self):
         html = Path("templates/energy.html").read_text(encoding="utf-8")
 

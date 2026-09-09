@@ -373,6 +373,14 @@
 
         select.form-control {
             cursor: pointer;
+            color: #fff;
+            background: #111;
+            color-scheme: dark;
+        }
+
+        select.form-control option {
+            color: #fff;
+            background: #111;
         }
 
         .btn {
@@ -822,26 +830,6 @@
             transform: translateY(-2px);
         }
 
-        #library-exterior-wall option,
-        #library-wall-insulation option,
-        #library-window-u option,
-        #library-roof-u option,
-        #library-floor-u option,
-        #library-window-shgc option,
-        #library-curtain-shading option,
-        #library-door-u option,
-        #library-floor-contact-type option,
-        #library-window-air-tightness option,
-        #modal-wall-base option,
-        #modal-wall-insulation option,
-        #modal-window-u-library option,
-        #modal-window-shgc-library option,
-        #modal-window-shading option,
-        #modal-window-air-tightness option,
-        #modal-door-u-library option {
-            color: #111;
-            background: #fff;
-        }
     </style>
 </head>
 <body data-is-administrator="{{ (session.get('is_admin') is true)|tojson }}">

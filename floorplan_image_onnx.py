@@ -77,8 +77,6 @@ class FloorplanImageSegmenterONNX(FloorplanSegmenterONNX):
         roi = cv2.dilate(footprint, np.ones((9, 9), dtype=np.uint8))
         prediction = probabilities.argmax(axis=0).astype(np.uint8)
         prediction[roi == 0] = 0
-        boundary = cv2.morphologyEx(footprint, cv2.MORPH_GRADIENT, np.ones((5, 5), dtype=np.uint8))
-        prediction[(prediction == 0) & (boundary > 0)] = 1
         return prediction, probabilities, {"footprint_mask": footprint}
 
     def predict(self, image_input, use_preprocessing=False, **kwargs):

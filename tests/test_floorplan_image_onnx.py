@@ -10,7 +10,12 @@ import cv2
 import numpy as np
 
 from energy_report_storage import user_storage_key
-from floorplan_image_onnx import prepare_image_tensor, remap_element_classes, footprint_mask_from_logits
+from floorplan_image_onnx import (
+    exterior_element_lengths,
+    footprint_mask_from_logits,
+    prepare_image_tensor,
+    remap_element_classes,
+)
 
 
 class FloorplanImageOnnxTests(unittest.TestCase):
@@ -46,6 +51,20 @@ class FloorplanImageOnnxTests(unittest.TestCase):
             [0, 1, 1, 1, 0],
             [0, 0, 0, 0, 0],
         ])
+
+    def test_exterior_element_lengths_ignores_internal_walls_and_groups_page_sides(self):
+        footprint = np.zeros((100, 100), dtype=np.uint8)
+        footprint[10:90, 10:90] = 1
+        mask = np.zeros_like(footprint)
+        mask[10:13, 20:80] = 1
+        mask[40:43, 25:75] = 1
+        mask[30:70, 87:90] = 2
+
+        lengths = exterior_element_lengths(mask, footprint, boundary_band_px=5)
+
+        self.assertEqual(lengths["top"]["wall_px"], 60.0)
+        self.assertEqual(lengths["right"]["window_px"], 40.0)
+        self.assertEqual(lengths["bottom"]["wall_px"], 0.0)
 
 
 class FloorplanImageOnnxRouteTests(unittest.TestCase):

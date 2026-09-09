@@ -1772,7 +1772,7 @@
                 if (event.key === 'Escape') closeRecognitionImageModal();
             });
             setupScaleCalibrationCanvas();
-            ['param-orientation', 'param-height', 'param-window-height'].forEach(id => {
+            ['param-orientation', 'param-height', 'param-window-height', 'param-door-height'].forEach(id => {
                 document.getElementById(id).addEventListener('change', applyImageExteriorAreas);
             });
             updateCalculationScopeControls();
@@ -2479,7 +2479,8 @@
             const scale = Number(document.getElementById('param-scale').value);
             const wallHeight = Number(document.getElementById('param-height').value);
             const windowHeight = Number(document.getElementById('param-window-height').value);
-            if (!exterior || !Number.isFinite(scale) || scale <= 0 || !Number.isFinite(wallHeight) || wallHeight <= 0 || !Number.isFinite(windowHeight) || windowHeight <= 0) return false;
+            const doorHeight = Number(document.getElementById('param-door-height').value);
+            if (!exterior || !Number.isFinite(scale) || scale <= 0 || !Number.isFinite(wallHeight) || wallHeight <= 0 || !Number.isFinite(windowHeight) || windowHeight <= 0 || !Number.isFinite(doorHeight) || doorHeight <= 0) return false;
             const pageSides = ['top', 'right', 'bottom', 'left'];
             const compass = ['north', 'east', 'south', 'west'];
             const topIndex = compass.indexOf(document.getElementById('param-orientation').value);
@@ -2488,6 +2489,7 @@
                 const lengths = exterior[side] || {};
                 detailedEnvelope.walls_by_orientation[direction].area_m2 = Number(lengths.wall_px || 0) * scale * wallHeight;
                 detailedEnvelope.windows_by_orientation[direction].area_m2 = Number(lengths.window_px || 0) * scale * windowHeight;
+                detailedEnvelope.windows_by_orientation[direction].door_area_m2 = Number(lengths.door_px || 0) * scale * doorHeight;
             });
             renderDetailedOrientationCards();
             return true;

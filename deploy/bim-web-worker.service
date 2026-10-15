@@ -1,0 +1,19 @@
+[Unit]
+Description=BIM Web RQ Simulation Worker
+After=network-online.target redis-server.service
+
+[Service]
+Type=simple
+User=bimweb
+Group=bimweb
+WorkingDirectory=/opt/bim-web/app
+EnvironmentFile=/etc/bim-web/bim-web.env
+Environment=BIM_WEB_ENV=production
+ExecStart=/opt/bim-web/venv/bin/python -m simulation_worker
+Restart=on-failure
+RestartSec=5
+PrivateTmp=true
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

@@ -6,7 +6,8 @@ BIM 网页服务端：建筑平面图 AI 识别结果的可视化与能耗仿真
 
 ```powershell
 $env:ADMIN_USER="admin"; $env:ADMIN_PASSWORD="你的密码"; $env:SECRET_KEY="随机串"
-pip install flask werkzeug
+$env:BIM_WEB_ENV="development" # 本地开发；生产需要固定的至少 32 字符密钥和 HTTPS
+pip install --require-hashes -r requirements.lock
 python web_server_server.py   # 默认 http://localhost:5000
 ```
 

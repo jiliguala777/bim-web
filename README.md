@@ -1,6 +1,8 @@
 # BIM Web：建筑平面图识别与能耗计算平台
 
-**在线体验：[BIM 建筑平面图识别与能耗计算平台](http://43.159.58.82/energy)**
+> 安全整改：生产部署必须使用 HTTPS。原 HTTP 演示地址暂不推荐登录使用；
+> 完成证书和服务器验收后再恢复在线入口。
+> [文档索引](docs/README.md) · [模型交付限制](docs/models.md) · [安全部署](docs/deployment-security.md)
 
 BIM Web 是一个基于 Flask 的建筑平面图 AI 识别、建筑参数配置、设计冷热负荷
 和年度能耗估算平台。它把多页 PDF 图纸、ONNX 语义分割、矢量 PDF 辅助处理、
@@ -301,6 +303,18 @@ Gunicorn 只监听 `127.0.0.1:8000`，不要在腾讯云防火墙中开放 8000 
 
 不要把真实值写入 `.env.example`、README、代码或 Git 提交。
 
+### 运维接口权限
+
+所有 `/ops/*` 接口仅允许已登录的管理员访问，包括健康详情、系统指标、日志、
+模型基准测试和 BESTEST 夹具生成。使用 `ADMIN_USER` / `ADMIN_PASSWORD` 配置的
+后备管理员通过 `/login` 登录后，调用方需携带服务返回的会话 Cookie。
+普通注册账号不具有管理员权限。
+
+未登录或会话不完整时返回 JSON `401`；已登录但不是管理员时返回 JSON `403`。
+鉴权失败时不会读取日志、采集系统指标或运行基准测试。现有监控程序若调用这些
+接口，需要先完成管理员登录；公开的 `/health` 只返回存活状态和时间戳，适合
+无需登录的存活检查。管理员通过鉴权后，缺失的可选 benchmark 模块仍返回 `501`。
+
 ## 8. Windows 本地开发
 
 ### 8.1 前置条件
@@ -320,8 +334,8 @@ Gunicorn 只监听 `127.0.0.1:8000`，不要在腾讯云防火墙中开放 8000 
 .\setup_venv.ps1
 ```
 
-脚本会创建 `.venv`，安装 `requirements.txt`，应用
-`requirements-runtime-constraints.txt`，最后运行 `pip check`。
+脚本会创建 `.venv`，使用 `requirements.lock` 的固定版本与 SHA-256 安装依赖，
+最后运行 `pip check`。`requirements.txt` 和约束文件用于更新锁文件，不作为生产安装入口。
 
 如果需要指定基础 Python：
 
@@ -334,6 +348,7 @@ $env:BIM_WEB_BASE_PYTHON="C:\Path\To\Python312\python.exe"
 
 ```powershell
 $env:ADMIN_USER="admin"
+$env:BIM_WEB_ENV="development"
 $env:ADMIN_PASSWORD="仅用于本地的强密码"
 $env:SECRET_KEY="本地随机字符串"
 $env:ONNX_MODEL_PATH=(Resolve-Path ".\models\M2_pub_plus_user.onnx").Path
@@ -680,22 +695,22 @@ journalctl -u bim-web -f
 systemd 以 `bimweb` 用户启动 Gunicorn：
 
 ```text
-1 worker
+2 workers
 2 threads
 gthread worker class
 300 秒超时
 127.0.0.1:8000
 ```
 
-服务器只有 2 核、约 3.6 GiB 内存，当前配置避免多个 worker 重复加载 ONNX
-模型造成过高内存占用。
+服务模板现为 2 worker × 2 threads；每个 worker 独立加载模型。约 3.6 GiB
+内存的部署需实测峰值占用，必要时减为 1 worker 并将计算放到独立 RQ worker。
 
 ### Nginx
 
 Nginx 负责公网入口、上传大小限制和反向代理。当前模板：
 
 ```text
-client_max_body_size 200m
+client_max_body_size 20m
 proxy_read_timeout 300s
 ```
 

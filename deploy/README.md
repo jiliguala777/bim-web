@@ -1,5 +1,10 @@
 # BIM Web：Ubuntu 24.04 部署指南
 
+> 2026-10-15 安全更新：公网生产必须启用 HTTPS；下面旧 IP/HTTP 步骤仅限
+> 初始连通性检查。正式登录前完成 [安全部署与队列配置](../docs/deployment-security.md)。
+> 依赖使用 `python -m pip install --require-hashes -r requirements.lock`。
+> 生产进程需要固定、至少 32 字符的 SECRET_KEY；Web 与队列 worker 共享它。
+
 本指南用于将私人 GitHub 中的 BIM Web 代码部署到腾讯云 Ubuntu 24.04
 轻量应用服务器。当前生产基线为 Ubuntu 24.04、Python 3.12、Nginx 1.24
 和 Poppler 24.02。第一阶段通过公网 IP 的 HTTP 端口访问；域名和 HTTPS
@@ -157,8 +162,7 @@ runuser -u bimweb -- git -C /opt/bim-web/app <Git 子命令>
 sudo -u bimweb python3 -m venv /opt/bim-web/venv
 sudo -u bimweb /opt/bim-web/venv/bin/pip install --upgrade pip
 sudo -u bimweb /opt/bim-web/venv/bin/pip install \
-  -r /opt/bim-web/app/requirements.txt \
-  -c /opt/bim-web/app/requirements-runtime-constraints.txt
+  --require-hashes -r /opt/bim-web/app/requirements.lock
 ```
 
 验证关键依赖：
@@ -389,8 +393,7 @@ sudo tail -n 100 /var/log/nginx/error.log
    runuser -u bimweb -- git -C /opt/bim-web/app fetch origin main
    runuser -u bimweb -- git -C /opt/bim-web/app pull --ff-only origin main
    runuser -u bimweb -- /opt/bim-web/venv/bin/pip install \
-     -r /opt/bim-web/app/requirements.txt \
-     -c /opt/bim-web/app/requirements-runtime-constraints.txt
+     --require-hashes -r /opt/bim-web/app/requirements.lock
    ```
 
 3. 在服务仍停止时，先运行源审计和部署资产测试，再运行只读平面目录预检。预检从

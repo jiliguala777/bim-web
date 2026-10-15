@@ -40,6 +40,10 @@ function Invoke-Python {
 }
 
 $BasePython = Find-BasePython
+& $BasePython -c 'import sys; sys.exit(0 if sys.version_info[:2] == (3, 12) else 1)'
+if ($LASTEXITCODE -ne 0) {
+    throw 'This runtime requires Python 3.12. Select it with BIM_WEB_BASE_PYTHON.'
+}
 Write-Host "Using base Python: $BasePython"
 
 $VenvUsable = $false
@@ -66,5 +70,5 @@ if (-not $VenvUsable) {
 }
 
 Invoke-Python $VenvPython -m pip install --upgrade pip
-Invoke-Python $VenvPython -m pip install -r (Join-Path $ProjectRoot 'requirements.txt') -c (Join-Path $ProjectRoot 'requirements-runtime-constraints.txt')
+Invoke-Python $VenvPython -m pip install --require-hashes -r (Join-Path $ProjectRoot 'requirements.lock')
 Invoke-Python $VenvPython -m pip check

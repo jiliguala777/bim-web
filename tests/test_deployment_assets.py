@@ -78,7 +78,7 @@ class DeploymentAssetTests(unittest.TestCase):
             "WorkingDirectory=/opt/bim-web/app",
             "EnvironmentFile=/etc/bim-web/bim-web.env",
             "/opt/bim-web/venv/bin/gunicorn",
-            "--workers 1",
+            "--workers 2",
             "--threads 2",
             "--worker-class gthread",
             "--timeout 300",
@@ -93,7 +93,7 @@ class DeploymentAssetTests(unittest.TestCase):
         for expected in (
             "listen 80 default_server;",
             "server_name _;",
-            "client_max_body_size 200m;",
+            "client_max_body_size 20m;",
             "proxy_pass http://127.0.0.1:8000;",
             "proxy_read_timeout 300s;",
             "proxy_send_timeout 300s;",
@@ -132,7 +132,7 @@ class DeploymentAssetTests(unittest.TestCase):
         self.assertNotIn(".gemini/antigravity", guide)
 
     def test_first_upload_checklist_blocks_old_history_and_sensitive_data(self):
-        checklist = self.read("docs/GitHub首次上传清单_2026-07-27.md")
+        checklist = self.read("docs/archive/GitHub首次上传清单_2026-07-27.md")
         for expected in (
             "Private",
             "不要直接推送当前旧历史",

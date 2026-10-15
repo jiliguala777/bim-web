@@ -13,7 +13,7 @@ from energy_report_storage import user_storage_key
 class AuthSessionTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        import web_server_server
+        from tests.server_fixture import server as web_server_server
 
         cls.server = web_server_server
         cls.server.app.config.update(TESTING=True, SECRET_KEY="energy-report-ownership-test")
@@ -54,7 +54,7 @@ class AuthSessionTests(unittest.TestCase):
     def test_logout_clears_all_identity_state(self):
         with self.client.session_transaction() as state:
             state.update(logged_in=True, username="admin", is_admin=True)
-        self.client.get("/logout")
+        self.client.post("/logout")
         with self.client.session_transaction() as state:
             self.assertNotIn("username", state)
             self.assertNotIn("is_admin", state)
@@ -77,7 +77,7 @@ class AuthSessionTests(unittest.TestCase):
             with self.subTest(username=username):
                 response = self.client.post(
                     "/register",
-                    json={"username": username, "password": "pw"},
+                    json={"username": username, "password": "Good-pass-123"},
                 )
                 self.assertEqual(response.status_code, 400, response.get_json())
 
@@ -98,7 +98,7 @@ class AuthSessionTests(unittest.TestCase):
 
         response = self.client.post(
             "/register",
-            json={"username": "alice", "password": "pw"},
+            json={"username": "alice", "password": "Good-pass-123"},
         )
 
         self.assertEqual(response.status_code, 400, response.get_json())
@@ -117,7 +117,7 @@ class AuthSessionTests(unittest.TestCase):
         ):
             response = self.client.post(
                 "/register",
-                json={"username": "alice", "password": "pw"},
+                json={"username": "alice", "password": "Good-pass-123"},
             )
 
         self.assertEqual(response.status_code, 400, response.get_json())
@@ -131,7 +131,7 @@ class AuthSessionTests(unittest.TestCase):
 class ReportSchemaMigrationTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        import web_server_server
+        from tests.server_fixture import server as web_server_server
 
         cls.server = web_server_server
 
@@ -325,7 +325,7 @@ class ReportSchemaMigrationTests(unittest.TestCase):
 class ReportOwnershipHelperTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        import web_server_server
+        from tests.server_fixture import server as web_server_server
 
         cls.server = web_server_server
 
@@ -384,7 +384,7 @@ class ReportOwnershipHelperTests(unittest.TestCase):
 class PdfOwnerBindingTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        import web_server_server
+        from tests.server_fixture import server as web_server_server
 
         cls.server = web_server_server
         cls.server.app.config.update(TESTING=True, SECRET_KEY="pdf-owner-binding-test")
@@ -775,7 +775,7 @@ class PdfOwnerBindingTests(unittest.TestCase):
             "created",
         )
 
-    def test_ai_recognition_failure_updates_only_the_authenticated_report_owner(self):
+    def test_invalid_backend_does_not_change_existing_report_status(self):
         self.server._upsert_report_status("alice", "BIM-FAIL-STATUS", "created")
         self.server._upsert_report_status("bob", "BIM-FAIL-STATUS", "created")
         self.login_as("alice")
@@ -791,14 +791,14 @@ class PdfOwnerBindingTests(unittest.TestCase):
         self.assertEqual(response.status_code, 400, response.get_json())
         self.assertEqual(
             self.server._report_row("alice", "BIM-FAIL-STATUS")["status"],
-            "failed",
+            "created",
         )
         self.assertEqual(
             self.server._report_row("bob", "BIM-FAIL-STATUS")["status"],
             "created",
         )
 
-    def test_ai_recognition_records_a_new_owner_report_before_processing(self):
+    def test_invalid_backend_does_not_create_a_new_report(self):
         self.login_as("alice")
 
         response = self.client.post(
@@ -811,15 +811,14 @@ class PdfOwnerBindingTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 400, response.get_json())
         alice_report = self.server._report_row("alice", "BIM-NEW-RECOGNITION")
-        self.assertIsNotNone(alice_report)
-        self.assertEqual(alice_report["status"], "failed")
+        self.assertIsNone(alice_report)
         self.assertIsNone(self.server._report_row("bob", "BIM-NEW-RECOGNITION"))
 
 
 class ReportOperationAuthorizationTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        import web_server_server
+        from tests.server_fixture import server as web_server_server
 
         cls.server = web_server_server
         cls.server.app.config.update(TESTING=True, SECRET_KEY="report-operation-authorization-test")
@@ -1209,7 +1208,7 @@ class ReportOperationAuthorizationTests(unittest.TestCase):
 class ReportUploadIsolationTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        import web_server_server
+        from tests.server_fixture import server as web_server_server
 
         cls.server = web_server_server
         cls.server.app.config.update(TESTING=True, SECRET_KEY="energy-report-upload-isolation-test")
@@ -1937,7 +1936,7 @@ class ReportUploadIsolationTests(unittest.TestCase):
 
         fake_thread = MagicMock()
         with (
-            patch.object(self.server.threading, "Thread", return_value=fake_thread) as thread_factory,
+            patch.object(self.server.task_dispatcher, "submit", return_value=fake_thread) as submit,
             patch.object(self.server, "simulation_jobs") as jobs,
         ):
             response = self.client.post(
@@ -1946,11 +1945,11 @@ class ReportUploadIsolationTests(unittest.TestCase):
             )
 
         self.assertEqual(response.status_code, 200, response.get_json())
-        worker_payload = thread_factory.call_args.kwargs["args"][1]
+        worker_payload = submit.call_args.args[2]
         self.assertEqual(worker_payload["owner_username"], "alice")
         self.assertEqual(worker_payload["report_number"], "BIM-CALC")
         jobs.set.assert_called_once()
-        fake_thread.start.assert_called_once_with()
+        self.assertEqual(submit.call_args.args[0], "simple")
 
     def test_calculation_start_marks_only_the_selected_composite_report(self):
         self.login_as("alice")
@@ -1965,7 +1964,8 @@ class ReportUploadIsolationTests(unittest.TestCase):
                 self.server._upsert_report_status("bob", report_number, "uploaded")
                 fake_thread = MagicMock()
                 with (
-                    patch.object(self.server.threading, "Thread", return_value=fake_thread),
+                    patch.object(self.server.task_dispatcher, "submit", return_value=fake_thread),
+                    patch.object(self.server, "energyplus_engine", MagicMock()),
                     patch.object(self.server, "simulation_jobs"),
                 ):
                     response = self.client.post(
@@ -2106,7 +2106,7 @@ class ReportUploadIsolationTests(unittest.TestCase):
         self.assertEqual(stored.read_bytes(), b"IFC")
 
     def test_benchmark_fixtures_are_stored_outside_user_report_directories(self):
-        self.login_as("alice")
+        self.login_as("admin", is_admin=True)
 
         with (
             patch.object(self.server, "HAS_BENCHMARK", True),

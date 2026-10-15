@@ -1,0 +1,12 @@
+<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><title>退出登录</title><link rel="stylesheet" href="/static/style.css"></head>
+<body>
+    <form method="post" action="/logout">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        <p>是否退出当前账号？</p>
+        <button type="submit">退出登录</button>
+        <a href="/">返回首页</a>
+    </form>
+</body>
+</html>

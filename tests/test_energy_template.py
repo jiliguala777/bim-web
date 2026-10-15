@@ -1179,7 +1179,7 @@ class EnergyRouteClientTests(unittest.TestCase):
                 )
             )
             render_preview.assert_called_once_with(
-                stored_pdf,
+                stored_pdf.resolve(),
                 2,
                 2,
                 "C:\\poppler\\bin",

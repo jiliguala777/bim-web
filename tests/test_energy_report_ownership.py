@@ -2065,7 +2065,7 @@ class ReportUploadIsolationTests(unittest.TestCase):
         fake_document.modelspace.return_value = []
 
         def readfile(path):
-            self.assertEqual(Path(path), report_dir / "building_plan.dxf")
+            self.assertTrue(Path(path).samefile(report_dir / "building_plan.dxf"))
             return fake_document
 
         with patch.object(self.server, "ezdxf", create=True) as ezdxf:

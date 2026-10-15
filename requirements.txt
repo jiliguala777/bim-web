@@ -1,5 +1,8 @@
 flask
 werkzeug
+Flask-WTF>=1.2,<2
+rq>=2,<3
+redis>=6,<7
 numpy
 psutil
 opencv-python-headless

@@ -164,6 +164,10 @@ class VectorProbabilityRunnerTests(unittest.TestCase):
                 device="cpu",
                 timeout_seconds=12.0,
             )
+            # Preserve executable aliases (including venv links); resolve the cwd
+            # while it exists so Windows can expand any 8.3 parent-directory alias.
+            expected_python = str(python_executable.absolute())
+            expected_cwd = training_root.resolve()
 
             def fake_run(command, **kwargs):
                 output = Path(command[command.index("--output") + 1])
@@ -191,10 +195,10 @@ class VectorProbabilityRunnerTests(unittest.TestCase):
         command = invoked.call_args.args[0]
         self.assertEqual(
             command[:3],
-            [str(python_executable.resolve()), "-m", "training.predict_vector"],
+            [expected_python, "-m", "training.predict_vector"],
         )
         self.assertEqual(command[command.index("--device") + 1], "cpu")
-        self.assertEqual(invoked.call_args.kwargs["cwd"], training_root.resolve())
+        self.assertEqual(invoked.call_args.kwargs["cwd"], expected_cwd)
         self.assertEqual(invoked.call_args.kwargs["timeout"], 12.0)
         self.assertNotIn("shell", invoked.call_args.kwargs)
         self.assertEqual(result.probabilities.shape, (10, 20, 30))

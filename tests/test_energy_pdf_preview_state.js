@@ -7,7 +7,10 @@ const recognitionState = require(
   "../static/energy/pdf_recognition_state.js"
 );
 
-const html = fs.readFileSync("templates/energy.html", "utf8");
+const html = fs.readFileSync("templates/energy.html", "utf8").replace(
+  '<script src="/static/energy/app.js"></script>',
+  '<script>\n' + fs.readFileSync("static/energy/app.js", "utf8") + '</script>'
+);
 const prepareFunctionMatch = html.match(
   /function pdfPrepareSessionMatchesCurrent\([\s\S]*?\n        \}/
 );

@@ -2,6 +2,8 @@
 <html lang="zh-CN">
 <head>
     <meta charset="utf-8">
+    <meta name="csrf-token" content="{{ csrf_token() }}">
+    <script src="/static/security.js"></script>
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Register - BIM Web</title>
     <link rel="stylesheet" href="/static/style.css">
@@ -19,7 +21,7 @@
     <form id="registerForm">
         <h1>注册</h1>
         <input name="username" autocomplete="username" placeholder="用户名" required>
-        <input name="password" type="password" autocomplete="new-password" placeholder="密码" required>
+        <input name="password" type="password" autocomplete="new-password" placeholder="8–128 位，包含字母和数字或符号" minlength="8" maxlength="128" required>
         <button type="submit">注册</button>
         <div class="msg" id="msg"></div>
         <a href="/login">返回登录</a>

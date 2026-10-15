@@ -1,4 +1,5 @@
 import unittest
+from tests.source_assets import energy_page_source, server_source
 from pathlib import Path
 import base64
 import re
@@ -19,7 +20,7 @@ from energy_report_storage import user_storage_key
 
 class EnergyTemplateTests(unittest.TestCase):
     def test_only_expanded_dropdown_options_use_dark_background(self):
-        html = Path("templates/energy.html").read_text(encoding="utf-8")
+        html = energy_page_source()
         select_style = re.search(r"select\.form-control\s*\{([^}]*)\}", html).group(1)
         option_style = re.search(r"select\.form-control option\s*\{([^}]*)\}", html).group(1)
 
@@ -30,7 +31,7 @@ class EnergyTemplateTests(unittest.TestCase):
         self.assertNotIn("#library-exterior-wall option", html)
 
     def test_recognition_ui_uses_closed_room_area_instead_of_image_rectangle_guess(self):
-        html = Path("templates/energy.html").read_text(encoding="utf-8")
+        html = energy_page_source()
 
         self.assertIn('id="room-closure-summary"', html)
         self.assertIn("totalAreaPx2 * scale * scale", html)
@@ -47,7 +48,7 @@ class EnergyTemplateTests(unittest.TestCase):
         self.assertNotIn("外轮廓无法由唯一一条直线自动闭合", html)
 
     def test_scale_ui_uses_auto_result_and_supports_manual_two_point_fallback(self):
-        html = Path("templates/energy.html").read_text(encoding="utf-8")
+        html = energy_page_source()
 
         self.assertIn('id="scale-calibration-canvas"', html)
         self.assertIn('id="scale-calibration-panel"', html)
@@ -60,7 +61,7 @@ class EnergyTemplateTests(unittest.TestCase):
         self.assertNotIn("const scale = 0.05;", html)
 
     def test_manual_scale_canvas_resizes_after_becoming_visible(self):
-        html = Path("templates/energy.html").read_text(encoding="utf-8")
+        html = energy_page_source()
         start_body = re.search(
             r"function startManualScaleCalibration\(\) \{(?P<body>.*?)\n        \}",
             html,
@@ -78,7 +79,7 @@ class EnergyTemplateTests(unittest.TestCase):
         )
 
     def test_approved_onnx_model_is_the_default(self):
-        server = Path("web_server_server.py").read_text(encoding="utf-8")
+        server = server_source()
         segmenter = Path("floorplan_onnx.py").read_text(encoding="utf-8")
 
         self.assertIn("os.environ.get('ONNX_MODEL_PATH'", server)
@@ -91,7 +92,7 @@ class EnergyTemplateTests(unittest.TestCase):
         self.assertNotIn("M2_DA_best.onnx", segmenter)
 
     def test_detailed_wall_modal_combines_base_and_insulation_u_values(self):
-        html = Path("templates/energy.html").read_text(encoding="utf-8")
+        html = energy_page_source()
 
         self.assertIn("function updateModalCombinedWallU", html)
         self.assertIn("applyModalWallBase", html)
@@ -103,7 +104,7 @@ class EnergyTemplateTests(unittest.TestCase):
         self.assertIn("(thicknessMm / 1000) / lambdaValue", html)
 
     def test_detailed_boundary_controls_default_off_and_multipage_pdf_notice_exists(self):
-        html = Path("templates/energy.html").read_text(encoding="utf-8")
+        html = energy_page_source()
 
         self.assertIn('type="checkbox" id="include-roof"', html)
         self.assertIn('type="checkbox" id="include-floor"', html)
@@ -115,7 +116,7 @@ class EnergyTemplateTests(unittest.TestCase):
         self.assertIn("多页 PDF 可在上传后选择需要识别的楼层页", html)
 
     def test_multipage_pdf_ui_prepares_once_then_recognizes_selected_page(self):
-        html = Path("templates/energy.html").read_text(encoding="utf-8")
+        html = energy_page_source()
 
         self.assertIn('id="pdf-page-selection"', html)
         self.assertIn('id="pdf-page-select"', html)
@@ -127,7 +128,7 @@ class EnergyTemplateTests(unittest.TestCase):
         self.assertIn("fd.append('pdf_page_number', document.getElementById('pdf-page-select').value)", html)
 
     def test_pdf_region_recognition_ui_exposes_preview_modes_and_crop_controls(self):
-        html = Path("templates/energy.html").read_text(encoding="utf-8")
+        html = energy_page_source()
 
         for element_id in [
             "pdf-recognition-mode-full",
@@ -142,7 +143,7 @@ class EnergyTemplateTests(unittest.TestCase):
         self.assertIn('<script src="/energy/crop_region.js">', html)
 
     def test_vector_raster_ui_exposes_an_independent_crop_preview(self):
-        html = Path("templates/energy.html").read_text(encoding="utf-8")
+        html = energy_page_source()
 
         for element_id in [
             "vector-raster-selection",
@@ -159,7 +160,7 @@ class EnergyTemplateTests(unittest.TestCase):
         self.assertIn("vectorRasterRecognitionMode", html)
 
     def test_vector_pdf_backend_waits_only_for_two_point_scale(self):
-        html = Path("templates/energy.html").read_text(encoding="utf-8")
+        html = energy_page_source()
 
         self.assertIn("新矢量模型（矢量 PDF/图片试验版）", html)
         self.assertIn("const vectorPdfFusion = Boolean(!file && preparedPdf && vectorBackend);", html)
@@ -169,7 +170,7 @@ class EnergyTemplateTests(unittest.TestCase):
         self.assertIn("请在原图上选择两个点并保存比例尺", html)
 
     def test_vector_pdf_page_has_no_separate_exterior_review_step(self):
-        html = Path("templates/energy.html").read_text(encoding="utf-8")
+        html = energy_page_source()
 
         self.assertIn("pendingExteriorFusion", html)
         self.assertIn("/energy/vector_pdf_exterior_confirm", html)
@@ -186,14 +187,14 @@ class EnergyTemplateTests(unittest.TestCase):
         self.assertIn("aiResultData = data.recognition;", html)
 
     def test_exterior_result_keeps_component_overlay_and_supports_image_enlargement(self):
-        html = Path("templates/energy.html").read_text(encoding="utf-8")
+        html = energy_page_source()
 
         self.assertIn("images.component_overlay", html)
         self.assertIn('id="recognition-image-modal"', html)
         self.assertIn("openRecognitionImageModal", html)
 
     def test_exterior_height_and_repeat_controls_are_sent_to_energy_route(self):
-        html = Path("templates/energy.html").read_text(encoding="utf-8")
+        html = energy_page_source()
 
         expected_inputs = {
             "param-door-height": ('min="0.1"', 'step="0.1"', 'value="2.1"'),
@@ -219,7 +220,7 @@ class EnergyTemplateTests(unittest.TestCase):
                 self.assertIn(f"{field}:", html)
 
     def test_exterior_pending_and_confirmed_state_is_cleared_with_recognition_selection(self):
-        html = Path("templates/energy.html").read_text(encoding="utf-8")
+        html = energy_page_source()
         clear_segment = html[
             html.index("function clearPdfRecognitionDerivedState()")
             :html.index("function invalidatePdfRecognitionSelection")
@@ -235,9 +236,7 @@ class EnergyTemplateTests(unittest.TestCase):
         node_script = r'''
 const fs = require('fs');
 const vm = require('vm');
-const html = fs.readFileSync('templates/energy.html', 'utf8');
-const inlineScript = [...html.matchAll(/<script(?:[^>]*)>([\s\S]*?)<\/script>/g)]
-  .map(match => match[1]).find(Boolean);
+const inlineScript = fs.readFileSync('static/energy/app.js', 'utf8');
 const elements = new Proxy({}, {
   get(target, key) {
     if (!target[key]) {
@@ -311,9 +310,7 @@ if (fetchCalls !== 0) throw new Error('stale REPORT-A was sent as REPORT-B');
         node_script = r'''
 const fs = require('fs');
 const vm = require('vm');
-const html = fs.readFileSync('templates/energy.html', 'utf8');
-const inlineScript = [...html.matchAll(/<script(?:[^>]*)>([\s\S]*?)<\/script>/g)]
-  .map(match => match[1]).find(Boolean);
+const inlineScript = fs.readFileSync('static/energy/app.js', 'utf8');
 const elements = new Proxy({}, {
   get(target, key) {
     if (!target[key]) {
@@ -450,9 +447,7 @@ function acceptRecognition(reportNumber) {
         node_script = r'''
 const fs = require('fs');
 const vm = require('vm');
-const html = fs.readFileSync('templates/energy.html', 'utf8');
-const inlineScript = [...html.matchAll(/<script(?:[^>]*)>([\s\S]*?)<\/script>/g)]
-  .map(match => match[1]).find(Boolean);
+const inlineScript = fs.readFileSync('static/energy/app.js', 'utf8');
 const elements = new Proxy({}, {
   get(target, key) {
     if (!target[key]) {
@@ -556,7 +551,7 @@ const context = {
         self.assertEqual(completed.returncode, 0, completed.stderr)
 
     def test_pdf_region_recognition_ui_loads_preview_and_manages_crop_state(self):
-        html = Path("templates/energy.html").read_text(encoding="utf-8")
+        html = energy_page_source()
 
         for function_name in [
             "loadPreparedPdfPreview",
@@ -577,14 +572,14 @@ const context = {
         self.assertIn("await loadPreparedPdfPreview()", prepare_body)
 
     def test_pdf_recognition_request_sends_mode_and_crop_coordinates(self):
-        html = Path("templates/energy.html").read_text(encoding="utf-8")
+        html = energy_page_source()
 
         self.assertIn("fd.append('recognition_mode'", html)
         self.assertIn("fd.append('crop_bbox_px'", html)
         self.assertIn("fd.append('crop_preview_size'", html)
 
     def test_pdf_async_requests_guard_prepare_and_preview_generations(self):
-        html = Path("templates/energy.html").read_text(encoding="utf-8")
+        html = energy_page_source()
 
         self.assertIn("let pdfUploadSessionId = 0;", html)
         self.assertIn("let pdfPreviewRequestId = 0;", html)
@@ -628,8 +623,8 @@ const context = {
         self.assertLess(post_decode_guard, visible_commit)
 
     def test_energy_request_and_server_forward_detailed_boundary_values(self):
-        html = Path("templates/energy.html").read_text(encoding="utf-8")
-        server = Path("web_server_server.py").read_text(encoding="utf-8")
+        html = energy_page_source()
+        server = server_source()
 
         self.assertIn("include_roof: calculationMode === 'detailed'", html)
         self.assertIn("include_floor: calculationMode === 'detailed'", html)
@@ -639,7 +634,7 @@ const context = {
         self.assertIn('"annual_solar_irradiation_kwh_m2a": max(', server)
 
     def test_boundary_fields_are_disabled_only_in_detailed_mode(self):
-        html = Path("templates/energy.html").read_text(encoding="utf-8")
+        html = energy_page_source()
 
         self.assertIn("function updateBoundaryControlState()", html)
         self.assertIn("const roofEnabled = !detailed ||", html)
@@ -647,7 +642,7 @@ const context = {
         self.assertIn("updateBoundaryControlState();", html)
 
     def test_server_maps_and_validates_annual_use_fields(self):
-        server = Path("web_server_server.py").read_text(encoding="utf-8")
+        server = server_source()
 
         required_contract = [
             '"occupancy": {',
@@ -678,7 +673,7 @@ const context = {
             self.assertIn(validation_fragment, server)
 
     def test_step_three_contains_global_annual_use_controls_and_defaults(self):
-        html = Path("templates/energy.html").read_text(encoding="utf-8")
+        html = energy_page_source()
         expected = {
             "param-t-heat": "18.0",
             "param-t-cool": "26.0",
@@ -719,8 +714,8 @@ const context = {
         self.assertIn("district: 0.80", html)
 
     def test_design_load_request_fields_are_forwarded_from_frontend_and_server(self):
-        html = Path("templates/energy.html").read_text(encoding="utf-8")
-        server = Path("web_server_server.py").read_text(encoding="utf-8")
+        html = energy_page_source()
+        server = server_source()
 
         for fragment in [
             "peak_solar_irradiance_w_m2: parseFloat(document.getElementById('param-peak-solar-irradiance').value)",
@@ -753,8 +748,8 @@ const context = {
             self.assertIn(fragment, server)
 
     def test_other_design_parameters_are_configurable_in_collapsed_panel(self):
-        html = Path("templates/energy.html").read_text(encoding="utf-8")
-        server = Path("web_server_server.py").read_text(encoding="utf-8")
+        html = energy_page_source()
+        server = server_source()
 
         for fragment in [
             'onclick="toggleOtherDesignParams()"',
@@ -799,7 +794,7 @@ const context = {
             self.assertIn(fragment, server)
 
     def test_step_three_has_independent_heating_and_cooling_scope_controls(self):
-        html = Path("templates/energy.html").read_text(encoding="utf-8")
+        html = energy_page_source()
 
         heating = re.search(r'<input[^>]*id="calculate-heating"[^>]*>', html)
         cooling = re.search(r'<input[^>]*id="calculate-cooling"[^>]*>', html)
@@ -821,7 +816,7 @@ const context = {
         self.assertIn("calculate_cooling: calculateCooling", calculate_segment)
 
     def test_history_restores_new_and_legacy_calculation_scope(self):
-        html = Path("templates/energy.html").read_text(encoding="utf-8")
+        html = energy_page_source()
         history_segment = html[html.index("async function loadReportDetails(repNum, ownerUsername)"):html.index("function showLoader(text)")]
 
         self.assertIn("function inferCalculationEnabled", html)
@@ -832,7 +827,7 @@ const context = {
         self.assertIn("updateCalculationScopeControls();", history_segment)
 
     def test_administrator_history_preserves_owner_identity_in_requests(self):
-        html = Path("templates/energy.html").read_text(encoding="utf-8")
+        html = energy_page_source()
         history_segment = html[
             html.index("async function openHistoryDrawer()")
             :html.index("function closeHistoryDrawer()")
@@ -857,7 +852,7 @@ const context = {
         self.assertIn("owner_username: activeReportOwnerUsername", html)
 
     def test_results_mark_disabled_calculation_scope_as_not_enabled(self):
-        html = Path("templates/energy.html").read_text(encoding="utf-8")
+        html = energy_page_source()
         display_segment = html[html.index("function displayResults(data)"):html.index("async function loadReportDetails(repNum, ownerUsername)")]
 
         self.assertIn("data.calculation_scope", display_segment)
@@ -867,7 +862,7 @@ const context = {
         self.assertIn("（未启用）", display_segment)
 
     def test_results_separate_thermal_demand_from_electricity(self):
-        html = Path("templates/energy.html").read_text(encoding="utf-8")
+        html = energy_page_source()
 
         self.assertIn('id="thermal-demand-results"', html)
         self.assertIn('id="electricity-results"', html)
@@ -885,7 +880,7 @@ const context = {
         self.assertNotIn("legacyElectricity[cat.legacyKey]", html)
 
     def test_results_render_design_heating_and_cooling_loads(self):
-        html = Path("templates/energy.html").read_text(encoding="utf-8")
+        html = energy_page_source()
 
         for fragment in [
             'id="design-load-results"',
@@ -902,7 +897,7 @@ const context = {
             self.assertIn(fragment, html)
 
     def test_step_four_navigation_uses_energy_result_state(self):
-        html = Path("templates/energy.html").read_text(encoding="utf-8")
+        html = energy_page_source()
         goto_segment = html[html.index("function gotoStep(step)"):html.index("// 上传与识别逻辑")]
         calculate_segment = html[html.index("async function calculateEnergy()"):html.index("function displayResults(data)")]
         history_segment = html[html.index("async function loadReportDetails(repNum, ownerUsername)"):html.index("function showLoader(text)")]
@@ -924,7 +919,7 @@ const context = {
         self.assertLess(history_render, history_navigation)
 
     def test_energy_result_state_is_invalidated_for_new_work(self):
-        html = Path("templates/energy.html").read_text(encoding="utf-8")
+        html = energy_page_source()
         recognize_segment = html[html.index("async function handleFile(file)"):html.index("function updateAnnualUsePreview()")]
         calculate_segment = html[html.index("async function calculateEnergy()"):html.index("function displayResults(data)")]
         calculate_failure = calculate_segment[calculate_segment.index("} catch (error) {"):]
@@ -943,7 +938,7 @@ const context = {
         self.assertNotIn("energyResultData =", calculate_failure)
 
     def test_non_xian_city_warns_about_xian_design_temperature_defaults(self):
-        html = Path("templates/energy.html").read_text(encoding="utf-8")
+        html = energy_page_source()
 
         self.assertIn('id="design-temperature-warning"', html)
         self.assertIn("function updateDesignTemperatureNotice()", html)
@@ -951,7 +946,7 @@ const context = {
         self.assertIn("updateDesignTemperatureNotice()", html)
 
     def test_history_reload_supports_nested_and_flat_annual_use_fields(self):
-        html = Path("templates/energy.html").read_text(encoding="utf-8")
+        html = energy_page_source()
 
         for fragment in [
             "occupancy.area_per_person_m2 ?? p.area_per_person_m2 ?? 10",
@@ -972,7 +967,7 @@ const context = {
         self.assertIn("detailedEnvelope = normalizeDetailedEnvelope(p.detailed_envelope)", html)
 
     def test_detailed_history_normalizes_empty_and_partial_shapes(self):
-        html = Path("templates/energy.html").read_text(encoding="utf-8")
+        html = energy_page_source()
 
         for fragment in [
             "function createDefaultDetailedEnvelope()",
@@ -1009,7 +1004,7 @@ class EnergyRouteClientTests(unittest.TestCase):
             redirect_stdout(io.StringIO()),
             redirect_stderr(io.StringIO()),
         ):
-            import web_server_server
+            from tests.server_fixture import server as web_server_server
 
         cls.server = web_server_server
         cls.server.app.config.update(TESTING=True, SECRET_KEY="test-secret")
@@ -1184,7 +1179,7 @@ class EnergyRouteClientTests(unittest.TestCase):
                 )
             )
             render_preview.assert_called_once_with(
-                stored_pdf,
+                stored_pdf.resolve(),
                 2,
                 2,
                 "C:\\poppler\\bin",
@@ -1247,7 +1242,7 @@ class EnergyRouteClientTests(unittest.TestCase):
         )
 
     def test_energy_assets_do_not_depend_on_annotation_tool_directory(self):
-        source = Path("web_server_server.py").read_text(encoding="utf-8")
+        source = server_source()
         self.assertNotIn("annotation_tool', 'static", source)
 
     def test_ai_recognize_rejects_invalid_crop_region_requests(self):
@@ -2634,7 +2629,7 @@ class EnergyRouteClientTests(unittest.TestCase):
             return self.client.post("/energy/ai_simulate", json={"report_number": "V2", **payload})
 
     def test_ai_recognize_persists_recognition_json(self):
-        with tempfile.TemporaryDirectory(dir=r"D:\Projects") as upload_root:
+        with tempfile.TemporaryDirectory() as upload_root:
             previous_upload = self.server.app.config["UPLOAD_FOLDER"]
             self.server.app.config["UPLOAD_FOLDER"] = upload_root
             segmenter = MagicMock()
@@ -2707,7 +2702,7 @@ class EnergyRouteClientTests(unittest.TestCase):
             self.assertIn("recognition", response.get_json())
 
     def test_vector_recognition_response_does_not_expose_internal_model_paths(self):
-        with tempfile.TemporaryDirectory(dir=r"D:\Projects") as upload_root:
+        with tempfile.TemporaryDirectory() as upload_root:
             internal_path = str(
                 Path(upload_root) / "energy" / user_storage_key("test-user")
                 / "VECTOR-SAFE" / "vector-prediction-secret"
@@ -2813,16 +2808,13 @@ class EnergyRouteClientTests(unittest.TestCase):
             "image_size": [2, 2],
         }
 
-        with tempfile.TemporaryDirectory(dir=r"D:\Projects") as upload_root:
+        with tempfile.TemporaryDirectory() as upload_root:
             previous_upload = self.server.app.config["UPLOAD_FOLDER"]
             self.server.app.config["UPLOAD_FOLDER"] = upload_root
             try:
                 with (
                     patch.object(self.server, "HAS_FLOORPLAN_AI", True),
                     patch.object(self.server, "_floorplan_segmenter", segmenter, create=True),
-                    patch.dict(os.environ, {
-                        "POPPLER_PATH": r"C:\Users\majin\.cache\codex-runtimes\codex-primary-runtime\dependencies\native\poppler\Library\bin"
-                    }),
                 ):
                     response = self.client.post(
                         "/energy/ai_recognize",
@@ -2919,7 +2911,7 @@ class EnergyRouteClientTests(unittest.TestCase):
             "image_size": [2, 2],
         }
 
-        with tempfile.TemporaryDirectory(dir=r"D:\Projects") as upload_root:
+        with tempfile.TemporaryDirectory() as upload_root:
             previous_upload = self.server.app.config["UPLOAD_FOLDER"]
             self.server.app.config["UPLOAD_FOLDER"] = upload_root
             try:
@@ -2940,9 +2932,6 @@ class EnergyRouteClientTests(unittest.TestCase):
                         "floorplan_page_pipeline.build_dimension_annotation_mask",
                         return_value=np.zeros((417, 556), dtype=np.uint8),
                     ) as dimension_mask,
-                    patch.dict(os.environ, {
-                        "POPPLER_PATH": r"C:\Users\majin\.cache\codex-runtimes\codex-primary-runtime\dependencies\native\poppler\Library\bin"
-                    }),
                 ):
                     response = self.client.post(
                         "/energy/ai_recognize",
@@ -2967,7 +2956,7 @@ class EnergyRouteClientTests(unittest.TestCase):
         self.assertEqual(body["vector_cleanup"]["ocr"]["accepted_count"], 2)
 
     def test_ai_simulate_reuses_saved_recognition_without_second_prediction(self):
-        with tempfile.TemporaryDirectory(dir=r"D:\Projects") as upload_root:
+        with tempfile.TemporaryDirectory() as upload_root:
             report_dir = (
                 Path(upload_root) / "energy" / user_storage_key("test-user") / "REUSE"
             )
@@ -3142,7 +3131,7 @@ class EnergyRouteClientTests(unittest.TestCase):
         self.assertEqual(response.get_json()["scale_source"], "vector_pdf_overall_dimensions")
 
     def test_manual_two_point_scale_calibration_is_saved_and_updates_room_area(self):
-        with tempfile.TemporaryDirectory(dir=r"D:\Projects") as upload_root:
+        with tempfile.TemporaryDirectory() as upload_root:
             report_dir = (
                 Path(upload_root) / "energy" / user_storage_key("test-user") / "MANUAL-SCALE"
             )
@@ -3245,7 +3234,7 @@ class EnergyRouteClientTests(unittest.TestCase):
                     self.assertEqual(response.status_code, 400, response.get_json())
 
     def test_ai_simulate_requires_saved_recognition_json(self):
-        with tempfile.TemporaryDirectory(dir=r"D:\Projects") as upload_root:
+        with tempfile.TemporaryDirectory() as upload_root:
             previous_upload = self.server.app.config["UPLOAD_FOLDER"]
             self.server.app.config["UPLOAD_FOLDER"] = upload_root
             segmenter = MagicMock()

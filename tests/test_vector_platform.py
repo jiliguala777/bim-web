@@ -82,7 +82,7 @@ class VectorPlatformTests(unittest.TestCase):
 class VectorPlatformRouteTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        import web_server_server
+        from tests.server_fixture import server as web_server_server
 
         cls.server = web_server_server
         cls.server.app.config.update(TESTING=True, SECRET_KEY="vector-platform-test")

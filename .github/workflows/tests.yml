@@ -1,0 +1,42 @@
+name: Tests
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  regression:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: requirements.lock
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install Poppler (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y poppler-utils
+      - name: Install Poppler (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco install poppler --no-progress -y
+          $binary = Get-ChildItem 'C:\ProgramData\chocolatey\lib\poppler' -Filter pdftoppm.exe -Recurse | Select-Object -First 1
+          if (-not $binary) { throw 'Poppler executable not found' }
+          "POPPLER_PATH=$($binary.DirectoryName)" >> $env:GITHUB_ENV
+      - name: Install locked runtime
+        run: python -m pip install --require-hashes -r requirements.lock
+      - run: python -m pip check
+      - run: python -m unittest discover -s tests
+      - run: node tests/test_crop_region.js
+      - run: node tests/test_energy_pdf_preview_state.js
+      - run: node tests/test_security.js
+      - run: git diff --check
